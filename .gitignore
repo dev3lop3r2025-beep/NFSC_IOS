@@ -24,6 +24,7 @@ game/
 *.zip
 *.7z
 *.tar.gz
+!gen.tar.gz
 assets/game_root/
 Documents/
 

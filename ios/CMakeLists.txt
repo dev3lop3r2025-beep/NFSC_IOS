@@ -80,7 +80,7 @@ endif()
 #  Generated Game Code (PowerPC to ARM64 C++)
 # -----------------------------------------------------------------------------
 set(NFSCARBON_WITH_GAME OFF)
-if(EXISTS "${NFSCARBON_GEN_DIR}/sources.cmake")
+if(EXISTS "${NFSCARBON_GEN_DIR}/sources.cmake" AND EXISTS "${NFSCARBON_GEN_DIR}/nfsc_recomp.0.cpp")
     set(NFSCARBON_WITH_GAME ON)
     include("${NFSCARBON_GEN_DIR}/sources.cmake")
 
