@@ -12,7 +12,6 @@ workflows:
       vars:
         TITLE_ID: "454107EC"
       xcode: latest
-      python: 3.12
     triggering:
       events:
         - push
