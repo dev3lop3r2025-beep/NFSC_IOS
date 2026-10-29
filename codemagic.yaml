@@ -95,7 +95,11 @@ workflows:
           set -e
           echo "[Codemagic] Compiling NFSCarbon.app and packaging IPA..."
           cd ios
-          cmake --build --preset ios --target ipa -v
+          cmake --build --preset ios --target ipa -- -j 4 || {
+            echo "[Codemagic] Build failed! Re-running failed file with single-job diagnostics..."
+            cmake --build --preset ios --target ipa -v -- -j 1
+            exit 1
+          }
 
       - name: Compute Checksums & Export Artifacts
         script: |

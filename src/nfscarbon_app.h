@@ -18,7 +18,9 @@
 #include "audio/coreaudio_driver.h"
 #endif
 
-extern "C" const rex::PPCImageConfig PPCImageConfig;
+#include <rex/image_info.h>
+
+extern const rex::PPCImageInfo PPCImageConfig;
 
 class NfsCarbonApp : public rex::ReXApp {
  public:

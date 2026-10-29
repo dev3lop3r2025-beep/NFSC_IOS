@@ -86,7 +86,7 @@ cmake --preset ios \
     ${OBJC:+-DCMAKE_OBJC_COMPILER="${OBJC}"} \
     ${OBJCXX:+-DCMAKE_OBJCXX_COMPILER="${OBJCXX}"} \
     ${CC:+-DCMAKE_ASM_COMPILER="${CC}"}
-cmake --build --preset ios --target ipa
+cmake --build --preset ios --target ipa -- -j 4
 
 cd "${SCRIPT_DIR}"
 

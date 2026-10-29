@@ -64,7 +64,7 @@ set(NFSCARBON_SDK "${NFSCARBON_REPO}/../rexglue-sdk-ios" CACHE PATH
 set(NFSCARBON_BUNDLE_ID "com.recomp.nfscarbon.ios" CACHE STRING "App bundle identifier")
 set(NFSCARBON_GEN_DIR "${NFSCARBON_REPO}/generated/default" CACHE PATH
     "Generated code for Carbon (tools/generate_code.py)")
-set(NFSCARBON_JOBS_RECOMP "4" CACHE STRING "Generated files compiled at once")
+set(NFSCARBON_JOBS_RECOMP "2" CACHE STRING "Generated files compiled at once")
 get_filename_component(NFSCARBON_REPO "${NFSCARBON_REPO}" ABSOLUTE)
 get_filename_component(NFSCARBON_SDK "${NFSCARBON_SDK}" ABSOLUTE)
 
@@ -168,6 +168,10 @@ if(EXISTS "${NFSCARBON_GEN_DIR}/sources.cmake" AND EXISTS "${NFSCARBON_GEN_DIR}/
         target_precompile_headers(nfscarbon_recomp PRIVATE "${NFSCARBON_GEN_DIR}/nfscarbon_pch.h")
     endif()
     target_compile_options(nfscarbon_recomp PRIVATE -gline-tables-only -Wno-unused-variable)
+    if(EXISTS "${NFSCARBON_GEN_DIR}/nfsc_register.cpp")
+        set_source_files_properties("${NFSCARBON_GEN_DIR}/nfsc_register.cpp"
+            PROPERTIES COMPILE_OPTIONS "-O1")
+    endif()
     set_property(GLOBAL APPEND PROPERTY JOB_POOLS recomp=${NFSCARBON_JOBS_RECOMP})
     set_target_properties(nfscarbon_recomp PROPERTIES JOB_POOL_COMPILE recomp)
     message(STATUS "NFSCarbon: compiling with game code (${NFSCARBON_GEN_DIR})")
