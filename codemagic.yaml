@@ -1,0 +1,108 @@
+# =============================================================================
+#  Need for Speed: Carbon (Xbox 360, Title ID: 454107EC) - Codemagic CI/CD
+#  Automated Native iOS/iPadOS Recompiled IPA Builder
+# =============================================================================
+
+workflows:
+  ios-release:
+    name: Build NFS Carbon iOS (ARM64 Unsigned IPA)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      vars:
+        TITLE_ID: "454107EC"
+      xcode: latest
+      python: 3.12
+    triggering:
+      events:
+        - push
+        - tag
+      branch_patterns:
+        - pattern: main
+          include: true
+        - pattern: master
+          include: true
+      tag_patterns:
+        - pattern: 'v*'
+          include: true
+    cache:
+      cache_paths:
+        - $HOME/Library/Caches/Homebrew
+        - $HOME/.nfsc-ios
+        - $CM_BUILD_DIR/../rexglue-sdk-ios
+    scripts:
+      - name: Install build tools & Python packages
+        script: |
+          set -e
+          echo "[Codemagic] Installing build tools..."
+          brew install cmake ninja
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pillow tomli
+
+      - name: Generate AppIcon & Asset Catalog
+        script: |
+          set -e
+          echo "[Codemagic] Generating high-contrast procedural AppIcon..."
+          python3 tools/generate_appicon.py
+
+      - name: Restore or Prepare Game Codegen (PowerPC to C++)
+        script: |
+          set -e
+          echo "[Codemagic] Unpacking pre-generated C++ code cache..."
+          mkdir -p game generated/default
+          # Extract pre-generated C++ source archive (352 translation files)
+          python3 tools/generate_code.py --unpack-cache || true
+
+      - name: Prepare ReXGlue iOS SDK & MoltenVK
+        script: |
+          set -e
+          echo "[Codemagic] Preparing ReXGlue iOS SDK and applying Apple Silicon patches..."
+          python3 tools/prepare_sdk.py
+
+      - name: Configure CMake for iOS (ARM64 Native)
+        script: |
+          set -e
+          echo "[Codemagic] Configuring CMake with iOS preset..."
+          cd ios
+          cmake --preset ios \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY=""
+
+      - name: Compile and Package Unsigned IPA
+        script: |
+          set -e
+          echo "[Codemagic] Compiling NFSCarbon.app and packaging IPA..."
+          cd ios
+          cmake --build --preset ios --target ipa -v
+
+      - name: Compute Checksums & Export Artifacts
+        script: |
+          set -e
+          echo "[Codemagic] Preparing release artifacts..."
+          mkdir -p dist
+          IPA_SRC="ios/build/NFS-Carbon-iOS-unsigned.ipa"
+          if [ ! -f "${IPA_SRC}" ]; then
+            IPA_SRC="ios/build/NFSCarbon.ipa"
+          fi
+          cp -f "${IPA_SRC}" dist/NFS-Carbon-iOS-unsigned.ipa
+          cp -f "${IPA_SRC}" dist/NFSCarbon.ipa
+          cd dist
+          shasum -a 256 NFS-Carbon-iOS-unsigned.ipa > SHA256SUMS.txt
+          echo "[Codemagic] SHA-256 Checksum:"
+          cat SHA256SUMS.txt
+
+    artifacts:
+      - dist/NFS-Carbon-iOS-unsigned.ipa
+      - dist/NFSCarbon.ipa
+      - dist/SHA256SUMS.txt
+      - ios/build/*.ipa
+
+    publishing:
+      email:
+        recipients:
+          - dev3lop3r2025@gmail.com
+        notify:
+          success: true
+          failure: true

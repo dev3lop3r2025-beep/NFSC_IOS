@@ -59,9 +59,16 @@ This is **not an emulator**. The game's PowerPC Xenon machine code is translated
 3. Go to **Actions** $\to$ **Build iOS IPA** $\to$ **Run workflow**.
 4. Once completed, download `NFS-Carbon-iOS-unsigned.ipa` from the workflow summary artifacts (or GitHub Releases on tags `v*`).
 
+### Option B: Fast Cloud Build with Codemagic (M2 Apple Silicon, Instant Builds)
+
+1. Sign up / Log in to [Codemagic.io](https://codemagic.io) using your GitHub account (`dev3lop3r2025-beep`).
+2. Click **Add application**, select **`NFSC_IOS`**, and select **codemagic.yaml**.
+3. Click **Start new build** with the `ios-release` workflow.
+4. Codemagic spins up a dedicated Apple Silicon **`mac_mini_m2`** instance, compiles `NFSCarbon.app`, and packages `NFS-Carbon-iOS-unsigned.ipa` ready to download from the build artifacts (and sent directly to your email).
+
 ---
 
-### Option B: Building Locally on macOS
+### Option C: Building Locally on macOS
 
 ```bash
 # 1. Clone this repository
