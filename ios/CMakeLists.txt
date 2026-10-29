@@ -82,6 +82,25 @@ if(EXISTS "${_mvk_marker}")
     endif()
 endif()
 
+# Fallback auto-discovery if marker path wasn't exact
+if(NOT EXISTS "${NFSCARBON_MOLTENVK_FW}/MoltenVK")
+    file(GLOB_RECURSE _found_mvk
+        "${NFSCARBON_SDK}/.nfsc-ios/*/ios-arm64/MoltenVK.framework"
+        "${NFSCARBON_SDK}/.nfsmw-ios/*/ios-arm64/MoltenVK.framework"
+        "${NFSCARBON_SDK}/.nfsc-ios/MoltenVK.framework"
+        "${NFSCARBON_SDK}/.nfsmw-ios/MoltenVK.framework"
+    )
+    if(_found_mvk)
+        list(GET _found_mvk 0 NFSCARBON_MOLTENVK_FW)
+    endif()
+endif()
+
+if(EXISTS "${NFSCARBON_MOLTENVK_FW}")
+    message(STATUS "NFSCarbon: Found MoltenVK.framework at ${NFSCARBON_MOLTENVK_FW}")
+else()
+    message(WARNING "NFSCarbon: MoltenVK.framework not found in SDK; will not be bundled")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -261,14 +280,39 @@ endif()
 set(_app "$<TARGET_BUNDLE_DIR:nfscarbon>")
 set(_fw "${_app}/Frameworks")
 
+if(TARGET rexruntime)
+    set(_copy_rexruntime COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rexruntime>" "${_fw}/")
+    set(_sign_rexruntime COMMAND codesign --force --sign - --timestamp=none "${_fw}/$<TARGET_FILE_NAME:rexruntime>" 2>/dev/null || true)
+    set(_dep_rexruntime rexruntime)
+else()
+    set(_copy_rexruntime COMMAND ${CMAKE_COMMAND} -E true)
+    set(_sign_rexruntime COMMAND ${CMAKE_COMMAND} -E true)
+    set(_dep_rexruntime "")
+endif()
+
+if(TARGET rexgpu-xenos)
+    set(_copy_rexgpu COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rexgpu-xenos>" "${_fw}/")
+    set(_sign_rexgpu COMMAND codesign --force --sign - --timestamp=none "${_fw}/$<TARGET_FILE_NAME:rexgpu-xenos>" 2>/dev/null || true)
+    set(_dep_rexgpu rexgpu-xenos)
+else()
+    set(_copy_rexgpu COMMAND ${CMAKE_COMMAND} -E true)
+    set(_sign_rexgpu COMMAND ${CMAKE_COMMAND} -E true)
+    set(_dep_rexgpu "")
+endif()
+
+if(EXISTS "${NFSCARBON_MOLTENVK_FW}")
+    set(_copy_mvk_cmd COMMAND ${CMAKE_COMMAND} -E copy_directory "${NFSCARBON_MOLTENVK_FW}" "${_fw}/MoltenVK.framework")
+    set(_sign_mvk_cmd COMMAND codesign --force --sign - --timestamp=none "${_fw}/MoltenVK.framework" 2>/dev/null || true)
+else()
+    set(_copy_mvk_cmd COMMAND ${CMAKE_COMMAND} -E true)
+    set(_sign_mvk_cmd COMMAND ${CMAKE_COMMAND} -E true)
+endif()
+
 add_custom_target(nfscarbon_package ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_fw}"
-    COMMAND ${CMAKE_COMMAND} -E $<IF:$<TARGET_EXISTS:rexruntime>,copy_if_different,true>
-            "$<TARGET_FILE:rexruntime>" "${_fw}/"
-    COMMAND ${CMAKE_COMMAND} -E $<IF:$<TARGET_EXISTS:rexgpu-xenos>,copy_if_different,true>
-            "$<TARGET_FILE:rexgpu-xenos>" "${_fw}/"
-    COMMAND ${CMAKE_COMMAND} -E $<IF:$<EXISTS:${NFSCARBON_MOLTENVK_FW}>,copy_directory,true>
-            "${NFSCARBON_MOLTENVK_FW}" "${_fw}/MoltenVK.framework"
+    ${_copy_rexruntime}
+    ${_copy_rexgpu}
+    ${_copy_mvk_cmd}
     COMMAND xcrun actool "${CMAKE_CURRENT_SOURCE_DIR}/resources/Assets.xcassets"
             --compile "${_app}" --platform iphoneos
             --minimum-deployment-target "${CMAKE_OSX_DEPLOYMENT_TARGET}"
@@ -276,13 +320,15 @@ add_custom_target(nfscarbon_package ALL
             --output-partial-info-plist "${CMAKE_CURRENT_BINARY_DIR}/actool-partial.plist"
             --output-format human-readable-text --errors --warnings || true
     COMMAND xattr -cr "${_app}" || true
-    COMMAND codesign --force --sign - --timestamp=none "${_fw}/MoltenVK.framework" 2>/dev/null || true
+    ${_sign_mvk_cmd}
+    ${_sign_rexruntime}
+    ${_sign_rexgpu}
     COMMAND codesign --force --sign - --timestamp=none
             --entitlements "${CMAKE_CURRENT_SOURCE_DIR}/nfscarbon.entitlements" "${_app}" || true
     COMMENT "NFSCarbon: Packaging and signing NFSCarbon.app"
     VERBATIM
 )
-add_dependencies(nfscarbon_package nfscarbon)
+add_dependencies(nfscarbon_package nfscarbon ${_dep_rexruntime} ${_dep_rexgpu})
 
 # -----------------------------------------------------------------------------
 #  IPA Generation Target
