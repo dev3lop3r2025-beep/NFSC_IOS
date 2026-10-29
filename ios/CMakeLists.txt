@@ -8,6 +8,50 @@
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.25)
+
+# Defaults for iOS ARM64 native target before project()
+if(NOT CMAKE_SYSTEM_NAME)
+    set(CMAKE_SYSTEM_NAME "iOS")
+endif()
+if(NOT CMAKE_SYSTEM_PROCESSOR)
+    set(CMAKE_SYSTEM_PROCESSOR "arm64")
+endif()
+if(NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64")
+endif()
+if(NOT CMAKE_OSX_SYSROOT)
+    set(CMAKE_OSX_SYSROOT "iphoneos")
+endif()
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0")
+endif()
+set(REX_PLATFORM_IOS 1 CACHE BOOL "Build for iOS platform" FORCE)
+add_compile_definitions(REX_PLATFORM_IOS=1)
+
+# Compiler resolution: ensure clang from the iphoneos SDK toolchain is preferred
+if(APPLE AND NOT CMAKE_C_COMPILER)
+    execute_process(
+        COMMAND xcrun --sdk iphoneos --find clang
+        OUTPUT_VARIABLE _IOS_CLANG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_IOS_CLANG AND EXISTS "${_IOS_CLANG}")
+        set(CMAKE_C_COMPILER "${_IOS_CLANG}" CACHE FILEPATH "C compiler" FORCE)
+    endif()
+endif()
+if(APPLE AND NOT CMAKE_CXX_COMPILER)
+    execute_process(
+        COMMAND xcrun --sdk iphoneos --find clang++
+        OUTPUT_VARIABLE _IOS_CLANGXX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_IOS_CLANGXX AND EXISTS "${_IOS_CLANGXX}")
+        set(CMAKE_CXX_COMPILER "${_IOS_CLANGXX}" CACHE FILEPATH "CXX compiler" FORCE)
+    endif()
+endif()
+
 project(nfscarbon_ios LANGUAGES C CXX OBJC OBJCXX ASM)
 
 if(NOT IOS)
@@ -68,6 +112,13 @@ if(TARGET renderdoc)
 endif()
 if(TARGET Vulkan::Headers)
     target_link_libraries(nfscarbon_headers INTERFACE Vulkan::Headers)
+endif()
+if(NOT IOS)
+    if(TARGET Vulkan::Loader)
+        target_link_libraries(nfscarbon_headers INTERFACE Vulkan::Loader)
+    elseif(TARGET vulkan)
+        target_link_libraries(nfscarbon_headers INTERFACE vulkan)
+    endif()
 endif()
 if(TARGET GPUOpen::VulkanMemoryAllocator)
     target_link_libraries(nfscarbon_headers INTERFACE GPUOpen::VulkanMemoryAllocator)

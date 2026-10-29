@@ -1,43 +1,48 @@
 #!/usr/bin/env python3
 """
-tools/ios/prepare_sdk.py
 Prepares the ReXGlue SDK tree for building the Need for Speed: Carbon iOS port.
 
-Usage:
     python3 tools/ios/prepare_sdk.py
     python3 tools/ios/prepare_sdk.py --sdk /path/to/rexglue-sdk-ios
     python3 tools/ios/prepare_sdk.py --status
+
+Leaves an SDK v0.10.0 in ../rexglue-sdk-ios, SEPARATE from the Windows and
+Android ones. Safe to run as often as needed: every step checks whether it is
+already done before touching anything.
 """
 
 import argparse
+import importlib.util
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import tarfile
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SDK_DEFAULT = ROOT.parent / "rexglue-sdk-ios"
 
-SDK_REPO = "https://github.com/rexglue/rexglue-sdk.git"
-SDK_TAG = "v0.10.0"
 
-MOLTENVK_VERSION = "v1.4.1"
+def _android():
+    """tools/preparar_sdk.py as a module, untouched."""
+    path = ROOT / "tools" / "preparar_sdk.py"
+    if not path.exists():
+        sys.exit(f"[ERROR] Cannot find {path}")
+    spec = importlib.util.spec_from_file_location("preparar_sdk_android", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ANDROID = _android()
+
+MOLTENVK_VERSION = "v1.4.1"  # = commit db445ff of the thirdparty/moltenvk submodule
 MOLTENVK_URL = (
     f"https://github.com/KhronosGroup/MoltenVK/releases/download/"
     f"{MOLTENVK_VERSION}/MoltenVK-ios.tar"
 )
 
-# Reference Android ARM64 memory barrier patches for codegen
-REF_COMMIT = "121f1588147d3c06d863f6ee81c3c393bc676db6"
-REF_URL = f"https://raw.githubusercontent.com/deivid22srk/hells-gate-recomp-android/{REF_COMMIT}/"
-PARCHES_REF = [
-    ("rexglue-sdk-v0.10.0-android.patch", []),
-    ("rexglue-sdk-v0.10.0-android-perf.patch", ["src/system/mmio_handler.cpp"]),
-]
-
+# Order matters: each one anchors on what the earlier ones left.
 IOS_PATCHES = [
     "patch_ios_platform",
     "patch_ios_signal_forwarding",
@@ -52,247 +57,251 @@ IOS_PATCHES = [
     "patch_ios_aspect",
     "patch_ios_retina",
     "patch_ios_qos",
-    "patch_ios_xma_direct_output",
-    "patch_ios_xma_starve_switch",
-    "patch_ios_xma_voice_log",
-    "patch_ios_cheap_sleep",
-    "patch_ios_fps_cap",
-    "patch_ios_cap_30_at_120",
-    "patch_ios_battery_group",
-    "patch_ios_touch_pad",
-    "patch_ios_mnk_modifiers",
-    "patch_ios_paint_suspend",
-    "patch_ios_utility_qos",
-    "patch_ios_retire_qos",
-    "patch_ios_sdl_scene",
-    "patch_ios_dump_image",
     "patch_ios_fault_log",
-    "patch_ios_vblank_realtime",
-    "patch_ios_save_hook",
     "patch_ios_save_log",
-    "patch_ios_present_pacing",
-    "patch_ios_vblank_grid",
-    "patch_ios_vblank_display",
-    "patch_ios_sdl_display_link",
-    "patch_ios_ui_tick_cap",
-    "patch_ios_suboptimal",
-    "patch_ios_suboptimal_limit",
-    "patch_ios_native_backend",
-    "patch_ios_narrow_invalidation",
-    "patch_ios_hot_pages",
-    "patch_ios_cp_idle_wait",
-    "patch_ios_cp_fast_runs",
-    "patch_ios_native_only",
-    "patch_ios_surface_reattach",
-    "patch_ios_texture_descriptors",
+    "patch_ios_touch_pad",
+    "patch_ios_dump_image",
     "patch_ios_upload_batch",
-    "patch_ios_type0_ranges",
-    "patch_ios_native_constants",
-    "patch_ios_native_present_skip",
-    "patch_ios_shader_disasm_log",
+    "patch_ios_vblank_grid",
     "patch_ios_shader_contraction",
-    "patch_ios_packet_census",
-    "patch_ios_shared_stats",
-    "patch_ios_read_timing",
-    "patch_ios_resolve_stats",
-    "patch_ios_texture_stats",
-    "patch_ios_xma_reset_stats",
-    "patch_ios_dispatch_stats",
-    "patch_ios_semaphore_trace",
-    "patch_ios_occlusion_batch",
     "patch_ios_occlusion_async",
-    "patch_ios_native_occlusion",
-    "patch_ios_readback_limit",
-    "patch_ios_timer_queue_block",
-    "patch_ios_small_shared_memory",
-    "patch_ios_xma_canary",
+    "patch_ios_fps_cap",
+    "patch_ios_present_pacing",
+    "patch_ios_vblank_display",
+    "patch_ios_ui_tick_cap",
     "patch_ios_register_check",
+    "patch_ios_texture_descriptors",
+    "patch_ios_readback_limit",
+    "patch_ios_suboptimal",
+    "patch_ios_surface_reattach",
+    "patch_ios_paint_suspend",
+    "patch_ios_texture_stats",
+    "patch_ios_narrow_invalidation",
+    "patch_ios_occlusion_batch",
+    "patch_ios_dispatch_stats",
+    "patch_ios_shared_stats",
+    "patch_ios_hot_pages",
     "patch_ios_async_copies",
+    "patch_ios_type0_ranges",
+    "patch_ios_resolve_stats",
     "patch_ios_iso_stream",
-    "patch_ios_stack_top",
+    "patch_ios_native_only",
+    "patch_ios_semaphore_trace",
+    "patch_ios_xma_canary",
+    "patch_ios_mnk_modifiers",
+    "patch_ios_native_present_skip",
+    "patch_ios_suboptimal_limit",
+    "patch_ios_native_occlusion",
+    "patch_ios_xma_starve_switch",
     "patch_ios_invalid_call_log",
+    "patch_ios_read_timing",
+    "patch_ios_xma_reset_stats",
+    "patch_ios_xma_voice_log",
+    "patch_ios_xma_direct_output",
+    "patch_ios_shader_disasm_log",
+    "patch_ios_small_shared_memory",
+    "patch_ios_native_backend",
+    "patch_ios_timer_queue_block",
+    "patch_ios_cheap_sleep",
+    "patch_ios_sdl_display_link",
+    "patch_ios_stack_top",
+    "patch_ios_save_hook",
+    "patch_ios_sdl_scene",
+    "patch_ios_retire_qos",
+    "patch_ios_battery_group",
+    "patch_ios_utility_qos",
+    "patch_ios_packet_census",
+    "patch_ios_cp_fast_runs",
+    "patch_ios_cp_idle_wait",
+    "patch_ios_vblank_realtime",
+    "patch_ios_cap_30_at_120",
 ]
 
 
-def run(cmd, cwd=None, check=True, quiet=False):
-    r = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
-    if check and r.returncode != 0:
-        if r.stdout:
-            sys.stdout.write(r.stdout)
-        if r.stderr:
-            sys.stderr.write(r.stderr)
-        sys.exit(f"[ERROR] Failed command: {' '.join(str(c) for c in cmd)}")
-    if not quiet and r.stdout.strip():
-        print(r.stdout.rstrip())
-    return r
-
-
 def step(n, text):
-    print(f"\n[Step {n}] {text}")
+    print(f"\n== {n}. {text}")
 
 
-def check_status(sdk):
-    print(f"Target SDK: {sdk}")
-    if not (sdk / "CMakeLists.txt").exists():
-        print("  Status: Not cloned")
-        return False
-
-    platform_h = sdk / "include" / "rex" / "platform.h"
-    has_ios = False
-    if platform_h.exists():
-        has_ios = "REX_PLATFORM_IOS" in platform_h.read_text(encoding="utf-8", errors="replace")
-
-    mvk_ready = sdk / ".nfsc-ios" / "MoltenVK" / f"{MOLTENVK_VERSION}.ready"
-    has_mvk = mvk_ready.exists()
-
-    print(f"  ReXGlue SDK clone: Found ({SDK_TAG})")
-    print(f"  iOS Patches applied: {'YES' if has_ios else 'NO'}")
-    print(f"  MoltenVK iOS ({MOLTENVK_VERSION}): {'YES' if has_mvk else 'NO'}")
-    return has_ios and has_mvk
-
-
-def clone_sdk(sdk):
-    if (sdk / "CMakeLists.txt").exists():
-        print(f"  [OK] Already cloned at {sdk}")
-    else:
-        print(f"  [..] Cloning rexglue-sdk ({SDK_TAG})...")
-        run(["git", "clone", "--branch", SDK_TAG, "--depth", "1", SDK_REPO, str(sdk)])
-
-    print("  [..] Updating submodules...")
-    run(["git", "-c", "core.symlinks=false", "submodule", "update", "--init", "--recursive", "--depth", "1"],
-        cwd=sdk, quiet=True)
-    print("  [OK] Submodules ready")
+def ensure_git_tags(sdk):
+    """Ensure v* git tag is reachable so rex_compute_version resolves cleanly."""
+    chk = subprocess.run(
+        ["git", "describe", "--tags", "--match", "v*"],
+        cwd=sdk,
+        capture_output=True,
+        text=True,
+    )
+    if chk.returncode != 0:
+        subprocess.run(["git", "fetch", "--tags", "--depth=1"], cwd=sdk, capture_output=True)
+        chk2 = subprocess.run(
+            ["git", "describe", "--tags", "--match", "v*"],
+            cwd=sdk,
+            capture_output=True,
+            text=True,
+        )
+        if chk2.returncode != 0:
+            subprocess.run(["git", "tag", "-f", "v0.10.0", "HEAD"], cwd=sdk, capture_output=True)
+            print("  [ok] Tagged v0.10.0 on HEAD for rex_compute_version")
 
 
-def apply_ref_patches(sdk):
-    folder = sdk / ".nfsc-ios"
-    folder.mkdir(parents=True, exist_ok=True)
-    for name, exclude in PARCHES_REF:
-        f = folder / name
-        if not f.exists():
-            print(f"  [..] Downloading {name}...")
-            try:
-                with urllib.request.urlopen(REF_URL + name, timeout=60) as resp:
-                    f.write_bytes(resp.read())
-            except Exception as e:
-                print(f"  [WARN] Could not download {name}: {e}")
-                continue
-
-        marker = folder / (name + ".applied")
-        extra = [f"--exclude={e}" for e in exclude]
-        base_cmd = ["git", "apply", "--whitespace=nowarn", *extra]
-        if marker.exists():
-            print(f"  [OK] {name} already applied")
-        else:
-            chk = run([*base_cmd, "--check", str(f)], cwd=sdk, check=False, quiet=True)
-            if chk.returncode == 0:
-                run([*base_cmd, str(f)], cwd=sdk)
-                marker.write_text(REF_COMMIT + "\n", encoding="utf-8")
-                print(f"  [OK] Applied {name}")
+def safeguard_vulkan_loader(sdk):
+    """Extra safeguard: quote ${SYSTEM_PROCESSOR} and ${CMAKE_SYSTEM_PROCESSOR} in vulkan-loader."""
+    loader_cmake = sdk / "thirdparty" / "vulkan-loader" / "loader" / "CMakeLists.txt"
+    if loader_cmake.exists():
+        txt = loader_cmake.read_text(encoding="utf-8")
+        orig = txt
+        for var in ["${SYSTEM_PROCESSOR}", "${CMAKE_SYSTEM_PROCESSOR}"]:
+            if var in txt:
+                tmp = f"___TMP_QUOTED_{var[2:-1]}___"
+                txt = txt.replace(f'"{var}"', tmp)
+                txt = txt.replace(var, f'"{var}"')
+                txt = txt.replace(tmp, f'"{var}"')
+        if txt != orig:
+            loader_cmake.write_text(txt, encoding="utf-8")
+            print("  [ok] Safeguarded vulkan-loader/loader/CMakeLists.txt (quoted processor variables)")
 
 
-def download_moltenvk(sdk):
-    mvk_dir = sdk / ".nfsc-ios" / "MoltenVK"
-    mvk_dir.mkdir(parents=True, exist_ok=True)
-    ready = mvk_dir / f"{MOLTENVK_VERSION}.ready"
-    if ready.exists():
-        print(f"  [OK] MoltenVK {MOLTENVK_VERSION} already downloaded and verified")
+def safeguard_rex_version(sdk):
+    """Ensure rex_version.cmake cleanly resolves 0.10.0 without warnings on iOS."""
+    ver_cmake = sdk / "cmake" / "rex_version.cmake"
+    if ver_cmake.exists():
+        txt = ver_cmake.read_text(encoding="utf-8")
+        old_warn = 'message(WARNING\n            "rex_compute_version: no v* tag reachable from HEAD.'
+        if old_warn in txt:
+            new_warn = 'set(${out_var} "0.10.0" PARENT_SCOPE)\n        return()\n        message(DEBUG\n            "rex_compute_version: no v* tag reachable from HEAD.'
+            txt = txt.replace(old_warn, new_warn)
+            ver_cmake.write_text(txt, encoding="utf-8")
+            print("  [ok] Safeguarded rex_version.cmake (clean 0.10.0 fallback)")
+
+
+def moltenvk(sdk):
+    dest = sdk / ".nfsc-ios" / "MoltenVK"
+    marker = dest / (MOLTENVK_VERSION + ".ready")
+    if marker.exists():
+        print(f"[ok] MoltenVK {MOLTENVK_VERSION} already there")
         return
-
-    tar_path = mvk_dir / "MoltenVK-ios.tar"
-    if not tar_path.exists():
-        print(f"  [..] Downloading MoltenVK iOS ({MOLTENVK_VERSION})...")
-        urllib.request.urlretrieve(MOLTENVK_URL, tar_path)
-
-    print("  [..] Extracting MoltenVK.framework...")
-    with tarfile.open(tar_path) as tar:
-        tar.extractall(path=mvk_dir)
-
-    # Find ios-arm64 framework
-    fw_path = None
-    for root_dir, dirs, files in os.walk(mvk_dir):
-        if "MoltenVK.framework" in dirs and "ios-arm64" in root_dir:
-            fw_path = pathlib.Path(root_dir) / "MoltenVK.framework"
-            break
-
-    if fw_path and fw_path.exists():
-        rel = fw_path.parent.relative_to(mvk_dir)
-        ready.write_text(str(rel).replace("\\", "/") + "\n", encoding="utf-8")
-        print(f"  [OK] MoltenVK framework verified at: {fw_path}")
-    else:
-        print("  [WARN] MoltenVK.framework found, marking ready relative to root")
-        ready.write_text("MoltenVK\n", encoding="utf-8")
+    dest.mkdir(parents=True, exist_ok=True)
+    tar = dest.parent / "MoltenVK-ios.tar"
+    if not tar.exists():
+        print(f"[..] Downloading MoltenVK {MOLTENVK_VERSION} for iOS")
+        with urllib.request.urlopen(MOLTENVK_URL, timeout=300) as resp:
+            tar.write_bytes(resp.read())
+    with tarfile.open(tar) as t:
+        t.extractall(dest)
+    xcf = list(dest.rglob("dynamic/MoltenVK.xcframework"))
+    if not xcf:
+        sys.exit(f"[ERROR] The MoltenVK tar has no dynamic/MoltenVK.xcframework ({dest})")
+    marker.write_text(str(xcf[0].relative_to(dest)) + "\n", encoding="utf-8")
+    # Also write marker to .nfsmw-ios for compatibility
+    alt_marker = sdk / ".nfsmw-ios" / "MoltenVK"
+    alt_marker.mkdir(parents=True, exist_ok=True)
+    (alt_marker / (MOLTENVK_VERSION + ".ready")).write_text(
+        str(xcf[0].relative_to(dest)) + "\n", encoding="utf-8"
+    )
+    tar.unlink(missing_ok=True)
+    print(f"[ok] MoltenVK in {xcf[0]}")
 
 
-def apply_ios_patches(sdk):
-    folder = sdk / ".nfsc-ios"
-    folder.mkdir(parents=True, exist_ok=True)
-    applied_log = folder / "ios-patches.applied"
-    already_applied = set()
-    if applied_log.exists():
-        already_applied = set(applied_log.read_text(encoding="utf-8").splitlines())
+def project_patches(sdk):
+    """The project patches still missing, each one only once."""
+    marker = sdk / ".nfsc-ios" / "project-patches.applied"
+    if not marker.exists():
+        marker = sdk / ".nfsmw-ios" / "project-patches.applied"
+    done = marker.read_text(encoding="utf-8").split() if marker.exists() else []
+    full = ANDROID.PARCHES_PROYECTO
+    pending = [p for p in full if p not in done]
+    if not pending:
+        print(f"[ok] All {len(full)} project patches already applied")
+        return
+    last = max((full.index(d) for d in done if d in full), default=-1)
+    for p in pending:
+        if full.index(p) < last:
+            print(f"[!!] {p} sits in the middle of list and is applied after the "
+                  f"ones that follow it: if it fails, prepare the SDK from scratch")
 
-    tools_ios = ROOT / "tools" / "ios"
-    env = dict(os.environ, NFSMW_SDK=str(sdk), NFSC_SDK=str(sdk))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    original = ANDROID.PARCHES_PROYECTO
+    try:
+        for p in pending:
+            ANDROID.PARCHES_PROYECTO = [p]
+            ANDROID.parches_proyecto(sdk)
+            done.append(p)
+            marker.write_text("\n".join(done) + "\n", encoding="utf-8")
+    finally:
+        ANDROID.PARCHES_PROYECTO = original
 
-    newly_applied = []
-    for patch_name in IOS_PATCHES:
-        if patch_name in already_applied:
-            continue
-        patch_file = tools_ios / f"{patch_name}.py"
-        if not patch_file.exists():
-            continue
 
-        cmd = [sys.executable, str(patch_file)]
-        res = subprocess.run(cmd, env=env, text=True, capture_output=True)
-        if res.returncode == 0:
-            newly_applied.append(patch_name)
-            print(f"  [OK] {patch_name}")
+def ios_patches(sdk, status=False):
+    env = dict(
+        os.environ,
+        NFSCARBON_SDK=str(sdk),
+        NFSC_SDK=str(sdk),
+        NFSMW_SDK=str(sdk),
+    )
+    for p in IOS_PATCHES:
+        cmd = [sys.executable, str(ROOT / "tools" / "ios" / f"{p}.py")]
+        if status:
+            cmd.append("--status")
+        r = subprocess.run(cmd, env=env, text=True, capture_output=True)
+        out = (r.stdout + r.stderr).strip()
+        if r.returncode != 0:
+            print(out)
+            sys.exit(f"[ERROR] {p} failed. The earlier ones are already applied; "
+                     f"re-running this script is safe.")
+        if status:
+            print(out)
         else:
-            print(f"  [WARN] {patch_name}: {res.stderr.strip() or res.stdout.strip()}")
-
-    if newly_applied:
-        with open(applied_log, "a", encoding="utf-8") as f:
-            for p in newly_applied:
-                f.write(f"{p}\n")
-
-
-def prepare(sdk_path=None):
-    sdk = pathlib.Path(sdk_path) if sdk_path else SDK_DEFAULT
-    sdk = sdk.resolve()
-
-    print(f"============================================================")
-    print(f"  Preparing ReXGlue SDK for NFS Carbon iOS (arm64 Native)   ")
-    print(f"  Location: {sdk}")
-    print(f"============================================================")
-
-    step(1, "Clone ReXGlue SDK (v0.10.0)")
-    clone_sdk(sdk)
-
-    step(2, "Download & Apply ARM64 Memory Barrier Patches")
-    apply_ref_patches(sdk)
-
-    step(3, "Download MoltenVK v1.4.1 for iOS")
-    download_moltenvk(sdk)
-
-    step(4, "Apply iOS ReXGlue Platform Patches")
-    apply_ios_patches(sdk)
-
-    print("\n[Complete] ReXGlue iOS SDK is fully configured and ready.")
+            first = next((l for l in out.splitlines() if l.startswith("[")), "")
+            print(f"  {p:30s} {first}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare ReXGlue SDK for NFS Carbon iOS")
-    parser.add_argument("--sdk", help="Path to rexglue-sdk-ios", default=None)
-    parser.add_argument("--status", action="store_true", help="Check current SDK preparation status")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Prepares the ReXGlue SDK for iOS.")
+    ap.add_argument("--sdk", default=str(ROOT.parent / "rexglue-sdk-ios"),
+                    help="iOS SDK folder (default ../rexglue-sdk-ios)")
+    ap.add_argument("--status", action="store_true", help="only report which patches are in")
+    args = ap.parse_args()
+    sdk = pathlib.Path(args.sdk).resolve()
 
-    sdk = pathlib.Path(args.sdk) if args.sdk else SDK_DEFAULT
     if args.status:
-        check_status(sdk)
-    else:
-        prepare(args.sdk)
+        if not (sdk / "CMakeLists.txt").exists():
+            sys.exit(f"[ERROR] No SDK in {sdk}")
+        marker = sdk / ".nfsc-ios" / "project-patches.applied"
+        if not marker.exists():
+            marker = sdk / ".nfsmw-ios" / "project-patches.applied"
+        done = marker.read_text(encoding="utf-8").split() if marker.exists() else []
+        full = ANDROID.PARCHES_PROYECTO
+        print(f"  project patches: {sum(p in done for p in full)} of {len(full)} applied (recorded)")
+        for p in full:
+            print(f"      {'yes' if p in done else 'NO':>3}  {p}")
+        ios_patches(sdk, status=True)
+        return 0
+
+    step(1, f"SDK {ANDROID.SDK_TAG}")
+    ANDROID.clonar(sdk)
+    ensure_git_tags(sdk)
+    ANDROID.reparar_symlinks(sdk)
+
+    step(2, "hells-gate's Android SDK patch: ARM64 barriers")
+    ANDROID.aplicar_parches_ref(sdk)
+
+    step(3, "Project patches (Android base, once each)")
+    project_patches(sdk)
+
+    step(4, f"MoltenVK {MOLTENVK_VERSION} for iOS")
+    moltenvk(sdk)
+
+    step(5, "iOS platform patches")
+    ios_patches(sdk)
+
+    step(6, "Extra safeguards")
+    safeguard_vulkan_loader(sdk)
+    safeguard_rex_version(sdk)
+    ensure_git_tags(sdk)
+
+    print(f"\n[ok] SDK ready in {sdk}")
+    print("     Next: build from ios/ (cmake --preset ios).")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

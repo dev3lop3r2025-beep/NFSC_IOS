@@ -37,6 +37,8 @@ Thumbs.db
 .idea/
 *.swp
 *~
+__pycache__/
+*.pyc
 
 # ReXGlue SDK build artifacts
 rexglue-sdk-ios/

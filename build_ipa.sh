@@ -56,12 +56,36 @@ else
     echo -e "${YELLOW}[NOTE] No generated sources found. App will build in probe mode unless default.xex is provided.${RESET}"
 fi
 
+# 3.5. Prepare ReXGlue iOS SDK
+echo -e "\n${BOLD}${YELLOW}[3.5/5] Preparing ReXGlue iOS SDK...${RESET}"
+python3 "${SCRIPT_DIR}/tools/ios/prepare_sdk.py" --sdk "${SCRIPT_DIR}/../rexglue-sdk-ios"
+if [ -d "${SCRIPT_DIR}/../rexglue-sdk-ios" ]; then
+    (cd "${SCRIPT_DIR}/../rexglue-sdk-ios" && git tag -f v0.10.0 HEAD 2>/dev/null || true)
+fi
+
 # 4. Configure & Compile via CMake
 echo -e "\n${BOLD}${YELLOW}[4/5] Configuring and building iOS targets...${RESET}"
 mkdir -p "${BUILD_DIR}"
 
 cd "${SCRIPT_DIR}/ios"
-cmake --preset ios
+if command -v xcrun >/dev/null 2>&1; then
+    export CC="$(xcrun --sdk iphoneos --find clang 2>/dev/null || which clang)"
+    export CXX="$(xcrun --sdk iphoneos --find clang++ 2>/dev/null || which clang++)"
+    export OBJC="${CC}"
+    export OBJCXX="${CXX}"
+fi
+cmake --preset ios \
+    -DCMAKE_SYSTEM_NAME=iOS \
+    -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_SYSROOT=iphoneos \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+    -DREX_PLATFORM_IOS=1 \
+    ${CC:+-DCMAKE_C_COMPILER="${CC}"} \
+    ${CXX:+-DCMAKE_CXX_COMPILER="${CXX}"} \
+    ${OBJC:+-DCMAKE_OBJC_COMPILER="${OBJC}"} \
+    ${OBJCXX:+-DCMAKE_OBJCXX_COMPILER="${OBJCXX}"} \
+    ${CC:+-DCMAKE_ASM_COMPILER="${CC}"}
 cmake --build --preset ios --target ipa
 
 cd "${SCRIPT_DIR}"

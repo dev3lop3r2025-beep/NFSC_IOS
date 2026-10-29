@@ -8,9 +8,11 @@
             "binaryDir": "$env{HOME}/Library/Caches/nfscarbon-ios/build",
             "cacheVariables": {
                 "CMAKE_SYSTEM_NAME": "iOS",
+                "CMAKE_SYSTEM_PROCESSOR": "arm64",
                 "CMAKE_OSX_SYSROOT": "iphoneos",
                 "CMAKE_OSX_ARCHITECTURES": "arm64",
                 "CMAKE_OSX_DEPLOYMENT_TARGET": "16.0",
+                "REX_PLATFORM_IOS": "1",
                 "CMAKE_BUILD_TYPE": "Release"
             }
         }

@@ -56,14 +56,35 @@ workflows:
         script: |
           set -e
           echo "[Codemagic] Preparing ReXGlue iOS SDK and applying Apple Silicon patches..."
-          python3 tools/prepare_sdk.py
+          python3 tools/ios/prepare_sdk.py --sdk "$CM_BUILD_DIR/../rexglue-sdk-ios"
+          # Ensure git tag v0.10.0 is reachable in the SDK so rex_compute_version succeeds
+          if [ -d "$CM_BUILD_DIR/../rexglue-sdk-ios" ]; then
+            cd "$CM_BUILD_DIR/../rexglue-sdk-ios"
+            git tag -f v0.10.0 HEAD 2>/dev/null || true
+            cd "$CM_BUILD_DIR"
+          fi
 
       - name: Configure CMake for iOS (ARM64 Native)
         script: |
           set -e
           echo "[Codemagic] Configuring CMake with iOS preset..."
           cd ios
+          export CC="$(xcrun --sdk iphoneos --find clang)"
+          export CXX="$(xcrun --sdk iphoneos --find clang++)"
+          export OBJC="${CC}"
+          export OBJCXX="${CXX}"
           cmake --preset ios \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DREX_PLATFORM_IOS=1 \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DCMAKE_CXX_COMPILER="${CXX}" \
+            -DCMAKE_OBJC_COMPILER="${CC}" \
+            -DCMAKE_OBJCXX_COMPILER="${CXX}" \
+            -DCMAKE_ASM_COMPILER="${CC}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
