@@ -1,0 +1,39 @@
+# ============================================================================
+#  Need for Speed: Carbon (Xbox 360, Title ID: 454107EC) Recomp Overrides
+#  Manual function declarations and bounds for ReXGlue ahead-of-time codegen
+# ============================================================================
+
+cr_as_local = false
+xer_as_local = false
+ctr_as_local = false
+non_volatile_as_local = false
+
+[functions]
+# Branch targets with unresolved function boundaries in automatic discovery
+# b 0x82A65510 at 0x82A65974
+"0x82A65510" = { }
+
+# b 0x82321850 at 0x823002A8
+"0x82321850" = { }
+
+# b 0x82A62188 at 0x82A62FBC
+"0x82A62188" = { }
+
+# Entrypoint called indirectly during resource initialization
+# Sits after the four-instruction thunk at 0x824DAA90
+"0x824DAAA0" = { }
+
+# Setup sequence called when entering Career mode
+"0x825BF6A0" = { }
+
+# State machine dispatcher entry
+"0x82296468" = { }
+
+# Story mode object resource update entry
+"0x822A9490" = { }
+
+# Adjustor thunk
+"0x82641480" = { }
+
+# Virtual dispatch fallback entry
+"0x82322048" = { }

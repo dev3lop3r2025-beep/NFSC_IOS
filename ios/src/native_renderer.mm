@@ -1,0 +1,8550 @@
+// Native renderer, step 3: the first frames drawn by Metal from the game's own
+// draws, next to the existing (emulated) renderer.
+//
+// Every 10 s, if the frame is menu-sized (nfsmw_native_dump), each draw of
+// one frame is recorded on the game's thread at draw time, when guest memory
+// holds exactly what that draw reads:
+//   - the shaders: Metal libraries vs_/ps_<key> from tools/native/
+//     build_shaders.sh (bundled in NativeShaders/ in local test builds);
+//   - the vertex inputs: for each input of the vertex shader
+//     (NativeShaders/vertex_inputs.txt: the vfetch instruction it comes
+//     from), that instruction (fetch constant, offset, stride, format) read
+//     from the bound microcode, every vertex decoded to a float4 (uint4 for
+//     blend indices) with the fetch constant's endianness;
+//   - the indices: 16/32-bit with their endianness, plus VGT_INDX_OFFSET;
+//     quad and rectangle lists turned into triangle lists;
+//   - the constants: c0-255 of each stage straight from the ALU constant
+//     registers (the translated shaders read cN at N * 16), the booleans;
+//   - the textures of fetch slots 0-15 (2D): untiled, endian-swapped,
+//     8_8_8_8 / DXT1 / DXT3 / DXT5 / 8 / 8_8 / 5_6_5 / 4_4_4_4 / 16F, the
+//     fetch constant's swizzle as a Metal texture swizzle;
+//   - render state: render target (RB_SURFACE_INFO / COLOR_INFO /
+//     DEPTH_INFO), blend, depth, colour mask, viewport, scissor.
+// Then, on a queue of its own, Metal draws the frame: every render target
+// (EDRAM colour base + pitch + format) is a texture of its own, and each one
+// is written to Documents/native/pass_NN_<pitch>x<height>.png.
+//
+// Not yet: inline-vertex draws, alpha test, stencil, cube and 3D textures,
+// culling, the console's gamma. Resolution scaling and MSAA use
+// the native renderer's target allocation and pipeline settings below.
+
+#import <CoreImage/CoreImage.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
+
+#include <mach/mach.h>
+#include <os/os_sync_wait_on_address.h>
+#include <mach/mach_time.h>
+#include <cstddef>
+#include <type_traits>
+#include <objc/runtime.h>
+#include <pthread.h>
+#include <mach/task_info.h>
+
+#include <algorithm>
+#include <dlfcn.h>
+#include <deque>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <tuple>
+#include <unordered_set>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <rex/cvar.h>
+#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/xenos.h>
+#include <rex/logging.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
+
+#include "battery.h"
+#include "native_renderer.h"
+#include "memory_report.h"
+#include "gpu_capture.h"
+#include "native_arena_ranges.h"
+#include "native_texture_masks.h"
+#include "native_draw_arena.h"
+
+// The SDK's command processor (tools/ios/patch_ios_native_only.py).
+extern std::atomic<bool> rex_native_draws_only;
+// Game-thread time in the draw capture (native_draw_census.cpp).
+extern std::atomic<uint64_t> nfsmw_capture_ns;
+// The command processor's hooks (the same in tools/ios/patch_ios_native_only.py).
+struct RexNativeDraw {
+  const uint32_t* regs;
+  const uint32_t* vs_ucode;
+  uint32_t vs_dwords;
+  const uint32_t* ps_ucode;
+  uint32_t ps_dwords;
+  uint64_t vs_hash, ps_hash;
+  uint32_t index_base, index_endian, index_count;
+};
+extern std::atomic<void (*)(const RexNativeDraw*)> rex_native_draw_hook;
+extern std::atomic<void (*)(const uint32_t*)> rex_native_resolve_hook;
+extern std::atomic<void (*)()> rex_native_swap_hook;
+// Occlusion queries (tools/ios/patch_ios_native_occlusion.py): (sample count
+// address, query end, count out) -> handled.
+extern std::atomic<bool (*)(uint32_t, bool, uint64_t*)> rex_native_occlusion_hook;
+
+// Oct 28 diagnostic (D-005): a screen recording showed every other picture
+// repeated in ~1 s stretches while 60 new frames a second were swapped and
+// shown on time. Each frame copies a strip of the displayed picture and
+// compares it with the previous frame's; each repeat is logged with where
+// the picture came from.
+REXCVAR_DEFINE_BOOL(nfsmw_native_repeat_log, false, "GPU",
+                    "Native renderer: log frames whose displayed picture repeats the previous one's");
+REXCVAR_DEFINE_BOOL(nfsmw_native_vfetch_cache, false, "GPU",
+                    "Native renderer: cache vertex fetch layouts by the full runtime shader hash");
+REXCVAR_DEFINE_BOOL(nfsmw_native_reclaim_geometry, true, "GPU",
+                    "Native renderer: reuse completed geometry ranges and release surplus empty chunks");
+REXCVAR_DEFINE_BOOL(nfsmw_native_compressible_resolves, false, "GPU",
+                    "Native renderer: omit unnecessary pixel-format-view usage on resolves and reflection cubes");
+REXCVAR_DEFINE_BOOL(nfsmw_native_deduplicate_cubes, true, "GPU",
+                    "Native renderer: assemble each identical reflection cube destination only once");
+REXCVAR_DEFINE_BOOL(nfsmw_native_texture_masks, true, "GPU",
+                    "Native renderer: process only shader-referenced texture slots (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_draw_arena, true, "GPU",
+                    "Native renderer: pool CPU attribute lists per frame and reserve draw storage (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_render_utility, true, "GPU",
+                    "Experiment: request Utility QoS for the serial Metal encoding queue (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_attribute_lookup, true, "GPU",
+                    "Experiment: cache decoded attribute entry lookups without skipping content validation (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_attribute_bulk_compare, false, "GPU",
+                    "Experiment: compare complete attribute front-cache keys in bulk (requires attribute lookup; restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_target_lookup, false, "GPU",
+                    "Experiment: reuse the last exact target lookup within frame setup and encoding (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_pipeline_lookup, false, "GPU",
+                    "Experiment: reuse the last successful ready-pipeline lookup on an exact key match (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_gpu_lookup_hash, true, "GPU",
+                    "Experiment: mix higher pointer bits into the existing GPU-buffer cache selector (restart required)");
+REXCVAR_DEFINE_INT32(nfsmw_native_gpu_lookup_slots_log2, 14, "GPU",
+                     "GPU-buffer direct cache size as a power of two, 12-15 (12 = 4096 slots before IPA64; restart required)");
+REXCVAR_DEFINE_INT32(nfsmw_native_attribute_lookup_sets_log2, 14, "GPU",
+                     "Attribute front-cache sets (2 ways each) as a power of two, 12-14 (12 before IPA64; restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_gpu_lookup_stats, false, "GPU",
+                    "Diagnostics: count GPU-buffer front-cache hits, collisions and new map entries (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_lazy_diagnostics, true, "GPU",
+                    "Experiment: prepare snapshot metadata and GPU labels only when consumed (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_fingerprint_memo, true, "GPU",
+                    "Experiment: fingerprint a non-dynamic vertex region once per frame, not per draw (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_fast_index_fingerprint, true, "GPU",
+                    "Native renderer: hash index buffers in four independent lanes (every word, "
+                    "as before, but not one long dependent chain)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_shadow_caster_variant, true, "GPU",
+                    "Experiment: shadow casters without the cut-out compiled in where it is off (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_early_commit, false, "GPU",
+                    "Experiment: commit finished render passes to the GPU while the frame is still encoded (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_fused_upload_sizing, true, "GPU",
+                    "Experiment: size the frame upload buffer in one draw traversal (restart required)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_dump, false, "GPU",
+                    "Native renderer bring-up: every 10 s, draw a menu frame with Metal and save "
+                    "each render target to Documents/native");
+// While the native renderer shows the game, the emulated renderer's draws and
+// resolves are skipped (tools/ios/patch_ios_native_only.py): it does every
+// other GPU packet still. Off: both draw, as before.
+REXCVAR_DEFINE_BOOL(nfsmw_native_exclusive, true, "GPU",
+                    "Native renderer: skip the emulated renderer's draws while it shows the game");
+// The game waits for the native renderer instead of it dropping frames.
+// The sun glare's occlusion query counted by the native renderer.
+REXCVAR_DEFINE_BOOL(nfsmw_native_occlusion, true, "GPU",
+                    "Native renderer: answer the game's occlusion queries (the sun glare) by "
+                    "counting its own samples");
+// Polygon offset (PA_SU_POLY_OFFSET_*): decals and overlays drawn on the
+// surface under them (the flickering grey on billboards was z-fighting).
+REXCVAR_DEFINE_BOOL(nfsmw_native_depth_bias, true, "GPU",
+                    "Native renderer: apply the game's polygon offset as Metal depth bias");
+// Cubes made from resolves (environment maps) sampled with the resolves'
+// red/blue swap and the fetch swizzle, as 2D resolves are.
+REXCVAR_DEFINE_BOOL(nfsmw_native_cube_swizzle, true, "GPU",
+                    "Native renderer: sample resolved cube maps with their red/blue swap and fetch swizzle");
+// Colour resolves scaled by their exponent bias (colour * 2^bias), as the
+// console's resolve does.
+REXCVAR_DEFINE_BOOL(nfsmw_native_exp_bias, true, "GPU",
+                    "Native renderer: apply the resolves' exponent bias (colour * 2^bias)");
+// Tuning shop car colour test: the car paint shaders without their
+// environment cube (black), or with a neutral grey 3D texture.
+REXCVAR_DEFINE_BOOL(nfsmw_native_test_no_envcube, false, "GPU",
+                    "Native renderer test: car paint without its environment cube");
+// The environment cube's faces (320-wide target) and the 240-wide blur target
+// came out black in every snapshot (IPA60): their draws without a depth test.
+REXCVAR_DEFINE_BOOL(nfsmw_native_test_small_no_depth, false, "GPU",
+                    "Native renderer test: no depth test in the 320- and 240-wide targets (environment cube, "
+                    "small blur)");
+// The bus-terminal glass (IPA62): every shader but the car paint and the
+// rear-view mirror reads a black environment cube, to see whether the glass's
+// harsh trees come from the cube term.
+REXCVAR_DEFINE_BOOL(nfsmw_native_test_no_envcube_world, false, "GPU",
+                    "Native renderer test: world surfaces (glass) without their environment cube");
+REXCVAR_DEFINE_BOOL(nfsmw_native_test_grey_volume, false, "GPU",
+                    "Native renderer test: car paint with a neutral grey 3D texture");
+// The movies (XMV player) drawn by the native renderer's own shaders.
+REXCVAR_DEFINE_BOOL(nfsmw_native_movies, true, "GPU",
+                    "Native renderer: draw the movies itself (off: the emulated renderer draws them)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_movie_16_9, true, "GPU",
+                    "Native renderer: movies keep 16:9 on wider screens (black bars at the sides)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_from_boot, true, "GPU",
+                    "Native renderer: the emulated renderer draws nothing from the first frame on "
+                    "(its memory is never filled)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_metal_hud, false, "GPU",
+                    "Native renderer: show Apple's Metal Performance HUD for the game picture");
+REXCVAR_DEFINE_BOOL(nfsmw_native_bc_gpu_decode, true, "GPU",
+                    "Native renderer: on GPUs without BC (DXT) formats, expand them on the GPU (off: on the CPU)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_present_at_time, true, "GPU",
+                    "Native renderer: below the display rate, keep each frame on screen at least one cap interval "
+                    "(frame pacing at the 30/40/60 caps)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_pace, true, "GPU",
+                    "Native renderer: the game waits for it rather than frames being dropped");
+// The draws from the emulated command processor (its own thread) instead of
+// the draw capture's decoding of D3D's command buffers on the game's thread.
+REXCVAR_DEFINE_BOOL(nfsmw_native_cp, true, "GPU",
+                    "Native renderer: take the draws from the command processor (off: from the game thread)");
+// Cached vertex data and textures trusted while the emulator reports no CPU
+// write to their pages (write_watch). Off: the SDK's iOS patches stop
+// watching pages written often (hot pages), so changes went unnoticed (UI
+// textures shown in the wrong places).
+REXCVAR_DEFINE_BOOL(nfsmw_native_write_watch, false, "GPU",
+                    "Native renderer: trust caches by the memory write watch (experimental)");
+REXCVAR_DEFINE_INT32(nfsmw_native_dump_interval_ms, 10000, "GPU",
+                     "Native renderer bring-up: time between snapshots (nfsmw_native_dump)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_dump_manual, false, "GPU",
+                    "Native renderer bring-up: snapshots (as nfsmw_native_dump) only when the SNAP "
+                    "touch button is tapped");
+// A snapshot asked for with the SNAP button (touch_controls.mm).
+std::atomic<bool> native_dump_requested{false};
+extern "C" void NativeRequestDump() { native_dump_requested.store(true, std::memory_order_relaxed); }
+// Bring-up: the alpha-tested shaders (fences, plants: 684f4711; trees:
+// 27d82ea0) replaced every 6 s by debug versions (test builds with
+// ps_<key>_dbg1-2 bundled): 1 their alpha as grey, 2 white where the alpha
+// test keeps the pixel and red where it discards it; 0 the real shader.
+// Bring-up: the wet road's shadow (ps af393d4c, with ps_<key>_dbg1-3): 1 the
+// shadow factor, 2 the "shadow map enabled" constant, 3 the shadow map
+// coordinates (red, green) and depth (blue); 0 the real shader.
+REXCVAR_DEFINE_BOOL(nfsmw_native_shadow_debug, false, "GPU",
+                    "Native renderer bring-up: show the wet road's shadow terms");
+REXCVAR_DEFINE_BOOL(nfsmw_native_alpha_debug, false, "GPU",
+                    "Native renderer bring-up: show what the alpha-tested shaders compute");
+REXCVAR_DEFINE_BOOL(nfsmw_native_sky_last, true, "GPU",
+                    "Native renderer: the sky drawn after the solid geometry that follows it, only where that "
+                    "left pixels untouched (the same picture, less shading)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_discard_unread, true, "GPU",
+                    "Native renderer: a target's depth, stencil and multisample samples are not written out "
+                    "after its last pass of the frame, unless a resolve or MetalFX reads them");
+REXCVAR_DEFINE_BOOL(nfsmw_native_compact_drawable, true, "GPU",
+                    "Native renderer: when the picture is smaller than the screen, the drawable is the "
+                    "picture's size and the compositor stretches it (same bilinear filter, no full-screen pass)");
+
+// The layer's drawable: the panel's pixels, or (compact) as many as the
+// picture has, the compositor stretching it to the layer like the present
+// pass did. The view's size in panel pixels is kept for the "native" scale
+// and MetalFX, which want the screen's.
+std::atomic<uint32_t> screen_pixels_w{0}, screen_pixels_h{0};
+std::atomic<uint32_t> drawable_want_w{0}, drawable_want_h{0};  // 0: the panel's pixels
+
+// The native renderer's own layer, over the game's view (touch controls stay
+// above it): a CAMetalLayer that follows the view's size.
+@interface NFSNativeView : UIView
+@end
+@implementation NFSNativeView
++ (Class)layerClass {
+  return CAMetalLayer.class;
+}
+- (void)layoutSubviews {
+  [super layoutSubviews];
+  CAMetalLayer* layer = (CAMetalLayer*)self.layer;
+  // The screen's real pixels per point: nativeScale, not scale. With Display
+  // Zoom ("More Space" on an iPad M1: 1389x970 points on 2388x1668 pixels)
+  // scale stays 2 and the drawable would have 35% more pixels than the panel.
+  UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
+  const CGFloat scale = screen.nativeScale ?: screen.scale;
+  layer.contentsScale = scale;
+  const CGSize full = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);
+  screen_pixels_w = uint32_t(std::lround(full.width));
+  screen_pixels_h = uint32_t(std::lround(full.height));
+  const uint32_t ww = drawable_want_w.load(), wh = drawable_want_h.load();
+  layer.drawableSize = ww && wh ? CGSizeMake(ww, wh) : full;
+}
+@end
+
+// HDMI and AirPlay: a second display (an adapter, or AirPlay chosen as a
+// separate display rather than mirroring) gets the picture alone, full size
+// and letterboxed to its own shape, without the touch controls; the phone
+// keeps showing the game with its controls. Its own layer, sized to that
+// screen's pixels.
+@interface NFSExternalView : UIView
+@property(nonatomic, weak) UIScreen* target;  // the external display
+@end
+@implementation NFSExternalView
++ (Class)layerClass {
+  return CAMetalLayer.class;
+}
+- (void)layoutSubviews {
+  [super layoutSubviews];
+  CAMetalLayer* layer = (CAMetalLayer*)self.layer;
+  // That display's own pixels (its screen, not the window's, which can be
+  // the phone's for a moment while the window moves).
+  UIScreen* screen = self.target ?: self.window.screen;
+  const CGSize pixels = screen.nativeBounds.size;
+  layer.contentsScale = screen.nativeScale ?: 1.0;
+  layer.drawableSize = CGSizeMake(std::max(pixels.width, pixels.height), std::min(pixels.width, pixels.height));
+}
+@end
+
+REXCVAR_DEFINE_BOOL(nfsmw_native_external_display, true, "GPU",
+                    "Native renderer: the picture on an external display (HDMI, AirPlay) by itself, "
+                    "instead of a mirror of the phone's screen");
+REXCVAR_DEFINE_BOOL(nfsmw_native_external_controls_only, true, "GPU",
+                    "Native renderer: with an external display, the phone shows only the touch "
+                    "controls, over black (off: the picture on both)");
+
+REXCVAR_DEFINE_BOOL(nfsmw_native_half_rate_reflections, false, "GPU",
+                    "Native renderer (battery): half the environment cube's faces drawn each frame, the "
+                    "others kept from the frame before");
+REXCVAR_DEFINE_DOUBLE(nfsmw_native_shadow_scale, 1.0, "GPU",
+                    "Native renderer (battery): the shadow map's size, times the game's (0.5: half)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_scale_shadows, false, "GPU",
+                    "Native renderer: the resolution scale also applies to the shadow map (depth-only targets)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_scale_reflections, false, "GPU",
+                    "Native renderer: the resolution scale also applies to the environment cube's faces (targets "
+                    "resolved only into a cube)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_present, false, "GPU",
+                    "Native renderer (experimental): every frame drawn by the native Metal renderer "
+                    "and shown on screen, over the emulated one");
+
+namespace xenos = rex::graphics::xenos;
+namespace texture_util = rex::graphics::texture_util;
+
+// The native renderer's own scale: the launcher sets the emulated renderer's
+// resolution_scale to 1 while this one shows the game.
+// Experiment (did not help, off): above 1x, split a pass after this many
+// indices, for the race's first-seconds stalls at 2x (none at 1x), in case
+// the scene pass overflowed the GPU's tiler memory. The split pieces stalled
+// the same, as did 340-draw loading frames.
+// Diagnostics: once every 60 frames, one frame drawn without the draws of
+// one pixel shader (in turn the 16 with the most draws), its GPU time logged
+// against the frames before: what each shader costs. Those frames lack
+// some objects (a flicker once a second).
+// The soft-shadow filter's 9 fetches as 4 gathers (tools/native/
+// rewrite_shadow_filter.py, shader_common.h's tfetch2DShadow9): function
+// constant 1 of every shader. Off: the 9 fetches as the game does them.
+REXCVAR_DEFINE_BOOL(nfsmw_native_shadow_gather, true, "GPU",
+                    "Native renderer: soft shadows from 4 gathers instead of 9 filtered fetches");
+REXCVAR_DEFINE_BOOL(nfsmw_native_async_pipelines, true, "GPU",
+                    "Native renderer: compile new pipelines in the background, leaving their draws out until ready "
+                    "(instead of a hitch while they compile)");
+REXCVAR_DEFINE_INT32(nfsmw_test_cpu_load, 0, "GPU",
+                     "Experiment: this many extra threads kept busy from the start (0-6), to see whether CPU load "
+                     "makes the system throttle the GPU (the race-start stutter)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_constant_ranges, true, "GPU",
+                    "Native renderer: compare and upload only the float constants each shader reads "
+                    "(false: all 256 of each stage, per draw)");
+REXCVAR_DEFINE_INT32(nfsmw_native_writeback_kb, 16, "GPU",
+                     "Native renderer: colour resolves up to this size (KB) are copied back to guest memory for the "
+                     "game's CPU (the exposure reads its brightness from one); 256 = the old limit");
+REXCVAR_DEFINE_BOOL(nfsmw_native_cost_probe, false, "GPU",
+                    "Native renderer diagnostics: measure each pixel shader's GPU cost by leaving it out of one frame");
+REXCVAR_DEFINE_INT32(nfsmw_native_pass_split_indices, 0, "GPU",
+                     "Native renderer: above 1x, a pass is split after this many indices (0 = never)");
+REXCVAR_DEFINE_STRING(nfsmw_native_fxaa, "off", "GPU",
+                      "Native renderer: FXAA over the final picture (off, normal, high); left out under "
+                      "MetalFX, which anti-aliases itself");
+REXCVAR_DEFINE_INT32(nfsmw_native_force_msaa, 0, "GPU",
+                     "Native renderer: MSAA (2 or 4) for the scene where the game draws it without "
+                     "(at 19.5:9 the console's 10 MB EDRAM had no room for it); 0 = the game's own");
+REXCVAR_DEFINE_STRING(nfsmw_native_metalfx, "off", "GPU",
+                      "Native renderer: MetalFX temporal (motion vectors, a jittered scene) to the picture's "
+                      "size on screen (screen), to three quarters of it (lower), or at the size drawn, as "
+                      "anti-aliasing (drawn); off");
+// Bumped by the in-game options menu (launcher.mm) after it changes the
+// render resolution or MetalFX: the two settings below are read again.
+std::atomic<uint32_t> settings_generation{0};
+extern "C" void NativeSettingsChanged() { settings_generation.fetch_add(1, std::memory_order_release); }
+
+// MetalFX temporal on (any size). Read once per frame by the recording
+// (Frame's motion and jitter follow it), so a change starts on a new frame.
+bool MetalFxTemporal() {
+  static std::atomic<uint32_t> read_at{~0u};
+  static std::atomic<bool> on{false};
+  const uint32_t generation = settings_generation.load(std::memory_order_acquire);
+  if (read_at.load(std::memory_order_acquire) != generation) {
+    const std::string mode = REXCVAR_GET(nfsmw_native_metalfx);
+    on.store(mode == "screen" || mode == "lower" || mode == "drawn", std::memory_order_relaxed);
+    read_at.store(generation, std::memory_order_release);
+  }
+  return on.load(std::memory_order_relaxed);
+}
+REXCVAR_DEFINE_BOOL(nfsmw_native_motion_debug, false, "GPU",
+                    "Native renderer diagnostics: the scene's motion vectors shown instead of the picture "
+                    "(grey: still; red/green: moving right/down; dark: no motion written)");
+REXCVAR_DEFINE_BOOL(nfsmw_native_jitter_flip, false, "GPU",
+                    "Native renderer diagnostics: MetalFX temporal told the opposite jitter offset");
+REXCVAR_DEFINE_STRING(nfsmw_native_resolution_scale, "1", "GPU",
+                      "Native renderer: internal resolution scale (1 = the console's 720p; fractions such as 1.5 "
+                      "work; \"native\" = the screen's own pixels)");
+
+// "native": the scale that makes the game's output as many pixels high as the
+// screen (render thread: from the layer's drawable and the frame's last
+// colour resolve).
+std::atomic<float> native_screen_scale{0.0f};
+
+// The internal resolution scale: a target of W x H guest pixels is drawn at
+// round(W * scale) x round(H * scale). While the phone is hot, at most
+// battery::HeatScale() (battery.mm): the targets are made again at the new
+// size on the next frame. The in-game options menu changes the setting the
+// same way (settings_generation).
+float NativeResolutionScale() {
+  static std::atomic<uint32_t> read_at{~0u};
+  static std::atomic<bool> native{false};
+  static std::atomic<float> fixed{1.0f};
+  const uint32_t generation = settings_generation.load(std::memory_order_acquire);
+  if (read_at.load(std::memory_order_acquire) != generation) {
+    const std::string setting = REXCVAR_GET(nfsmw_native_resolution_scale);
+    native.store(setting == "native", std::memory_order_relaxed);
+    fixed.store(std::clamp(float(std::strtod(setting.c_str(), nullptr)), 0.5f, 4.0f), std::memory_order_relaxed);
+    read_at.store(generation, std::memory_order_release);
+  }
+  const float s = native_screen_scale.load();
+  const float f = fixed.load(std::memory_order_relaxed);
+  const float chosen = !native.load(std::memory_order_relaxed) ? (std::isfinite(f) && f > 0 ? f : 1.0f)
+                       : s > 0                                 ? s
+                                                               : 1.0f;  // until the first frame has been shown
+  const float hot = nfsmw::battery::HeatScale();
+  return hot > 0 ? std::min(chosen, hot) : chosen;
+}
+
+// Guest pixels at a scale: rounded, so that neighbouring rectangles meet.
+inline uint32_t Px(double v, float scale) { return uint32_t(std::max(0L, std::lround(v * scale))); }
+
+uint32_t NativeSampleCount(id<MTLDevice> device, uint32_t surface_info, bool msaa_disabled,
+                           uint32_t maximum) {
+  if (msaa_disabled) return 1;
+  const uint32_t requested = 1u << ((surface_info >> 16) & 3);
+  uint32_t samples = std::min(requested, maximum);
+  while (samples > 1 && ![device supportsTextureSampleCount:samples]) samples >>= 1;
+  return std::max(samples, 1u);
+}
+
+extern "C" float nfsmw_mirror_scale_x, nfsmw_mirror_scale_y, nfsmw_mirror_shift_y;  // game_scene_size.cpp
+
+namespace {
+
+// Every texture the renderer makes, described in the system log first (NSLog,
+// public) for the first 60: Metal aborts on a descriptor it rejects, and its
+// own message is private ("validateWithDevice: ... error '<private>'"), as on
+// the iPhone 14 Pro Max (A16) at the first frame.
+id<MTLTexture> NewTexture(id<MTLDevice> device, MTLTextureDescriptor* d, const char* what) {
+  static std::atomic<int> left{60};
+  if (left.fetch_sub(1) > 0) {
+    NSLog(@"[nfsmw-native] texture %s: type %d format %d %dx%dx%d array %d mips %d samples %d storage %d usage 0x%x",
+          what, int(d.textureType), int(d.pixelFormat), int(d.width), int(d.height), int(d.depth),
+          int(d.arrayLength), int(d.mipmapLevelCount), int(d.sampleCount), int(d.storageMode), unsigned(d.usage));
+  }
+  return [device newTextureWithDescriptor:d];
+}
+
+
+// --- Registers ----------------------------------------------------------------
+
+constexpr uint32_t kRbSurfaceInfo = 0x2000, kRbColorInfo = 0x2001, kRbDepthInfo = 0x2002;
+constexpr uint32_t kPaScWindowOffset = 0x2080, kPaScWindowScissorTl = 0x2081,
+                   kPaScWindowScissorBr = 0x2082;
+constexpr uint32_t kVgtIndxOffset = 0x2102, kRbColorMask = 0x2104;
+constexpr uint32_t kVportXScale = 0x210F;  // X scale, X offset, Y scale, Y offset, Z scale, Z offset
+constexpr uint32_t kRbDepthControl = 0x2200, kRbBlendControl0 = 0x2201;
+constexpr uint32_t kPaSuScModeCntl = 0x2205, kPaClVteCntl = 0x2206;
+constexpr uint32_t kAluBase = 0x4000, kFetchBase = 0x4800, kBoolBase = 0x4900;
+
+float AsFloat(uint32_t v) {
+  float f;
+  std::memcpy(&f, &v, 4);
+  return f;
+}
+
+// The recording's clock (per draw, several times): mach_absolute_time, one
+// register read. steady_clock is mach_continuous_time on iOS, ~10x as slow.
+struct FastClock {
+  using duration = std::chrono::nanoseconds;
+  using rep = duration::rep;
+  using period = duration::period;
+  using time_point = std::chrono::time_point<FastClock>;
+  static constexpr bool is_steady = true;
+  static time_point now() noexcept {
+    static const mach_timebase_info_data_t tb = [] {
+      mach_timebase_info_data_t t;
+      mach_timebase_info(&t);
+      return t;
+    }();
+    return time_point(duration(rep(mach_absolute_time() * tb.numer / tb.denom)));
+  }
+};
+
+// A texture fetch constant (6 dwords): the key of the frame's textures and the
+// texture cache.
+struct FetchKey {
+  uint32_t v[6];
+  bool operator==(const FetchKey& o) const { return std::memcmp(v, o.v, sizeof(v)) == 0; }
+};
+struct FetchKeyHash {
+  size_t operator()(const FetchKey& k) const {
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint32_t x : k.v) h = (h ^ x) * 0x100000001B3ull;
+    return size_t(h ^ (h >> 29));
+  }
+};
+
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+rex::memory::Memory* Mem() {
+  auto* kernel = rex::system::kernel_state();
+  return kernel ? kernel->memory() : nullptr;
+}
+
+const uint8_t* Physical(uint32_t address) { return Mem()->TranslatePhysical<const uint8_t*>(address); }
+
+// Resolves written back to guest memory (small ones, as the console's GPU
+// writes every resolve there: the game may read them on the CPU, e.g. the
+// scene's brightness for the exposure). The emulated renderer used to; with
+// it skipped (nfsmw_native_exclusive) the native renderer does. Done when
+// the GPU has finished; the addresses then go to the game thread, which
+// refreshes its fingerprints of them (its own copy stays in use).
+struct WriteBack {
+  id<MTLBuffer> pixels;  // RGBA8, rows of row_bytes
+  uint32_t row_bytes;
+  uint32_t src_w, src_h;  // the copied pixels' size
+  uint32_t base, pitch;  // guest physical; pitch in texels
+  uint32_t x0, y0, w, h;
+  float scale = 1;
+  bool swap;
+  uint32_t endian;
+};
+std::mutex written_back_mutex;
+std::vector<uint32_t> written_back;  // addresses, for the game thread
+
+uint32_t LoadLE32(const uint8_t* p) {
+  uint32_t v;
+  std::memcpy(&v, p, 4);
+  return v;
+}
+
+// --- Shaders ------------------------------------------------------------------
+
+struct VertexInput {
+  uint32_t address;   // vfetch instruction
+  uint32_t usage;
+  uint32_t location;  // Metal attribute
+  uint32_t swizzle = 0x688;  // the vfetch's destination swizzle in the game's file (XYZW)
+  int32_t dst = -1;          // the register it writes (-1: unknown, use the address)
+};
+
+struct ShaderStore {
+  id<MTLDevice> device;
+  std::map<std::string, id<MTLFunction>> functions;
+  std::map<std::string, id<MTLLibrary>> libraries;       // for specialized variants
+  std::map<std::pair<uint64_t, uint32_t>, id<MTLFunction>> ps_variants;
+  std::map<std::pair<uint64_t, uint32_t>, id<MTLFunction>> motion_variants;  // (key ^ pixel << 63, spec)
+  std::unordered_map<uint64_t, std::vector<VertexInput>> inputs;  // by VS key
+  std::set<uint64_t> internal_keys;  // D3D's run-time vertex shaders (written here)
+  nfsmw::TextureMasks texture_masks;
+  // The float constant registers each shader reads, FIRST..END-1
+  // (constant_ranges.txt, tools/native/constant_ranges.py); not listed: all.
+  std::unordered_map<uint64_t, std::pair<uint16_t, uint16_t>> constant_ranges;  // by "vs"/"ps" key ^ kind
+  std::pair<uint16_t, uint16_t> ConstantRange(bool pixel, uint64_t key) const {
+    if (!REXCVAR_GET(nfsmw_native_constant_ranges)) return {0, 256};
+    auto it = constant_ranges.find(key ^ (pixel ? 1ull : 0ull) << 63);
+    return it != constant_ranges.end() ? it->second : std::pair<uint16_t, uint16_t>{0, 256};
+  }
+  bool loaded = false;
+
+  void Load() {
+    if (loaded) {
+      return;
+    }
+    loaded = true;
+    device = MTLCreateSystemDefaultDevice();
+    // Experiment (nfsmw_test_cpu_load): CPU load that does nothing useful, to
+    // see whether the GPU's duty cycling at a race's start follows the SoC's
+    // power use rather than anything the renderer does.
+    for (int i = 0; i < std::clamp(REXCVAR_GET(nfsmw_test_cpu_load), 0, 6); ++i) {
+      std::thread([i] {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+        volatile double x = 1.0 + i;
+        for (;;) {
+          for (int k = 0; k < 1000000; ++k) x = x * 1.0000001 + 0.0000001;
+        }
+      }).detach();
+    }
+    if (REXCVAR_GET(nfsmw_test_cpu_load) > 0) {
+      REXLOG_INFO("[native] experiment: {} busy threads for CPU load", std::clamp(REXCVAR_GET(nfsmw_test_cpu_load), 0, 6));
+    }
+    {  // Metal's capture layer wraps every call (several times the encoding cost)
+      const char* cls = object_getClassName(device);
+      const char* env = getenv("MTL_CAPTURE_ENABLED");
+      REXLOG_INFO("[native] Metal device {} ({}{}), MTL_CAPTURE_ENABLED={}", device.name.UTF8String, cls,
+                  std::strstr(cls, "Capture") ? ": the GPU capture layer is on, CPU timings are inflated" : "",
+                  env ? env : "unset");
+    }
+    NSString* dir =
+        [[NSBundle mainBundle].resourcePath stringByAppendingPathComponent:@"NativeShaders"];
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    const uint32_t spec = 0;
+    [constants setConstantValue:&spec type:MTLDataTypeUInt atIndex:0];
+    const bool shadow_gather = REXCVAR_GET(nfsmw_native_shadow_gather);
+    [constants setConstantValue:&shadow_gather type:MTLDataTypeBool atIndex:1];
+    uint32_t unloadable = 0;
+    for (NSString* name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]) {
+      if (![name.pathExtension isEqualToString:@"metallib"]) {
+        continue;
+      }
+      NSURL* url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:name]];
+      NSError* error = nil;
+      id<MTLLibrary> library = [device newLibraryWithURL:url error:&error];
+      // E.g. built for a newer iOS than this one (iOS 26 with libraries for
+      // 27): nothing but the movies draws. Said once, with the count below.
+      if (!library && unloadable++ == 0) {
+        REXLOG_WARN("[native] shader library {} not loaded: {}", name.UTF8String,
+                    error ? error.localizedDescription.UTF8String : "?");
+      }
+      id<MTLFunction> f = [library newFunctionWithName:@"shaderMain" constantValues:constants error:nil];
+      if (f) {
+        f.label = name.stringByDeletingPathExtension;  // e.g. ps_<key>, named in GPU traces
+        functions[name.stringByDeletingPathExtension.UTF8String] = f;
+        libraries[name.stringByDeletingPathExtension.UTF8String] = library;
+      }
+    }
+    NSString* text = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"vertex_inputs.txt"]
+                                               encoding:NSUTF8StringEncoding
+                                                  error:nil];
+    for (NSString* line in [text componentsSeparatedByString:@"\n"]) {
+      unsigned long long key = 0;
+      unsigned address = 0, usage = 0, index = 0, swizzle = 0x688;
+      int location = -1, dst = -1;
+      if (sscanf(line.UTF8String, "%llx %u %u %u %d %x %d", &key, &address, &usage, &index, &location, &swizzle,
+                 &dst) >= 5 &&
+          location >= 0) {
+        inputs[key].push_back({address, usage, uint32_t(location), swizzle, dst});
+      }
+    }
+    NSString* ranges = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"constant_ranges.txt"]
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:nil];
+    for (NSString* line in [ranges componentsSeparatedByString:@"\n"]) {
+      char kind[3] = {};
+      unsigned long long key = 0;
+      unsigned first = 0, end = 0;
+      if (sscanf(line.UTF8String, "%2s_%llx %u %u", kind, &key, &first, &end) == 4 && first <= end && end <= 256) {
+        constant_ranges[key ^ (kind[0] == 'p' ? 1ull : 0ull) << 63] = {uint16_t(first), uint16_t(end)};
+      }
+    }
+    NSString* masks = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"texture_masks.txt"]
+                                               encoding:NSUTF8StringEncoding error:nil];
+    const bool masks_valid = masks && masks.UTF8String && texture_masks.Load(masks.UTF8String);
+    REXLOG_INFO("[native] texture slot metadata: {} shader interfaces; {}",
+                texture_masks.Size(), masks_valid ? "loaded" : "unavailable; retaining all slots for unknown shaders");
+    LoadD3DInternalShaders(constants);
+    if (unloadable) {
+      REXLOG_WARN("[native] {} shader libraries could not be loaded on iOS {}", unloadable,
+                  UIDevice.currentDevice.systemVersion.UTF8String);
+    }
+    REXLOG_INFO("[native] renderer built {} {}: {} shaders, vertex inputs of {} vertex shaders, constant ranges of {}",
+                __DATE__, __TIME__, functions.size(), inputs.size(), constant_ranges.size());
+  }
+
+  // The vertex shaders D3D builds at run time (draws from user memory: the
+  // final composite, the bloom chain, clears). Not in the game's files, so
+  // not translated: written here from their microcode (logged as [d3d-vs]),
+  // all three pass-throughs with one vertex fetch constant:
+  //   ea96a7e9f897dae6  oPos = (x, y, 1, 1)           x, y: vfetch at 2, 32_32_FLOAT
+  //   c4d5a3612b92f170  oPos = xyzw; o0 = (u, v, 0, 1) vfetch at 3 (32_32_32_32_FLOAT)
+  //                                                  and 4 (mini, 32_32_FLOAT, +16)
+  //   e69ff45e5d083e23  oPos = (x, y, z, 1); o0 = rgba vfetch at 3 (32_32_32_FLOAT)
+  //                                                  and 4 (mini, 32_32_32_32_FLOAT, +12)
+  // o0 goes to every interpolator: the pixel shader takes its register 0
+  // from whichever one it declares.
+  void LoadD3DInternalShaders(MTLFunctionConstantValues* constants) {
+    std::string outs;
+    std::string all;
+    for (int i = 0; i < 16; ++i) {
+      outs += fmt::format("  float4 t{0} [[user(TEXCOORD{0})]];\n", i);
+      all += fmt::format("o.t{} = v; ", i);
+    }
+    for (int i = 0; i < 6; ++i) {
+      outs += fmt::format("  float4 c{0} [[user(COLOR{0})]];\n", i);
+      all += fmt::format("o.c{} = v; ", i);
+    }
+    const std::string source =
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct Out {\n  float4 pos [[position]];\n" + outs + "};\n"
+        "struct InPos { float4 a0 [[attribute(0)]]; };\n"
+        "struct InPosUv { float4 a0 [[attribute(0)]]; float4 a13 [[attribute(13)]]; };\n"
+        "struct InPosUv2 { float4 a0 [[attribute(0)]]; float4 a13 [[attribute(13)]]; float4 a14 [[attribute(14)]]; };\n"
+        "struct Push { ulong vs; ulong ps; ulong shared_; };\n"
+        // xf: positions in pixels (the console's viewport transform off) to
+        // Metal's clip space, which Metal clips before any viewport:
+        // (2/width, -2/height, -1, 1); (1, 1, 0, 0) when already in clip space.
+        "float4 toClip(float4 p, float4 xf) { return float4(p.xy * xf.xy + xf.zw * p.w, p.z, p.w); }\n"
+        "vertex Out vs_xy(InPos in [[stage_in]], constant float4& xf [[buffer(30)]]) { Out o; float4 v = 0.0; " + all +
+        "o.pos = toClip(float4(in.a0.xy, 1.0, 1.0), xf); return o; }\n"
+        "vertex Out vs_xyzw_uv(InPosUv in [[stage_in]], constant float4& xf [[buffer(30)]]) { Out o; float4 v = float4(in.a13.xy, 0.0, 1.0); " + all +
+        "o.pos = toClip(in.a0, xf); return o; }\n"
+        "vertex Out vs_xyz_rgba(InPosUv in [[stage_in]], constant float4& xf [[buffer(30)]]) { Out o; float4 v = in.a13; " + all +
+        "o.pos = toClip(float4(in.a0.xyz, 1.0), xf); return o; }\n"
+        // a16249c01dac6178: oPos = xyzw; o0 = (uv at +16, uv at +24)
+        "vertex Out vs_xyzw_uv2(InPosUv2 in [[stage_in]], constant float4& xf [[buffer(30)]]) { Out o; "
+        "float4 v = float4(in.a13.xy, in.a14.xy); " + all + "o.pos = toClip(in.a0, xf); return o; }\n"
+        // 2f583d7c8ddf572a: oPos = (dot(p, c0), dot(p, c1), dot(p, c2), dot(p, c3)), p = (xyz, 1)
+        "vertex Out vs_matrix(InPos in [[stage_in]], constant float4& xf [[buffer(30)]], constant Push& pc [[buffer(8)]]) { "
+        "Out o; float4 v = 0.0; " + all + "device float4* c = reinterpret_cast<device float4*>(pc.vs); "
+        "float4 p = float4(in.a0.xyz, 1.0); "
+        "o.pos = toClip(float4(dot(p, c[0]), dot(p, c[1]), dot(p, c[2]), dot(p, c[3])), xf); return o; }\n"
+        // The XMV movie player's shaders (built into the executable, not the
+        // game's files; from their microcode, logged with ios_log_shader_disasm).
+        // acc15ef6157ec934: oPos = (xyz, 1) (32_32_32 at vfetch 3), o0 = uv
+        // (mini 32_32 at +12, vfetch 4, bound as r0._xy_: uv lands in y and z).
+        "vertex Out vs_xyz_uv(InPosUv in [[stage_in]], constant float4& xf [[buffer(30)]]) { Out o; "
+        "float4 v = float4(in.a13.yz, 0.0, 1.0); " + all + "o.pos = toClip(float4(in.a0.xyz, 1.0), xf); return o; }\n"
+        // 2d2462de73d283de: Y, U, V from tf0-2 (each read as x) at t0.xy; with
+        // its literal constants c254 (Y offset, chroma offset, Y scale) and c255
+        // (chroma weights): R = s(Y-o) + V c255.y, G = s(Y-o) + U c255.z + V c255.x,
+        // B = s(Y-o) + U c255.w.
+        "struct Tex2D { texture2d<float> tex; };\n"
+        "struct Samp { sampler samp; };\n"
+        "struct InXmv { float4 pos [[position]]; float4 t0 [[user(TEXCOORD0)]]; };\n"
+        "fragment float4 ps_xmv(InXmv in [[stage_in]], constant Tex2D* tex [[buffer(0)]], "
+        "constant Samp* samp [[buffer(4)]], constant Push& pc [[buffer(8)]]) {\n"
+        "  device uint* shared_ = reinterpret_cast<device uint*>(pc.shared_);\n"
+        "  device float4* c = reinterpret_cast<device float4*>(pc.ps);\n"
+        "  float y = tex[shared_[0]].tex.sample(samp[shared_[64]].samp, in.t0.xy).x;\n"
+        "  float u = tex[shared_[1]].tex.sample(samp[shared_[65]].samp, in.t0.xy).x + c[254].y;\n"
+        "  float v = tex[shared_[2]].tex.sample(samp[shared_[66]].samp, in.t0.xy).x + c[254].y;\n"
+        "  float l = c[254].z * (y - c[254].x);\n"
+        "  float3 rgb = float3(l + v * c[255].y, l + u * c[255].z + v * c[255].x, l + u * c[255].w);\n"
+        "  return float4(rgb, 1.0); }\n";
+    NSError* error = nil;
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion3_0;  // GPU addresses as pointers
+    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                                  options:options
+                                                    error:&error];
+    if (!library) {
+      REXLOG_WARN("[native] D3D internal vertex shaders: {}", error.localizedDescription.UTF8String);
+      return;
+    }
+    internal_keys = {0xea96a7e9f897dae6ull, 0xc4d5a3612b92f170ull, 0xe69ff45e5d083e23ull,
+                     0xa16249c01dac6178ull, 0x2f583d7c8ddf572aull};
+    functions["vs_a16249c01dac6178"] = [library newFunctionWithName:@"vs_xyzw_uv2"];
+    functions["vs_2f583d7c8ddf572a"] = [library newFunctionWithName:@"vs_matrix"];
+    inputs[0xa16249c01dac6178ull] = {{3, 0, 0}, {4, 5, 13}, {5, 5, 14}};
+    inputs[0x2f583d7c8ddf572aull] = {{3, 0, 0}};
+    functions["vs_ea96a7e9f897dae6"] = [library newFunctionWithName:@"vs_xy"];
+    functions["vs_c4d5a3612b92f170"] = [library newFunctionWithName:@"vs_xyzw_uv"];
+    functions["vs_e69ff45e5d083e23"] = [library newFunctionWithName:@"vs_xyz_rgba"];
+    // The movie player's (see above): movie frames drawn here, not by the
+    // emulated renderer, unless nfsmw_native_movies is off.
+    if (REXCVAR_GET(nfsmw_native_movies)) {
+      internal_keys.insert(0xacc15ef6157ec934ull);
+      functions["vs_acc15ef6157ec934"] = [library newFunctionWithName:@"vs_xyz_uv"];
+      functions["ps_2d2462de73d283de"] = [library newFunctionWithName:@"ps_xmv"];
+      inputs[0xacc15ef6157ec934ull] = {{3, 0, 0}, {4, 5, 13}};
+    }
+    inputs[0xea96a7e9f897dae6ull] = {{2, 0, 0}};
+    inputs[0xc4d5a3612b92f170ull] = {{3, 0, 0}, {4, 5, 13}};
+    inputs[0xe69ff45e5d083e23ull] = {{3, 0, 0}, {4, 5, 13}};
+    // The hand-written vertex functions above do not sample textures. The
+    // movie pixel shader samples exactly Y/U/V at slots 0/1/2.
+    for (uint64_t key : internal_keys) texture_masks.SetInternal(false, key, 0);
+    if (REXCVAR_GET(nfsmw_native_movies)) texture_masks.SetInternal(true, 0x2d2462de73d283deull, 7);
+  }
+
+  // A pixel shader specialized for an alpha test (G_SPEC_CONSTANTS: bit 1 on,
+  // bits 8-10 the compare function, as RB_COLORCONTROL encodes it).
+  id<MTLFunction> PixelVariant(uint64_t key, uint32_t spec) {
+    if (!spec) {
+      return Find("ps", key);
+    }
+    auto found = ps_variants.find({key, spec});
+    if (found != ps_variants.end()) {
+      return found->second;
+    }
+    char name[32];
+    snprintf(name, sizeof(name), "ps_%016llx", static_cast<unsigned long long>(key));
+    auto lib = libraries.find(name);
+    id<MTLFunction> f = nil;
+    if (lib != libraries.end()) {
+      MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+      [values setConstantValue:&spec type:MTLDataTypeUInt atIndex:0];
+      const bool shadow_gather = REXCVAR_GET(nfsmw_native_shadow_gather);
+      [values setConstantValue:&shadow_gather type:MTLDataTypeBool atIndex:1];
+      f = [lib->second newFunctionWithName:@"shaderMain" constantValues:values error:nil];
+    }
+    ps_variants[{key, spec}] = f;
+    return f;
+  }
+
+  // Motion vectors: the shader's shaderMainMotion entry point (the vertex
+  // shader run with this frame's and the frame before's constants; the pixel
+  // shader writing the motion to colour target 4), alpha test as PixelVariant.
+  id<MTLFunction> MotionVariant(bool pixel, uint64_t key, uint32_t spec) {
+    auto found = motion_variants.find({key ^ (pixel ? 1ull : 0ull) << 63, spec});
+    if (found != motion_variants.end()) {
+      return found->second;
+    }
+    char name[32];
+    snprintf(name, sizeof(name), "%s_%016llx", pixel ? "ps" : "vs", static_cast<unsigned long long>(key));
+    auto lib = libraries.find(name);
+    id<MTLFunction> f = nil;
+    if (lib != libraries.end()) {
+      MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+      [values setConstantValue:&spec type:MTLDataTypeUInt atIndex:0];
+      const bool shadow_gather = REXCVAR_GET(nfsmw_native_shadow_gather);
+      [values setConstantValue:&shadow_gather type:MTLDataTypeBool atIndex:1];
+      f = [lib->second newFunctionWithName:@"shaderMainMotion" constantValues:values error:nil];
+    }
+    motion_variants[{key ^ (pixel ? 1ull : 0ull) << 63, spec}] = f;
+    return f;
+  }
+
+  id<MTLFunction> Find(const char* kind, uint64_t key) const {
+    char name[32];
+    snprintf(name, sizeof(name), "%s_%016llx", kind, static_cast<unsigned long long>(key));
+    auto it = functions.find(name);
+    return it == functions.end() ? nil : it->second;
+  }
+};
+
+ShaderStore store;
+
+// --- A recorded frame ----------------------------------------------------------
+
+// Vertex data arrays: not zeroed when made (every element is written right
+// after; zeroing them cost ~1 ms per frame of dynamic vertices).
+template <typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+  template <typename U>
+  struct rebind {
+    using other = DefaultInitAllocator<U>;
+  };
+  using std::allocator<T>::allocator;
+  template <typename U>
+  void construct(U* p) noexcept {
+    ::new (static_cast<void*>(p)) U;
+  }
+  template <typename U, typename... Args>
+  void construct(U* p, Args&&... args) {
+    ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+  }
+};
+using FloatArray = std::vector<float, DefaultInitAllocator<float>>;
+
+struct Attribute {
+  uint32_t location;
+  bool integer;                // uint4 (blend indices) instead of float4
+  // 4 per vertex (uint bits when integer); shared with the attribute cache
+  // (and the renderer's Metal buffer for it) while the source is unchanged.
+  std::shared_ptr<FloatArray> values;
+  bool fresh = false;  // decoded this frame: uploaded with the frame, not kept
+};
+
+// --- Residency ---------------------------------------------------------------------
+//
+// The renderer's long-lived GPU memory (targets, the pool, the texture cache's
+// Metal copies, vertex buffers) in one residency set on the queue: resident
+// once. Without it the driver wired every resource a frame used when the
+// frame ran and unwired it after (about 1,000 a second, 15% of a core); in
+// the race's first seconds a wire of a 2x target took up to 6 ms, and the GPU
+// waited for each in the middle of the frame (50-150 ms frames).
+// Additions and removals come from any thread; the renderer's queue applies
+// them before each frame. A removal keeps the object until then.
+namespace residency {
+std::mutex mutex;
+std::vector<id<MTLAllocation>> adds, removes;
+
+void Add(id<MTLAllocation> a) {
+  if (!a) return;
+  std::lock_guard<std::mutex> lock(mutex);
+  adds.push_back(a);
+}
+
+void Remove(id<MTLAllocation> a) {
+  if (!a) return;
+  std::lock_guard<std::mutex> lock(mutex);
+  removes.push_back(a);
+}
+
+// The renderer's queue, before encoding a frame.
+void Apply(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+  static id<MTLResidencySet> set = nil;
+  if (!set) {
+    MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
+    d.label = @"nfsmw native";
+    d.initialCapacity = 4096;
+    NSError* error = nil;
+    set = [device newResidencySetWithDescriptor:d error:&error];
+    if (!set) {
+      REXLOG_WARN("[native] no residency set: {}", error ? error.localizedDescription.UTF8String : "?");
+      return;
+    }
+    [queue addResidencySet:set];
+    REXLOG_INFO("[native] resources kept resident in a residency set");
+  }
+  std::vector<id<MTLAllocation>> add, remove;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    add.swap(adds);
+    remove.swap(removes);
+  }
+  if (add.empty() && remove.empty()) return;
+  if (!add.empty()) [set addAllocations:add.data() count:add.size()];
+  if (!remove.empty()) [set removeAllocations:remove.data() count:remove.size()];
+  [set commit];
+  [set requestResidency];
+}
+}  // namespace residency
+
+// The Metal copy of a decoded texture: made by the renderer at its first
+// use, released with the texture (the cache entries own both). Counted for
+// the memory log.
+std::atomic<int64_t> gpu_texture_count{0}, gpu_texture_bytes{0};
+struct GpuCopy {
+  id<MTLTexture> texture = nil;
+  size_t bytes = 0;
+  GpuCopy() = default;
+  GpuCopy(GpuCopy&& o) noexcept : texture(o.texture), bytes(o.bytes) {
+    o.texture = nil;
+    o.bytes = 0;
+  }
+  GpuCopy(const GpuCopy&) = delete;
+  GpuCopy& operator=(const GpuCopy&) = delete;
+  ~GpuCopy() {
+    if (texture) {
+      residency::Remove(texture);
+      --gpu_texture_count;
+      gpu_texture_bytes -= int64_t(bytes);
+    }
+  }
+};
+
+struct Texture {
+  MTLPixelFormat format = MTLPixelFormatInvalid;
+  uint32_t width = 0, height = 0;
+  uint32_t row_bytes = 0;      // level 0's
+  uint32_t block = 1, block_bytes = 4;  // of format: texels across a block, bytes in one
+  // The game's mip levels (2D and cube): level 0's layers, then level 1's,
+  // and so on, each level max(size >> level, 1) and tightly packed. Without
+  // them the distant road and the grass sparkled (every far pixel read from
+  // the full-size level).
+  uint32_t levels = 1;
+  MTLSamplerMipFilter mip_filter = MTLSamplerMipFilterNotMipmapped;
+  // Levels 0.., linear. Freed by the renderer once uploaded (gpu): a second
+  // copy of every texture in CPU memory took the iPhone over its memory
+  // limit in races.
+  // Default-initialized: the decode writes every byte (zeroing it first was
+  // ~44 ms per second of the command processor thread in a race).
+  mutable std::vector<uint8_t, DefaultInitAllocator<uint8_t>> data;
+  size_t bytes = 0;            // data's size when decoded (the cache's budget)
+  mutable GpuCopy gpu;         // render thread only
+  MTLTextureSwizzleChannels swizzle = MTLTextureSwizzleChannelsDefault;
+  uint32_t clamp_x = 0, clamp_y = 0;
+  bool linear_filter = true;
+  xenos::AnisoFilter aniso_filter = xenos::AnisoFilter::kDisabled;
+  uint32_t address = 0;        // guest physical: a resolve to it replaces it
+  uint32_t fetch_swizzle = 0x688;  // the fetch constant's swizzle (XYZW = 0x688)
+  bool persistent = false;         // a resolve from an earlier frame stands in for it
+  int32_t exp_adjust = 0;          // the fetch constant's exp_adjust: values read * 2^exp_adjust
+  bool cube = false;           // six faces in data, one after another
+  uint32_t depth = 1;          // 3D textures: depth slices in data, one after another
+  bool volume = false;
+  bool bc_on_gpu = false;      // BC blocks kept, expanded to RGBA8 by a GPU kernel (no BC on this GPU)
+  uint32_t guest_format = 0;   // the fetch constant's format (diagnostics)
+  uint32_t guest_endian = 0;   // the fetch constant's endianness (diagnostics)
+  bool guest_tiled = false;    // (diagnostics)
+  bool guest_signed = false;   // any component signed (diagnostics)
+};
+
+// Where one mip level is in a texture's data (Texture::levels).
+struct LevelSpan {
+  size_t offset = 0;       // of its first layer
+  size_t layer_bytes = 0;  // one layer of it
+  uint32_t width = 0, height = 0, bw = 0, bh = 0, row_bytes = 0;
+};
+
+LevelSpan SpanOf(uint32_t width, uint32_t height, uint32_t layers, uint32_t block, uint32_t block_bytes,
+                 uint32_t level) {
+  LevelSpan s;
+  for (uint32_t l = 0;; ++l) {
+    s.width = std::max(width >> l, 1u);
+    s.height = std::max(height >> l, 1u);
+    s.bw = (s.width + block - 1) / block;
+    s.bh = (s.height + block - 1) / block;
+    s.row_bytes = s.bw * block_bytes;
+    s.layer_bytes = size_t(s.row_bytes) * s.bh;
+    if (l == level) return s;
+    s.offset += s.layer_bytes * layers;
+  }
+}
+
+inline uint32_t LayersOf(const Texture& t) { return t.volume ? t.depth : t.cube ? 6 : 1; }
+
+LevelSpan SpanOf(const Texture& t, uint32_t level) {
+  return SpanOf(t.width, t.height, LayersOf(t), t.block, t.block_bytes, level);
+}
+
+// A resolve: a rectangle of the current render target copied into a texture
+// at the same coordinates (rexglue draw_util GetResolveInfo).
+struct ResolveEvent {
+  size_t after_draws;          // draws recorded before it
+  bool depth;                  // RB_COPY_CONTROL source 4: the depth buffer
+  bool clear_color, clear_depth;
+  uint32_t clear_color_value;  // RB_COLOR_CLEAR
+  uint32_t clear_depth_value;  // RB_DEPTH_CLEAR (depth 24 | stencil 8)
+  int32_t x0, y0, x1, y1;
+  uint32_t dest_base, dest_pitch, dest_height;
+  // The EDRAM layout the resolve reads (its own registers): the source.
+  uint32_t surface_info, color_info, depth_info;
+  uint32_t control;
+  bool array;                  // RB_COPY_DEST_INFO: into a slice (a cube face)
+  uint32_t slice;
+  bool swap;                   // RB_COPY_DEST_INFO bit 24: red and blue swapped
+  int32_t exp_bias;            // RB_COPY_DEST_INFO bits 16-21: colour * 2^bias
+  uint32_t dest_endian = 2;    // RB_COPY_DEST_INFO bits 0-2
+  uint32_t dest_format = 6;    // RB_COPY_DEST_INFO bits 7-12 (6: k_8_8_8_8)
+};
+
+// A stage's float constants, c0-c255 (1024 dwords). Only the registers its
+// draws' shaders read are filled in (Record copies just those): the rest is
+// left as it was allocated, never read.
+struct ConstantBank {
+  uint32_t v[1024];
+  const uint32_t* data() const { return v; }
+  uint32_t* data() { return v; }
+  const uint32_t& operator[](size_t i) const { return v[i]; }
+  uint32_t& operator[](size_t i) { return v[i]; }
+};
+
+struct Draw {
+  explicit Draw(std::pmr::memory_resource* attributes_resource) : attributes(attributes_resource) {}
+  Draw(const Draw&) = delete;
+  Draw& operator=(const Draw&) = delete;
+  Draw(Draw&&) noexcept = default;
+  Draw& operator=(Draw&&) = delete;
+  id<MTLFunction> vs, ps;
+  uint64_t vs_key, ps_key;
+  MTLPrimitiveType primitive = MTLPrimitiveTypeTriangle;
+  std::pmr::vector<Attribute> attributes;
+  // Rebased to the decoded vertices; shared with the index cache (and the
+  // renderer's Metal buffer for them) unless made this frame (indices_fresh).
+  std::shared_ptr<const std::vector<uint32_t>> indices;
+  bool indices_fresh = true;
+  size_t index_count() const { return indices ? indices->size() : 0; }
+  uint32_t vertex_count = 0;
+  // 1024 dwords each; shared with the draw before while unchanged (most are).
+  std::shared_ptr<const ConstantBank> vs_constants, ps_constants;
+  // Motion vectors: the same draw's vertex shader constants in the frame
+  // before (the same shader, vertices and indices, the same how-many-th of
+  // those in the frame), or null: not matched, or not a draw that writes depth.
+  std::shared_ptr<const ConstantBank> previous_vs_constants;
+  // The registers its shaders read of them (FIRST..END-1): compared, uploaded.
+  std::pair<uint16_t, uint16_t> vs_range{0, 256}, ps_range{0, 256};
+  uint32_t booleans = 0;
+  int textures[16];  // index into Frame::textures, or -1
+  // Render state.
+  uint32_t surface_info, color_info, depth_info;
+  uint32_t depth_control, blend_control, color_mask;
+  // Polygon offset: constant in host depth units, slope per guest pixel.
+  float depth_bias = 0, depth_slope = 0;
+  // A second render target (the pixel shader's oC1), when the colour mask
+  // writes one: RB_COLOR1_INFO and RB_BLENDCONTROL1.
+  bool second_target = false;
+  uint32_t color1_info = 0, blend_control1 = 0;
+  // PA_CL_CLIP_CNTL bit 16: clipping off, depth clamped instead (the shadow
+  // maps: casters beyond the light's near or far plane stay in them).
+  bool clip_disable = false;
+  uint32_t color_control;  // RB_COLORCONTROL: alpha test function (0-2), enable (3)
+  float alpha_ref;         // RB_ALPHA_REF
+  float viewport[6];
+  uint32_t vte;
+  int32_t window_offset_x, window_offset_y;
+  uint32_t scissor[4];
+  bool window_offset_enable;
+  int query = -1;  // the occlusion query counting it (index into Frame::queries), or -1
+};
+
+struct VertexDiagnostics {
+  uint64_t attribute_lookup_hits = 0, attribute_lookup_misses = 0, attribute_lookup_bypasses = 0;
+  uint64_t draw_arena_frames = 0, draw_attribute_lists = 0;
+  uint64_t draw_attribute_heap_calls = 0, draw_attribute_heap_bytes = 0;
+  uint64_t draw_attribute_peak_bytes = 0;
+  uint64_t texture_slots_considered = 0, texture_slots_skipped = 0;
+  uint64_t texture_mask_unknown_draws = 0;
+  uint64_t fetch_layout_hits = 0, fetch_layout_misses = 0, fetch_layout_bypasses = 0;
+  uint64_t watched_cache_hits = 0;
+  uint64_t fingerprint_cache_hits = 0;
+  uint64_t cache_misses = 0;
+  uint64_t fingerprint_calls = 0;
+  uint64_t fingerprint_sample_count = 0;
+  uint64_t fingerprint_sample_ns = 0;
+  uint64_t fingerprint_shared = 0;  // inputs that reused their draw's region fingerprint
+  uint64_t fingerprint_memo = 0;    // regions fingerprinted earlier in the same frame (fingerprint memo)
+  uint64_t decoded_vertex_elements = 0;
+  uint64_t decoded_bytes = 0, dynamic_decoded_bytes = 0;
+  uint64_t expanded_input_indices = 0;
+  uint64_t expanded_output_indices = 0;
+  uint64_t index_cache_hits = 0, index_cache_misses = 0;
+
+  VertexDiagnostics& operator+=(const VertexDiagnostics& other) {
+    attribute_lookup_hits += other.attribute_lookup_hits;
+    attribute_lookup_misses += other.attribute_lookup_misses;
+    attribute_lookup_bypasses += other.attribute_lookup_bypasses;
+    draw_arena_frames += other.draw_arena_frames;
+    draw_attribute_lists += other.draw_attribute_lists;
+    draw_attribute_heap_calls += other.draw_attribute_heap_calls;
+    draw_attribute_heap_bytes += other.draw_attribute_heap_bytes;
+    draw_attribute_peak_bytes = std::max(draw_attribute_peak_bytes, other.draw_attribute_peak_bytes);
+    texture_slots_considered += other.texture_slots_considered;
+    texture_slots_skipped += other.texture_slots_skipped;
+    texture_mask_unknown_draws += other.texture_mask_unknown_draws;
+    fetch_layout_hits += other.fetch_layout_hits;
+    fetch_layout_misses += other.fetch_layout_misses;
+    fetch_layout_bypasses += other.fetch_layout_bypasses;
+    watched_cache_hits += other.watched_cache_hits;
+    fingerprint_cache_hits += other.fingerprint_cache_hits;
+    cache_misses += other.cache_misses;
+    fingerprint_calls += other.fingerprint_calls;
+    fingerprint_sample_count += other.fingerprint_sample_count;
+    fingerprint_sample_ns += other.fingerprint_sample_ns;
+    fingerprint_shared += other.fingerprint_shared;
+    fingerprint_memo += other.fingerprint_memo;
+    decoded_vertex_elements += other.decoded_vertex_elements;
+    decoded_bytes += other.decoded_bytes;
+    dynamic_decoded_bytes += other.dynamic_decoded_bytes;
+    expanded_input_indices += other.expanded_input_indices;
+    expanded_output_indices += other.expanded_output_indices;
+    index_cache_hits += other.index_cache_hits;
+    index_cache_misses += other.index_cache_misses;
+    return *this;
+  }
+};
+
+struct Frame {
+  // Declared first, destroyed last: every draw releases its attribute objects
+  // and shared references before the arena's blocks are returned to the heap.
+  nfsmw::DrawArena attribute_arena;
+  std::vector<Draw> draws;
+  size_t attribute_lists = 0, attribute_hint_bytes = 0;
+  Frame(bool pooled, size_t previous_attribute_bytes, size_t previous_draws)
+      : attribute_arena(pooled, previous_attribute_bytes) {
+    if (pooled) draws.reserve(std::min(previous_draws, nfsmw::DrawArena::kMaxDrawHint));
+  }
+  // The texture of each fetch slot at the last draw (cleared by a resolve:
+  // its address may then stand for the renderer's copy).
+  uint32_t slot_fetch[16][6] = {};
+  int slot_texture[16] = {};
+  bool slot_valid[16] = {};
+  std::shared_ptr<const ConstantBank> last_vs_constants, last_ps_constants;
+  // Motion vectors: the vertex shader constants of each draw writing depth,
+  // by its identity (see Record), for the next frame's matching draw.
+  std::unordered_map<uint64_t, std::shared_ptr<const ConstantBank>> motion_constants;
+  std::unordered_map<uint64_t, uint32_t> motion_seen;  // draws of each identity so far
+  std::vector<ResolveEvent> resolves;
+  // Occlusion queries begun in the frame (their sample count addresses), and
+  // the one open now (its draws are counted).
+  std::vector<uint32_t> queries;
+  // The address each one ended at (the game reads its answer there: the
+  // begin's minus 0x20 in this game), or 0 while open or never ended.
+  std::vector<uint32_t> query_ends;
+  int open_query = -1;
+  // The frame's textures (indices in Draw::textures), shared with the
+  // texture cache while their memory is unchanged.
+  std::vector<std::shared_ptr<const Texture>> textures;
+  std::unordered_map<FetchKey, int, FetchKeyHash> texture_index;
+  uint32_t skipped_inline = 0, skipped_shader = 0, skipped_other = 0;
+  uint32_t movie_draws = 0;  // the video player's picture (no library for its shaders)
+  uint32_t from_arguments = 0;  // DrawVertices rebuilt from their arguments
+  std::set<uint32_t> unsupported_formats;
+  std::set<uint32_t> resolved_so_far;  // resolve destinations recorded so far
+  std::vector<std::pair<size_t, std::string>> notes;  // first problems
+  VertexDiagnostics vertex_diagnostics;
+  // For the hitch log: the recording's time and the textures decoded in it.
+  uint64_t record_ns = 0;
+  uint32_t textures_decoded = 0;
+  uint64_t texture_decode_bytes = 0, texture_decode_us = 0;
+};
+
+std::unique_ptr<Frame> recording;
+// The last frame's Frame::motion_constants (game thread).
+std::unordered_map<uint64_t, std::shared_ptr<const ConstantBank>> previous_motion_constants;
+bool MotionVectorsWanted() {
+  return MetalFxTemporal() || REXCVAR_GET(nfsmw_native_motion_debug);
+}
+inline uint64_t MotionMix(uint64_t h, uint64_t v) { return (h ^ (v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2))) * 0x100000001B3ull; }
+int64_t next_dump_ms = 0;
+uint32_t dump_number = 0;
+std::atomic<bool> rendering{false};
+std::atomic<int> in_flight{0};               // frames recorded or rendering, not yet done
+std::atomic<uint32_t> frames_left{0};        // bumped as each leaves in_flight (the game thread sleeps on it)
+void FrameLeft() {
+  --in_flight;
+  frames_left.fetch_add(1, std::memory_order_release);
+  os_sync_wake_by_address_all(&frames_left, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+}
+std::atomic<int> frames_without_output{0};   // e.g. FMVs: the emulated output shows through
+
+void Note(Frame& f, std::string text) {
+  if (f.notes.size() < 40) {
+    f.notes.emplace_back(f.draws.size(), std::move(text));
+  }
+}
+
+// --- Caches across frames (game thread) ------------------------------------------
+//
+// Decoded textures and vertex attributes are kept from frame to frame, keyed by
+// what describes them (fetch constant, vertex layout and range) and checked
+// against a fingerprint of their source memory: 32 samples of 8 bytes spread
+// over it. Static data costs nothing after the first frame; data the game
+// rewrites (dynamic vertices, UI text) is decoded again when its bytes change.
+// Entries unused for 600 frames are dropped.
+
+uint64_t frame_counter = 0;
+
+// Timing, logged every 300 native frames.
+std::atomic<uint64_t> record_ns{0}, render_us{0}, presented{0};
+std::atomic<double> recent_gpu_seconds{0};
+// Frame trace (Oct 28 diagnostic, 40 fps pacing): per frame, when the game's
+// swap reached the renderer (0), when the frame was handed to Metal (1), when
+// the GPU finished it (2) and when it was shown (3), in CACurrentMediaTime
+// seconds. Each 60 shown frames: the gaps between consecutive frames at each
+// stage, to see where the 16.7 / 25 / 33 ms cycle at the 40 cap starts.
+struct FrameTrace {
+  std::mutex m;
+  std::map<uint32_t, std::array<double, 5>> times;  // 4: the paced target
+};
+FrameTrace frame_trace;
+void TraceFrame(uint32_t number, int stage, double t);  // average GPU time per frame (paced presentation)
+// For the hitch log (the renderer's queue only): this frame's texture uploads.
+uint32_t frame_uploads = 0, frame_new_buffers = 0;
+uint64_t frame_upload_bytes = 0, frame_upload_us = 0;
+// Hitch lines left to log (frames much slower than the ones around them).
+std::atomic<int> hitch_lines_left{300};
+// Parts of the recording (game thread): vertex inputs, then constants and
+// textures.
+std::atomic<uint64_t> record_vertex_ns{0}, record_texture_ns{0};
+// Textures decoded from guest memory since the last stats line (cache misses).
+std::atomic<uint64_t> textures_decoded_total{0}, texture_decode_bytes_total{0};
+bool timed_draw = false;  // this draw's recording is timed (one in eight; command processor thread)
+// Renderer queue totals since the last summary; uploads include cached and dynamic arrays.
+uint64_t geometry_upload_bytes = 0, geometry_upload_arrays = 0;
+std::atomic<uint64_t> gpu_us{0};  // the GPU's own time per frame
+std::atomic<uint32_t> gpu_slow_frames{0};  // over 45 ms on the GPU, since the last stats line
+uint64_t caster_variant_draws = 0;  // shadow-caster draws with the cut-out compiled out (render queue only)
+std::atomic<uint64_t> early_commit_total{0};
+// PM4 census (tools/ios/patch_ios_packet_census.py, --ios_packet_census=true):
+// key 0-127 type-3 opcode, 128 type 0, 129 type 1/2. In the GPU plugin
+// (librexgpu-xenos, loaded at run time): found with dlsym.  // early command-buffer commits, since the last stats line
+
+// Occlusion queries: the last count per sample count address, at the guest's
+// resolution (written when the GPU finishes a frame, read by the command
+// processor at the query's end). Visibility result slots per frame, in one of
+// a ring of buffers (frames in flight are far fewer).
+constexpr size_t kVisibilitySlots = 64;
+constexpr int kVisibilityBuffers = 8;
+std::mutex occlusion_mutex;
+std::unordered_map<uint32_t, uint64_t> occlusion_counts;
+std::atomic<uint64_t> unmarked_query_ends{0};  // ends seen without the marker (see CpOcclusion)
+// The answers given since the last stats line (per query address: answers,
+// how many were 0, the largest, the last), to see whether the sun is ever
+// counted as visible. Under occlusion_mutex.
+struct OcclusionAnswers {
+  uint32_t answers = 0, zero = 0;
+  uint64_t largest = 0, last = 0;
+};
+std::unordered_map<uint32_t, OcclusionAnswers> occlusion_answers;
+
+// Draws with a polygon offset, and with an equal depth test (z-fighting
+// candidates), since the last stats line.
+std::atomic<uint64_t> depth_bias_draws{0}, depth_equal_draws{0};
+
+// Compiled pipelines kept on disk (Library/Caches), so a pipeline compiled
+// once is loaded, not compiled, in later sessions: compiling them as the race
+// starts (dozens, tens of ms each, on the render thread) made it stutter.
+// Used from the render thread and the background compiles (PipelineCache).
+struct PipelineArchive {
+  id<MTLBinaryArchive> archive = nil;
+  NSURL* url = nil;
+  bool tried = false, dirty = false, saving = false;
+  std::mutex mutex;  // the archive's additions and saving, the counts
+  // Since the last log line: pipelines made, of them from the archive, time.
+  uint32_t made = 0, loaded = 0;
+  double ms = 0, worst_ms = 0;
+  uint32_t misses_logged = 0;
+
+  static unsigned long long FileSize(NSURL* u) {
+    NSDictionary* a = [[NSFileManager defaultManager] attributesOfItemAtPath:u.path error:nil];
+    return a ? a.fileSize : 0;
+  }
+
+  void Open(id<MTLDevice> device) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (tried) return;
+    tried = true;
+    NSURL* caches = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
+    // v2: a fresh archive (the first kept missing pipelines it had added and
+    // saved, session after session; the misses' log says whether this one does).
+    [[NSFileManager defaultManager]
+        removeItemAtURL:[caches URLByAppendingPathComponent:@"nfsmw_native_pipelines.metalarchive"]
+                  error:nil];
+    url = [caches URLByAppendingPathComponent:@"nfsmw_native_pipelines_v2.metalarchive"];
+    MTLBinaryArchiveDescriptor* desc = [MTLBinaryArchiveDescriptor new];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:url.path]) desc.url = url;
+    NSError* error = nil;
+    archive = [device newBinaryArchiveWithDescriptor:desc error:&error];
+    if (!archive && desc.url) {  // unreadable (a new OS or GPU driver): start again
+      REXLOG_WARN("[native] pipeline cache unreadable ({}), starting a new one",
+                  error ? error.localizedDescription.UTF8String : "?");
+      [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+      archive = [device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:nil];
+    }
+    REXLOG_INFO("[native] pipeline cache {} ({} KiB)", !archive ? "unavailable" : desc.url ? "loaded" : "new",
+                FileSize(url) / 1024);
+  }
+
+  // From the archive if it has it, else compiled (and added to it).
+  id<MTLRenderPipelineState> Make(id<MTLDevice> device, MTLRenderPipelineDescriptor* desc, NSError** error) {
+    Open(device);
+    const auto start = std::chrono::steady_clock::now();
+    id<MTLRenderPipelineState> pso = nil;
+    bool hit = false;
+    if (archive) {
+      desc.binaryArchives = @[ archive ];
+      pso = [device newRenderPipelineStateWithDescriptor:desc
+                                                 options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                              reflection:nil
+                                                   error:nil];
+      hit = pso != nil;
+      if (!pso) {
+        std::lock_guard<std::mutex> lock(mutex);
+        NSError* add_error = nil;
+        const bool added = [archive addRenderPipelineFunctionsWithDescriptor:desc error:&add_error];
+        if (added) dirty = true;  // compiled into the archive: made from it below
+        if (misses_logged < 40) {
+          ++misses_logged;
+          REXLOG_INFO("[native] pipeline cache miss: {} ({})", desc.label.UTF8String,
+                      added ? "added" : add_error ? add_error.localizedDescription.UTF8String : "not added");
+        }
+      }
+    }
+    if (!pso) pso = [device newRenderPipelineStateWithDescriptor:desc error:error];
+    const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::lock_guard<std::mutex> lock(mutex);
+    ++made;
+    loaded += hit;
+    ms += took;
+    worst_ms = std::max(worst_ms, took);
+    return pso;
+  }
+
+  // With the periodic log line: the counts, and the archive written if it grew.
+  void Report() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (made) {
+      REXLOG_INFO("[native] pipelines: {} made ({} from the cache), {:.1f} ms in all, worst {:.1f} ms", made, loaded,
+                  ms, worst_ms);
+    }
+    made = loaded = 0;
+    ms = worst_ms = 0;
+    if (dirty && archive && !saving) {
+      // Saved on a background queue, not here on the render queue: a
+      // synchronous save stalled the picture for seconds after the menu and
+      // at the start of an event, whenever new pipelines had been added.
+      // Written to a new file that then replaces the old one: the archive was
+      // loaded from that file, and saving over it in place lost entries (the
+      // file shrank, and the same pipelines missed again next session).
+      dirty = false;
+      saving = true;
+      static dispatch_queue_t queue = dispatch_queue_create(
+          "nfsmw.pipelines.save", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+      dispatch_async(queue, ^{
+        NSURL* tmp = [url URLByAppendingPathExtension:@"new"];
+        NSError* error = nil;
+        bool ok;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          [[NSFileManager defaultManager] removeItemAtURL:tmp error:nil];
+          ok = [archive serializeToURL:tmp error:&error];
+        }
+        if (ok) ok = rename(tmp.fileSystemRepresentation, url.fileSystemRepresentation) == 0;
+        if (!ok) {
+          REXLOG_WARN("[native] pipeline cache not saved: {}", error ? error.localizedDescription.UTF8String : "rename failed");
+          std::lock_guard<std::mutex> lock(mutex);
+          dirty = true;
+        } else {
+          REXLOG_INFO("[native] pipeline cache saved in the background ({} KiB)", FileSize(url) / 1024);
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        saving = false;
+      });
+    }
+  }
+};
+PipelineArchive pipeline_archive;
+int64_t stats_since_ms = 0;
+
+uint64_t Fingerprint(const uint8_t* p, size_t size) {
+  uint64_t h = 0xCBF29CE484222325ull ^ size;
+  if (!p || !size) {
+    return h;
+  }
+  const size_t samples = 32;
+  for (size_t i = 0; i < samples; ++i) {
+    const size_t at = size > 8 ? (size - 8) * i / (samples - 1) : 0;
+    uint64_t v = 0;
+    if (size >= 8) {
+      std::memcpy(&v, p + at, 8);
+    } else {
+      std::memcpy(&v, p + at, size);
+    }
+    h = (h ^ v) * 0x100000001B3ull;
+  }
+  return h;
+}
+
+template <typename T>
+struct CacheEntry {
+  std::shared_ptr<T> value;
+  uint64_t fingerprint = 0;
+  uint64_t last_used = 0;
+  bool watched = false;       // its memory is watched (WriteWatch): valid while clean
+  uint64_t last_changed = 0;  // frame it last had to be decoded again
+  bool dynamic = false;       // rewritten frame after frame: fingerprinted, not watched
+  uint64_t last_false_alarm = 0;  // its pages written, its data unchanged (shared with hot data)
+};
+
+// Guest memory write watch: a cached decode of a watched range stays valid
+// until the CPU writes there, without reading the memory again (a fingerprint
+// reads 32 spread-out points: mostly cache misses, for every vertex input and
+// texture of every draw). The emulator's page protection calls back on the
+// first write to a watched page (host pages, 16 KB), which clears its bit.
+namespace write_watch {
+constexpr uint32_t kPageShift = 14;
+constexpr uint32_t kPages = (512u << 20) >> kPageShift;
+std::atomic<uint64_t> armed[kPages / 64];
+std::once_flag registered;
+
+std::pair<uint32_t, uint32_t> Written(void*, uint32_t start, uint32_t length, bool) {
+  start &= 0x1FFFFFFF;
+  const uint32_t first = start >> kPageShift;
+  const uint32_t last = std::min<uint32_t>((start + std::max<uint32_t>(length, 1) - 1) >> kPageShift, kPages - 1);
+  for (uint32_t page = first; page <= last; ++page) {
+    armed[page >> 6].fetch_and(~(1ull << (page & 63)), std::memory_order_relaxed);
+  }
+  return {0, UINT32_MAX};
+}
+
+// Every page of the range watched and not written since.
+bool Clean(uint32_t address, size_t size) {
+  address &= 0x1FFFFFFF;
+  const uint32_t first = address >> kPageShift;
+  const uint32_t last = std::min<uint32_t>(uint32_t((address + std::max<size_t>(size, 1) - 1) >> kPageShift), kPages - 1);
+  for (uint32_t page = first; page <= last; ++page) {
+    if (!(armed[page >> 6].load(std::memory_order_relaxed) & (1ull << (page & 63)))) return false;
+  }
+  return true;
+}
+
+// Watches the range (before it is read: a write while decoding unwatches it).
+void Arm(uint32_t address, size_t size) {
+  std::call_once(registered, [] { Mem()->RegisterPhysicalMemoryInvalidationCallback(&Written, nullptr); });
+  address &= 0x1FFFFFFF;
+  const uint32_t first = address >> kPageShift;
+  const uint32_t last = std::min<uint32_t>(uint32_t((address + std::max<size_t>(size, 1) - 1) >> kPageShift), kPages - 1);
+  bool all = true;
+  for (uint32_t page = first; page <= last && all; ++page) {
+    all = armed[page >> 6].load(std::memory_order_relaxed) & (1ull << (page & 63));
+  }
+  if (all) return;
+  for (uint32_t page = first; page <= last; ++page) {
+    armed[page >> 6].fetch_or(1ull << (page & 63), std::memory_order_relaxed);
+  }
+  Mem()->EnablePhysicalMemoryAccessCallbacks(first << kPageShift, (last - first + 1) << kPageShift, true, false);
+}
+}  // namespace write_watch
+
+template <typename Map>
+void Sweep(Map& cache) {
+  if ((frame_counter & 255) != 0) {
+    return;
+  }
+  for (auto it = cache.begin(); it != cache.end();) {
+    it = frame_counter - it->second.last_used > 600 ? cache.erase(it) : std::next(it);
+  }
+}
+
+std::unordered_map<FetchKey, CacheEntry<Texture>, FetchKeyHash> texture_cache;
+// Textures in use (each on the GPU once drawn; its CPU copy freed then).
+constexpr size_t kNativeDecodedTextureCacheBudgetBytes = 384u << 20;
+constexpr uint64_t kNativeTextureCacheIdleFrames = 120;
+
+size_t DecodedTextureCacheBytes() {
+  size_t bytes = 0;
+  for (const auto& [key, entry] : texture_cache) {
+    (void)key;
+    if (entry.value) bytes += entry.value->bytes;
+  }
+  return bytes;
+}
+
+void SweepTextureCache() {
+  if ((frame_counter & 63) != 0) return;
+
+  for (auto it = texture_cache.begin(); it != texture_cache.end();) {
+    const bool idle = frame_counter - it->second.last_used > kNativeTextureCacheIdleFrames;
+    // Keep data owned by an in-flight frame or the GPU texture cache. The GPU
+    // cache has its own byte budget and will release those references first.
+    it = idle && (!it->second.value || it->second.value.use_count() == 1)
+             ? texture_cache.erase(it)
+             : std::next(it);
+  }
+
+  size_t bytes = DecodedTextureCacheBytes();
+  if (bytes <= kNativeDecodedTextureCacheBudgetBytes) return;
+
+  std::vector<std::pair<uint64_t, FetchKey>> candidates;
+  candidates.reserve(texture_cache.size());
+  for (const auto& [key, entry] : texture_cache) {
+    if (entry.value && entry.value.use_count() == 1) candidates.emplace_back(entry.last_used, key);
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (const auto& [last_used, key] : candidates) {
+    (void)last_used;
+    auto it = texture_cache.find(key);
+    if (it == texture_cache.end() || !it->second.value || it->second.value.use_count() != 1) continue;
+    bytes -= it->second.value->bytes;
+    texture_cache.erase(it);
+    if (bytes <= kNativeDecodedTextureCacheBudgetBytes) break;
+  }
+}
+
+// Addresses the game resolves to (seen in earlier frames): the renderer always
+// draws those from its own resolve output, so they are never decoded from
+// memory (the emulated renderer rewrites them every frame).
+std::unordered_map<uint32_t, uint64_t> resolve_destinations;  // address -> last frame
+// Every resolve the native renderer made, by address: the fingerprint of
+// guest memory there at the time. A later frame sampling the address uses the
+// renderer's copy while the memory is unchanged (the emulated renderer only
+// writes resolves up to 256 KB back, e.g. not the car's livery composited at
+// load); if the CPU wrote there since (FMV frames), memory is decoded instead.
+struct PersistentResolve {
+  uint64_t fingerprint;
+  uint32_t span;
+  uint64_t frame = 0;  // frame_counter when the renderer last resolved there
+};
+std::unordered_map<uint32_t, PersistentResolve> persistent_resolves;
+// Decoded vertex inputs, by where and how they were read (no strings: one
+// lookup per input per draw).
+struct AttributeKey {
+  uintptr_t base;
+  uint32_t stride, offset, format, endian, integer, lo, count, remap;
+  bool operator==(const AttributeKey& o) const {
+    return base == o.base && stride == o.stride && offset == o.offset && format == o.format &&
+           endian == o.endian && integer == o.integer && lo == o.lo && count == o.count && remap == o.remap;
+  }
+};
+struct AttributeKeyHash {
+  size_t operator()(const AttributeKey& k) const {
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint64_t v : {uint64_t(k.base), uint64_t(k.stride), uint64_t(k.offset), uint64_t(k.format),
+                       uint64_t(k.endian), uint64_t(k.integer), uint64_t(k.lo), uint64_t(k.count), uint64_t(k.remap)}) {
+      h = (h ^ v) * 0x100000001B3ull;
+      h ^= h >> 29;
+    }
+    return size_t(h);
+  }
+};
+// Bulk equality is valid only while equal values have identical bytes: no
+// padding, alternate representations or ownership-bearing members.
+static_assert(sizeof(AttributeKey) == 40 && std::is_standard_layout_v<AttributeKey> &&
+              offsetof(AttributeKey, base) == 0 && std::is_trivially_copyable_v<AttributeKey> &&
+              std::has_unique_object_representations_v<AttributeKey>);
+std::unordered_map<AttributeKey, CacheEntry<FloatArray>, AttributeKeyHash> attribute_cache;
+
+// Recording-thread-only entry lookup. This does not cache validation results:
+// every hit still checks the current guest bytes/write watch below in Record.
+// unordered_map nodes survive rehash, but Clear must precede any erasure.
+size_t AttributeLookupSetMask() {
+  static const size_t mask = (size_t(1) << std::clamp(REXCVAR_GET(nfsmw_native_attribute_lookup_sets_log2), 12, 14)) - 1;
+  return mask;
+}
+struct AttributeLookupCache {
+  // Sized by nfsmw_native_attribute_lookup_sets_log2: at 4096 sets, ~18% of
+  // a pursuit's lookups missed into attribute_cache (IPA63 iPhone profile).
+  static constexpr size_t kSets = 16384;
+  struct Slot {
+    AttributeKey key{};
+    CacheEntry<FloatArray>* entry = nullptr;
+  };
+  struct Set {
+    Slot slots[2];
+    uint8_t replace = 0;
+  };
+  Set sets[kSets]{};
+
+  static size_t SetIndex(const AttributeKey& key) {
+    // A cheap selector only. Every identity field is compared on a hit, so
+    // different formats/endian/remaps may share a set without sharing data.
+    uint64_t h = uint64_t(key.base >> 4) ^ (uint64_t(key.lo) << 32) ^
+                 (uint64_t(key.count) << 16) ^ (uint64_t(key.stride) << 8) ^ key.offset;
+    h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+    return size_t(h ^ (h >> 27)) & AttributeLookupSetMask();
+  }
+
+  template <bool BulkCompare>
+  CacheEntry<FloatArray>& Find(const AttributeKey& key, VertexDiagnostics& diagnostics) {
+    Set& set = sets[SetIndex(key)];
+    for (size_t i = 0; i < 2; ++i) {
+      Slot& slot = set.slots[i];
+      if (!slot.entry) continue;
+      bool matches;
+      if constexpr (BulkCompare) {
+        // Reject different buffers before loading the rest of a colliding
+        // key. The remaining eight fields occupy 32 contiguous bytes.
+        const auto* stored = reinterpret_cast<const unsigned char*>(&slot.key);
+        const auto* requested = reinterpret_cast<const unsigned char*>(&key);
+        matches = slot.key.base == key.base &&
+                  std::memcmp(stored + sizeof(uintptr_t), requested + sizeof(uintptr_t),
+                              sizeof(AttributeKey) - sizeof(uintptr_t)) == 0;
+      } else {
+        matches = slot.key == key;
+      }
+      if (matches) {
+        set.replace = uint8_t(i ^ 1);
+        ++diagnostics.attribute_lookup_hits;
+        return *slot.entry;
+      }
+    }
+    ++diagnostics.attribute_lookup_misses;
+    auto& entry = attribute_cache[key];
+    Slot& slot = set.slots[set.replace];
+    slot.key = key;
+    slot.entry = &entry;
+    set.replace ^= 1;
+    return entry;
+  }
+
+  void Clear() {
+    for (size_t i = 0, n = AttributeLookupSetMask() + 1; i < n; ++i) {
+      sets[i].slots[0].entry = sets[i].slots[1].entry = nullptr;
+      sets[i].replace = 0;
+    }
+  }
+};
+AttributeLookupCache attribute_lookup;
+
+bool AttributeLookupEnabled() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_attribute_lookup);
+  return enabled;
+}
+
+bool AttributeBulkCompareEnabled() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_attribute_bulk_compare);
+  return enabled;
+}
+
+CacheEntry<FloatArray>& AttributeEntryFor(const AttributeKey& key, VertexDiagnostics& diagnostics) {
+  if (AttributeLookupEnabled()) {
+    if (AttributeBulkCompareEnabled()) return attribute_lookup.Find<true>(key, diagnostics);
+    return attribute_lookup.Find<false>(key, diagnostics);
+  }
+  ++diagnostics.attribute_lookup_bypasses;
+  return attribute_cache[key];
+}
+
+void SweepAttributeCache() {
+  if ((frame_counter & 255) == 0) attribute_lookup.Clear();
+  Sweep(attribute_cache);
+}
+
+// A draw's indices as the renderer draws them (read, byte-swapped, offset,
+// rebased to the lowest vertex, fans and quads made triangles), by where and
+// how they were read, checked against their memory like the attributes: most
+// draws are static scenery whose index buffers never change.
+struct IndexKey {
+  uint32_t base, count, offset, flags;  // flags: initiator bits (primitive, source, 32-bit) | endian << 16
+  bool operator==(const IndexKey& o) const {
+    return base == o.base && count == o.count && offset == o.offset && flags == o.flags;
+  }
+};
+struct IndexKeyHash {
+  size_t operator()(const IndexKey& k) const {
+    uint64_t h = (uint64_t(k.base) << 32 | k.count) * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t(k.offset) << 32 | k.flags) + (h >> 29);
+    return size_t(h * 0x100000001B3ull);
+  }
+};
+struct IndexEntry {
+  std::shared_ptr<const std::vector<uint32_t>> indices;
+  uint64_t fingerprint = 0, last_used = 0;
+  uint32_t lo = 0, hi = 0;
+  MTLPrimitiveType primitive = MTLPrimitiveTypeTriangle;
+};
+std::unordered_map<IndexKey, IndexEntry, IndexKeyHash> index_cache;
+
+// The index memory's fingerprint: every word up to 4 KB (most draws), else
+// the sampled one. One FNV chain is a multiply per 8 bytes that each waits for
+// the last (~3,000 draws a frame in pursuits, up to 512 steps each), so by
+// default four chains run side by side over 32-byte blocks and are folded at
+// the end: the same words go in, a different (equally strong) value comes out.
+// The values live only in this session's index cache.
+uint64_t IndexFingerprint(const uint8_t* p, size_t size) {
+  if (size > 4096) return Fingerprint(p, size);
+  uint64_t h = 0xCBF29CE484222325ull ^ size;
+  size_t i = 0;
+  static const bool lanes = REXCVAR_GET(nfsmw_native_fast_index_fingerprint);
+  if (lanes) {
+    uint64_t l0 = h, l1 = h ^ 0x9E3779B97F4A7C15ull, l2 = h ^ 0xC2B2AE3D27D4EB4Full,
+             l3 = h ^ 0x165667B19E3779F9ull;
+    for (; i + 32 <= size; i += 32) {
+      uint64_t v[4];
+      std::memcpy(v, p + i, 32);
+      l0 = (l0 ^ v[0]) * 0x100000001B3ull;
+      l1 = (l1 ^ v[1]) * 0x100000001B3ull;
+      l2 = (l2 ^ v[2]) * 0x100000001B3ull;
+      l3 = (l3 ^ v[3]) * 0x100000001B3ull;
+    }
+    h = (((l0 * 0x100000001B3ull) ^ l1) * 0x100000001B3ull ^ l2) * 0x100000001B3ull ^ l3;
+  }
+  for (; i + 8 <= size; i += 8) {
+    uint64_t v;
+    std::memcpy(&v, p + i, 8);
+    h = (h ^ v) * 0x100000001B3ull;
+  }
+  for (; i < size; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+  return h;
+}
+
+// --- Vertex fetch -------------------------------------------------------------
+
+struct VFetch {
+  uint32_t slot, offset, stride, format;
+  uint32_t swizzle;  // destination swizzle: 3 bits per component (0-3 XYZW, 4 zero, 5 one, 7 not written)
+  bool is_signed, integer;
+};
+
+bool ParseVFetch(const uint32_t* code, uint32_t dwords, uint32_t address, VFetch& out) {
+  if ((address + 1) * 3 > dwords) {
+    return false;
+  }
+  const uint32_t* w = code + address * 3;
+  if ((w[0] & 0x1F) != 0) {
+    return false;
+  }
+  out.format = (w[1] >> 16) & 0x3F;
+  out.swizzle = w[1] & 0xFFF;
+  out.is_signed = (w[1] >> 12) & 1;
+  out.integer = (w[1] >> 13) & 1;
+  out.offset = uint32_t(int32_t(w[2] << 1) >> 9);  // 23-bit signed at 8
+  // A mini fetch takes its fetch constant and stride from the full fetch
+  // before it.
+  const uint32_t* full = w;
+  if ((w[1] >> 30) & 1) {
+    full = nullptr;
+    for (int a = int(address) - 1; a >= 0; --a) {
+      const uint32_t* p = code + a * 3;
+      if ((p[0] & 0x1F) == 0 && ((p[0] >> 19) & 1) && !((p[1] >> 30) & 1)) {
+        full = p;
+        break;
+      }
+    }
+    if (!full) {
+      return false;
+    }
+  }
+  out.slot = ((full[0] >> 20) & 0x1F) * 3 + ((full[0] >> 25) & 3);
+  out.stride = full[2] & 0xFF;
+  return true;
+}
+
+float Norm(int64_t v, uint32_t bits, bool is_signed, bool integer) {
+  if (integer) {
+    return float(v);
+  }
+  if (is_signed) {
+    return std::max(float(v) / float((1ll << (bits - 1)) - 1), -1.0f);
+  }
+  return float(v) / float((1ll << bits) - 1);
+}
+
+int64_t Field(uint32_t word, uint32_t shift, uint32_t bits, bool is_signed) {
+  uint32_t v = (word >> shift) & ((bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1));
+  if (is_signed && bits < 32 && (v >> (bits - 1))) {
+    return int64_t(v) - (int64_t(1) << bits);
+  }
+  return is_signed ? int64_t(int32_t(v)) : int64_t(v);
+}
+
+// One element (fetch format) to four components.
+bool DecodeElement(const uint8_t* p, xenos::Endian endian, const VFetch& f, float out[4]) {
+  auto word = [&](int i) { return xenos::GpuSwap(LoadLE32(p + 4 * i), endian); };
+  out[0] = out[1] = out[2] = 0;
+  out[3] = 1;
+  const bool s = f.is_signed, n = f.integer;
+  switch (xenos::VertexFormat(f.format)) {
+    case xenos::VertexFormat::k_8_8_8_8:
+      for (int c = 0; c < 4; ++c) out[c] = Norm(Field(word(0), 8 * c, 8, s), 8, s, n);
+      return true;
+    case xenos::VertexFormat::k_2_10_10_10:
+      for (int c = 0; c < 3; ++c) out[c] = Norm(Field(word(0), 10 * c, 10, s), 10, s, n);
+      out[3] = Norm(Field(word(0), 30, 2, s), 2, s, n);
+      return true;
+    case xenos::VertexFormat::k_11_11_10:
+      out[0] = Norm(Field(word(0), 0, 11, s), 11, s, n);
+      out[1] = Norm(Field(word(0), 11, 11, s), 11, s, n);
+      out[2] = Norm(Field(word(0), 22, 10, s), 10, s, n);
+      return true;
+    case xenos::VertexFormat::k_10_11_11:
+      out[0] = Norm(Field(word(0), 0, 10, s), 10, s, n);
+      out[1] = Norm(Field(word(0), 10, 11, s), 11, s, n);
+      out[2] = Norm(Field(word(0), 21, 11, s), 11, s, n);
+      return true;
+    case xenos::VertexFormat::k_16_16:
+      for (int c = 0; c < 2; ++c) out[c] = Norm(Field(word(0), 16 * c, 16, s), 16, s, n);
+      return true;
+    case xenos::VertexFormat::k_16_16_16_16:
+      for (int c = 0; c < 4; ++c) out[c] = Norm(Field(word(c / 2), 16 * (c & 1), 16, s), 16, s, n);
+      return true;
+    case xenos::VertexFormat::k_16_16_FLOAT:
+    case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
+      const int count = xenos::VertexFormat(f.format) == xenos::VertexFormat::k_16_16_FLOAT ? 2 : 4;
+      for (int c = 0; c < count; ++c) {
+        const uint16_t h = uint16_t(word(c / 2) >> (16 * (c & 1)));
+        __fp16 half;
+        std::memcpy(&half, &h, 2);
+        out[c] = float(half);
+      }
+      return true;
+    }
+    case xenos::VertexFormat::k_32:
+    case xenos::VertexFormat::k_32_32:
+    case xenos::VertexFormat::k_32_32_32_32: {
+      const int count = f.format == 33 ? 1 : f.format == 34 ? 2 : 4;
+      for (int c = 0; c < count; ++c) out[c] = Norm(Field(word(c), 0, 32, s), 32, s, n);
+      return true;
+    }
+    case xenos::VertexFormat::k_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_32_32_FLOAT: {
+      const int count = f.format == 36 ? 1 : f.format == 37 ? 2 : f.format == 57 ? 3 : 4;
+      for (int c = 0; c < count; ++c) out[c] = AsFloat(word(c));
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+// --- Textures -----------------------------------------------------------------
+
+struct TexFormat {
+  MTLPixelFormat format;
+  uint32_t block, bytes;  // block size in texels, bytes per block
+};
+
+bool TextureFormatInfo(uint32_t f, TexFormat& out) {
+  switch (xenos::TextureFormat(f)) {
+    case xenos::TextureFormat::k_8_8_8_8: out = {MTLPixelFormatRGBA8Unorm, 1, 4}; return true;
+    case xenos::TextureFormat::k_8: out = {MTLPixelFormatR8Unorm, 1, 1}; return true;
+    case xenos::TextureFormat::k_8_8: out = {MTLPixelFormatRG8Unorm, 1, 2}; return true;
+    case xenos::TextureFormat::k_5_6_5: out = {MTLPixelFormatB5G6R5Unorm, 1, 2}; return true;
+    case xenos::TextureFormat::k_4_4_4_4: out = {MTLPixelFormatABGR4Unorm, 1, 2}; return true;
+    case xenos::TextureFormat::k_1_5_5_5: out = {MTLPixelFormatA1BGR5Unorm, 1, 2}; return true;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT: out = {MTLPixelFormatRGBA16Float, 1, 8}; return true;
+    case xenos::TextureFormat::k_32_FLOAT: out = {MTLPixelFormatR32Float, 1, 4}; return true;
+    case xenos::TextureFormat::k_DXT1: out = {MTLPixelFormatBC1_RGBA, 4, 8}; return true;
+    case xenos::TextureFormat::k_DXT2_3: out = {MTLPixelFormatBC2_RGBA, 4, 16}; return true;
+    case xenos::TextureFormat::k_DXT4_5: out = {MTLPixelFormatBC3_RGBA, 4, 16}; return true;
+    default: return false;
+  }
+}
+
+MTLTextureSwizzle SwizzleOf(uint32_t s) {
+  switch (s & 7) {
+    case 0: return MTLTextureSwizzleRed;
+    case 1: return MTLTextureSwizzleGreen;
+    case 2: return MTLTextureSwizzleBlue;
+    case 3: return MTLTextureSwizzleAlpha;
+    case 4: return MTLTextureSwizzleZero;
+    default: return MTLTextureSwizzleOne;
+  }
+}
+
+// Whether the GPU samples BC (DXT) textures: not the A16 and older iPhones.
+bool GpuHasBC() {
+  static const bool has = [] {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    const bool b = device && device.supportsBCTextureCompression;
+    REXLOG_INFO("[native] BC (DXT) textures {} on this GPU", b ? "supported" : "NOT supported: decoded on the CPU");
+    return b;
+  }();
+  return has;
+}
+
+// A 565 colour to 8-bit RGB.
+inline void Unpack565(uint16_t c, uint8_t out[3]) {
+  out[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
+  out[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+  out[2] = uint8_t((c & 31) * 255 / 31);
+}
+
+// One BC1 colour block (8 bytes) into 16 RGBA texels; alpha from the
+// 3-colour mode unless the caller's alpha replaces it (BC2/BC3).
+void DecodeBC1Block(const uint8_t* b, uint8_t out[16][4], bool three_colour_alpha) {
+  const uint16_t c0 = uint16_t(b[0] | (b[1] << 8)), c1 = uint16_t(b[2] | (b[3] << 8));
+  uint8_t p[4][4];
+  Unpack565(c0, p[0]);
+  Unpack565(c1, p[1]);
+  p[0][3] = p[1][3] = 255;
+  if (c0 > c1 || !three_colour_alpha) {
+    for (int k = 0; k < 3; ++k) {
+      p[2][k] = uint8_t((2 * p[0][k] + p[1][k]) / 3);
+      p[3][k] = uint8_t((p[0][k] + 2 * p[1][k]) / 3);
+    }
+    p[2][3] = p[3][3] = 255;
+  } else {
+    for (int k = 0; k < 3; ++k) {
+      p[2][k] = uint8_t((p[0][k] + p[1][k]) / 2);
+      p[3][k] = 0;
+    }
+    p[2][3] = 255;
+    p[3][3] = 0;
+  }
+  const uint32_t idx = uint32_t(b[4]) | (uint32_t(b[5]) << 8) | (uint32_t(b[6]) << 16) | (uint32_t(b[7]) << 24);
+  for (int i = 0; i < 16; ++i) std::memcpy(out[i], p[(idx >> (2 * i)) & 3], 4);
+}
+
+// BC1-3 blocks (tex.data, bw x bh blocks per layer) into RGBA8 texels.
+void DecodeBCToRGBA8(Texture& tex) {
+  const bool bc1 = tex.format == MTLPixelFormatBC1_RGBA, bc2 = tex.format == MTLPixelFormatBC2_RGBA;
+  const size_t block_bytes = bc1 ? 8 : 16;
+  const uint32_t layers = LayersOf(tex);
+  decltype(tex.data) out(SpanOf(tex.width, tex.height, layers, 1, 4, tex.levels).offset);
+  uint8_t px[16][4];
+  for (uint32_t level = 0; level < tex.levels; ++level) {
+  const LevelSpan in = SpanOf(tex, level), to = SpanOf(tex.width, tex.height, layers, 1, 4, level);
+  const uint32_t bw = in.bw, bh = in.bh, w = in.width, h = in.height;
+  const size_t in_face = in.layer_bytes, out_row = to.row_bytes, out_face = to.layer_bytes;
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    for (uint32_t by = 0; by < bh; ++by) {
+      for (uint32_t bx = 0; bx < bw; ++bx) {
+        const uint8_t* b = tex.data.data() + in.offset + layer * in_face + (size_t(by) * bw + bx) * block_bytes;
+        if (bc1) {
+          DecodeBC1Block(b, px, true);
+        } else {
+          DecodeBC1Block(b + 8, px, false);
+          if (bc2) {
+            for (int i = 0; i < 16; ++i) px[i][3] = uint8_t(((b[i / 2] >> (4 * (i & 1))) & 15) * 17);
+          } else {
+            uint8_t a[8] = {b[0], b[1]};
+            if (a[0] > a[1]) {
+              for (int i = 1; i < 7; ++i) a[i + 1] = uint8_t(((7 - i) * a[0] + i * a[1]) / 7);
+            } else {
+              for (int i = 1; i < 5; ++i) a[i + 1] = uint8_t(((5 - i) * a[0] + i * a[1]) / 5);
+              a[6] = 0;
+              a[7] = 255;
+            }
+            uint64_t bits = 0;
+            for (int i = 0; i < 6; ++i) bits |= uint64_t(b[2 + i]) << (8 * i);
+            for (int i = 0; i < 16; ++i) px[i][3] = a[(bits >> (3 * i)) & 7];
+          }
+        }
+        for (int i = 0; i < 16; ++i) {
+          const uint32_t x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+          if (x < w && y < h) std::memcpy(out.data() + to.offset + layer * out_face + y * out_row + x * 4, px[i], 4);
+        }
+      }
+    }
+  }
+  }
+  tex.data.swap(out);
+  tex.format = MTLPixelFormatRGBA8Unorm;
+  tex.row_bytes = tex.width * 4;
+  tex.block = 1;
+  tex.block_bytes = 4;
+  tex.bytes = tex.data.size();
+}
+
+int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_block_log2) {
+  // rexglue src/graphics/pipeline/texture/util.cpp GetTiledOffset2D (from UModel).
+  pitch = (pitch + 31) & ~31u;
+  int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (bytes_per_block_log2 + 7);
+  int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bytes_per_block_log2;
+  int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+// The resolves of a finished frame into guest memory: tiled, in the
+// resolve's byte order, red and blue swapped if it swapped (what the
+// console's resolve writes, and what the texture decoder reads back).
+void ApplyWriteBacks(const std::vector<WriteBack>& list) {
+  std::vector<uint32_t> done;
+  for (const WriteBack& wb : list) {
+    uint8_t* base = const_cast<uint8_t*>(Physical(wb.base));
+    const uint8_t* src = static_cast<const uint8_t*>(wb.pixels.contents);
+    const auto endian = xenos::Endian(wb.endian & 3);
+    for (uint32_t y = 0; y < wb.h; ++y) {
+      for (uint32_t x = 0; x < wb.w; ++x) {
+        uint32_t v;
+        // The texel nearest the guest pixel's centre (the copy starts at the rect's scaled origin).
+        const uint32_t sy = std::min(uint32_t((y + 0.5f) * wb.scale), wb.src_h - 1);
+        const uint32_t sx = std::min(uint32_t((x + 0.5f) * wb.scale), wb.src_w - 1);
+        std::memcpy(&v, src + sy * wb.row_bytes + sx * 4, 4);  // R, G, B, A bytes
+        if (wb.swap) v = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+        v = xenos::GpuSwap(v, endian);
+        std::memcpy(base + TiledOffset2D(int32_t(wb.x0 + x), int32_t(wb.y0 + y), wb.pitch, 2), &v, 4);
+      }
+    }
+    done.push_back(wb.base);
+  }
+  std::lock_guard<std::mutex> lock(written_back_mutex);
+  written_back.insert(written_back.end(), done.begin(), done.end());
+}
+
+int32_t TiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, uint32_t height,
+                      uint32_t bytes_per_block_log2) {
+  // rexglue src/graphics/pipeline/texture/util.cpp GetTiledOffset3D
+  // (reconstructed from XGRAPHICS::TileVolume).
+  pitch = (pitch + 31) & ~31u;
+  height = (height + 31) & ~31u;
+  int32_t macro_outer = ((y >> 4) + (z >> 2) * int32_t(height >> 4)) * int32_t(pitch >> 5);
+  int32_t macro = ((((x >> 5) + macro_outer) << (bytes_per_block_log2 + 6)) & 0xFFFFFFF) << 1;
+  int32_t micro = (((x & 7) + ((y & 6) << 2)) << (bytes_per_block_log2 + 6)) >> 6;
+  int32_t offset_outer = ((y >> 3) + (z >> 2)) & 1;
+  int32_t offset1 = offset_outer + ((((x >> 3) + (offset_outer << 1)) & 3) << 1);
+  int32_t offset2 = ((macro + (micro & ~15)) << 1) + (micro & 15) +
+                    ((z & 3) << (bytes_per_block_log2 + 6)) + ((y & 1) << 4);
+  int32_t address = (offset1 & 1) << 3;
+  address += (offset2 >> 6) & 7;
+  address <<= 3;
+  address += offset1 & ~1;
+  address <<= 2;
+  address += offset2 & ~511;
+  address <<= 3;
+  address += offset2 & 63;
+  return address;
+}
+
+// The texture of a fetch slot, decoded once per frame.
+int TextureOf(Frame& frame, const uint32_t* fetch) {
+  xenos::xe_gpu_texture_fetch_t t;
+  std::memcpy(&t, fetch, sizeof(t));
+  // Textures: 2D, or cube (six faces stored like 2D slices).
+  const bool cube = uint32_t(t.dimension) == 3;
+  const bool volume = uint32_t(t.dimension) == 2;
+  if (uint32_t(t.type) == 2 && uint32_t(t.dimension) != 1 && !cube && !volume &&
+      frame.unsupported_formats.insert(0x80000000u | uint32_t(t.dimension)).second) {
+    Note(frame, fmt::format("texture dimension {} not decoded (format {})", uint32_t(t.dimension),
+                            uint32_t(t.format)));
+  }
+  if (uint32_t(t.type) != 2 || (uint32_t(t.dimension) != 1 && !cube && !volume)) {
+    return -1;
+  }
+  // 3D textures size their fields differently (11, 11 and 10 bits).
+  const uint32_t width = volume ? t.size_3d.width + 1 : t.size_2d.width + 1;
+  const uint32_t height = volume ? t.size_3d.height + 1 : t.size_2d.height + 1;
+  const uint32_t depth = volume ? t.size_3d.depth + 1 : 1;
+  FetchKey key;
+  std::memcpy(key.v, fetch, sizeof(key.v));
+  if (auto it = frame.texture_index.find(key); it != frame.texture_index.end()) {
+    return it->second;
+  }
+  TexFormat info;
+  // Resolved earlier in this frame: the renderer draws it from its own copy.
+  // (Only then: an address resolved in other frames can hold what the CPU
+  // writes, e.g. the FMVs' video frames.)
+  bool persistent = false;
+  if (!frame.resolved_so_far.count(uint32_t(t.base_address) << 12)) {
+    auto pr = persistent_resolves.find(uint32_t(t.base_address) << 12);
+    if (pr != persistent_resolves.end()) {
+      // Resolved by the renderer in the last two frames: its own copy, without
+      // looking at memory. Its own write-back (small resolves, read back for
+      // the CPU) changes that memory a moment after the fingerprint was
+      // taken, so the check failed and the texture was decoded again from it
+      // every frame (the race's environment cube: 1.5 MB, the bloom buffer).
+      if (frame_counter - pr->second.frame <= 2) {
+        persistent = true;
+      } else if (Fingerprint(Physical(pr->first), pr->second.span) == pr->second.fingerprint) {
+        persistent = true;  // the renderer's copy from an earlier frame
+      } else {
+        persistent_resolves.erase(pr);  // the CPU wrote there since
+      }
+    }
+  }
+  if (persistent || frame.resolved_so_far.count(uint32_t(t.base_address) << 12)) {
+    {  // The filters the game asks for its resolves (once each): the renderer samples them linear.
+      static std::set<uint64_t> said;
+      const uint64_t k = (uint64_t(t.base_address) << 12) | (uint64_t(t.mag_filter) << 40) | (uint64_t(t.min_filter) << 42);
+      if (said.size() < 64 && said.insert(k).second) {
+        REXLOG_INFO("[native] resolve {:08x} ({}x{}) sampled with mag filter {} min filter {} mip filter {} "
+                    "(0 point, 1 linear), clamp {}/{}",
+                    uint32_t(t.base_address) << 12, width, height, uint32_t(t.mag_filter), uint32_t(t.min_filter),
+                    uint32_t(t.mip_filter), uint32_t(t.clamp_x), uint32_t(t.clamp_y));
+      }
+    }
+    Texture placeholder;  // stands in for the renderer's own resolve
+    placeholder.width = width;
+    placeholder.height = height;
+    placeholder.cube = cube;
+    placeholder.fetch_swizzle = t.swizzle;
+    placeholder.persistent = persistent;
+    placeholder.exp_adjust = int32_t(t.exp_adjust);
+    placeholder.address = uint32_t(t.base_address) << 12;
+    frame.textures.push_back(std::make_shared<const Texture>(std::move(placeholder)));
+    const int index = int(frame.textures.size() - 1);
+    frame.texture_index[key] = index;
+    return index;
+  }
+  if (!TextureFormatInfo(uint32_t(t.format), info)) {
+    // Which formats are missing (once each): white until supported.
+    if (frame.unsupported_formats.insert((uint32_t(t.format) << 2) | uint32_t(t.dimension)).second) {
+      Note(frame, fmt::format("texture format {} not decoded ({}x{}, {}, tiled {}, endian {}, at {:08x})",
+                              uint32_t(t.format), width, height,
+                              cube ? "cube" : "2D", uint32_t(t.tiled), uint32_t(t.endianness),
+                              uint32_t(t.base_address) << 12));
+    }
+    // Not decodable from memory (e.g. the depth format of the shadow map):
+    // only a resolve can stand in for it; until then, white.
+    Texture placeholder;
+    placeholder.width = width;
+    placeholder.height = height;
+    placeholder.address = uint32_t(t.base_address) << 12;
+    frame.textures.push_back(std::make_shared<const Texture>(std::move(placeholder)));
+    const int index = int(frame.textures.size() - 1);
+    frame.texture_index[key] = index;
+    return index;
+  }
+  Texture tex;
+  tex.exp_adjust = int32_t(t.exp_adjust);
+  tex.address = uint32_t(t.base_address) << 12;
+  tex.format = info.format;
+  tex.guest_format = uint32_t(t.format);
+  tex.guest_endian = uint32_t(t.endianness);
+  tex.guest_tiled = t.tiled;
+  tex.guest_signed = t.sign_x != xenos::TextureSign::kUnsigned || t.sign_y != xenos::TextureSign::kUnsigned ||
+                     t.sign_z != xenos::TextureSign::kUnsigned || t.sign_w != xenos::TextureSign::kUnsigned;
+  tex.width = width;
+  tex.height = height;
+  const uint32_t bw = (width + info.block - 1) / info.block, bh = (height + info.block - 1) / info.block;
+  tex.row_bytes = bw * info.bytes;
+  tex.block = info.block;
+  tex.block_bytes = info.bytes;
+  tex.cube = cube;
+  tex.volume = volume;
+  tex.depth = depth;
+  const size_t face_bytes = size_t(tex.row_bytes) * bh;
+  const uint32_t layers = cube ? 6u : depth;
+  // The mips (2D and cube), where the game keeps them: rexglue's guest
+  // layout, as its Vulkan renderer loads them (levels 1.. under mip_address,
+  // the small ones packed into one tail).
+  uint32_t mip_page = 0, mip_max = 0;
+  texture_util::GetSubresourcesFromFetchConstant(t, nullptr, nullptr, nullptr, nullptr, &mip_page, nullptr,
+                                                 &mip_max);
+  if (volume || t.mip_filter == xenos::TextureFilter::kBaseMap) mip_max = 0;
+  texture_util::TextureGuestLayout mip_layout = {};
+  if (mip_max) {
+    mip_layout = texture_util::GetGuestTextureLayout(t.dimension, uint32_t(t.pitch), width, height, layers,
+                                                     bool(t.tiled), xenos::TextureFormat(t.format),
+                                                     bool(t.packed_mips), true, mip_max);
+    if (!mip_layout.mips_total_extent_bytes) mip_max = 0;
+  }
+  tex.levels = mip_max + 1;
+  const uint32_t mip_address = mip_page << 12;
+  const size_t mip_span = mip_max ? mip_layout.mips_total_extent_bytes : 0;
+  const uint8_t* mip_base = mip_max ? Physical(mip_address) : nullptr;
+  const uint8_t* texture_base = Physical(uint32_t(t.base_address) << 12);
+  const uint32_t log2 = __builtin_ctz(info.bytes);
+  const auto endian = xenos::Endian(uint32_t(t.endianness));
+  // Pitch in texels >> 5; in blocks for the tiled addressing.
+  const uint32_t pitch_texels = uint32_t(t.pitch) << 5;
+  const uint32_t pitch_blocks = (pitch_texels + info.block - 1) / info.block;
+  const uint32_t linear_row = (pitch_blocks * info.bytes + 255) & ~255u;
+  // Faces of a cube: the base level's row pitch (blocks, tile-aligned) times
+  // its height in blocks aligned to 32, aligned to 4 KB (rexglue
+  // GetGuestTextureLayout's array slice stride).
+  const uint32_t row_pitch_aligned = ((pitch_blocks + 31) & ~31u) * info.bytes;
+  const uint32_t face_stride =
+      (row_pitch_aligned * ((bh + 31) & ~31u) + 4095) & ~4095u;
+  // 3D: linear slices one row pitch x height (aligned to 32 rows) apart;
+  // tiled ones addressed by the 3D tiling.
+  const size_t linear_slice = size_t(linear_row) * ((bh + 31) & ~31u);
+  // Already decoded and its memory unchanged: the cached one.
+  const size_t span = size_t(layers) * std::max<size_t>(face_stride, linear_slice);
+  const uint32_t texture_address = uint32_t(t.base_address) << 12;
+  CacheEntry<Texture>& cached = texture_cache[key];
+  cached.last_used = frame_counter;
+  // Watched and not written since: no need to read the memory (WriteWatch).
+  const bool watch = REXCVAR_GET(nfsmw_native_write_watch);
+  bool hit = watch && cached.value && cached.watched && write_watch::Clean(texture_address, span) &&
+             (!mip_span || write_watch::Clean(mip_address, mip_span));
+  uint64_t fingerprint = 0;
+  if (!hit) {
+    if (watch && !cached.dynamic) {
+      write_watch::Arm(texture_address, span);
+      if (mip_span) write_watch::Arm(mip_address, mip_span);
+    }
+    fingerprint = Fingerprint(texture_base, span);
+    if (mip_span) fingerprint = (fingerprint ^ Fingerprint(mip_base, mip_span)) * 0x100000001B3ull;
+    hit = cached.value && cached.fingerprint == fingerprint;
+    if (hit) {
+      // Its pages were written but not it (they hold data the CPU writes
+      // every frame): fingerprinted from now on, not watched.
+      if (cached.watched) {
+        if (frame_counter - cached.last_false_alarm <= 2) cached.dynamic = true;
+        cached.last_false_alarm = frame_counter;
+      }
+      cached.watched = !cached.dynamic;
+    } else {
+      if (cached.value && frame_counter - cached.last_changed <= 2) cached.dynamic = true;  // FMV frames, etc.
+      cached.last_changed = frame_counter;
+      cached.watched = !cached.dynamic;
+    }
+  }
+  if (hit) {
+    frame.textures.push_back(cached.value);
+    const int index = int(frame.textures.size() - 1);
+    frame.texture_index[key] = index;
+    return index;
+  }
+  const auto decode_start = std::chrono::steady_clock::now();
+  // Allocated only now, for a real decode (it was allocated, and zeroed,
+  // before the cache check: for every lookup, then thrown away on a hit).
+  tex.data.resize(SpanOf(tex, tex.levels).offset);
+  tex.bytes = tex.data.size();
+  // bw x bh blocks from (xo, yo) of an image at src (tiled: pitch in blocks;
+  // linear: row in bytes), byte-swapped, to dst rows of dst_row bytes.
+  auto copy_blocks = [&](const uint8_t* src_base, uint32_t pitch, uint32_t row, uint32_t z, uint32_t z_rows,
+                         uint32_t xo, uint32_t yo, uint32_t bw, uint32_t bh, uint8_t* dst_base, size_t dst_row) {
+  for (uint32_t by = 0; by < bh; ++by) {
+    for (uint32_t bx = 0; bx < bw; ++bx) {
+      const int32_t x = int32_t(bx + xo), y = int32_t(by + yo);
+      const uint8_t* src = src_base + (t.tiled ? uint32_t(volume ? TiledOffset3D(x, y, int32_t(z), pitch, z_rows, log2)
+                                                                 : TiledOffset2D(x, y, pitch, log2))
+                                               : uint32_t(y) * row + uint32_t(x) * info.bytes);
+      uint8_t* dst = dst_base + size_t(by) * dst_row + size_t(bx) * info.bytes;
+      if (info.bytes == 1) {
+        *dst = *src;
+        continue;
+      }
+      for (uint32_t i = 0; i < info.bytes; i += 2) {
+        if (info.bytes == 2 || endian == xenos::Endian::k8in16) {
+          uint16_t v;
+          std::memcpy(&v, src + i, 2);
+          v = xenos::GpuSwap(v, endian == xenos::Endian::k8in16 ? endian : xenos::Endian::kNone);
+          std::memcpy(dst + i, &v, 2);
+        } else {
+          if (i & 2) {
+            continue;
+          }
+          uint32_t v = xenos::GpuSwap(LoadLE32(src + i), endian);
+          std::memcpy(dst + i, &v, 4);
+        }
+      }
+    }
+  }
+  };
+  for (uint32_t face = 0; face < layers; ++face) {
+    const uint8_t* base = texture_base + (volume ? (t.tiled ? 0 : face * linear_slice) : size_t(face) * face_stride);
+    copy_blocks(base, pitch_blocks, linear_row, face, bh, 0, 0, bw, bh,
+                tex.data.data() + face * face_bytes, tex.row_bytes);
+  }
+  for (uint32_t level = 1; level <= mip_max; ++level) {
+    const uint32_t stored = std::min(level, mip_layout.packed_level);
+    const auto& guest = mip_layout.mips[stored];
+    uint32_t xo = 0, yo = 0, zo = 0;
+    if (level >= mip_layout.packed_level) {
+      texture_util::GetPackedMipOffset(width, height, 1, xenos::TextureFormat(t.format), level, xo, yo, zo);
+    }
+    const LevelSpan to = SpanOf(tex, level);
+    for (uint32_t face = 0; face < layers; ++face) {
+      copy_blocks(mip_base + mip_layout.mip_offsets_bytes[stored] + size_t(face) * guest.array_slice_stride_bytes,
+                  guest.row_pitch_bytes / info.bytes, guest.row_pitch_bytes, 0, 0, xo, yo, to.bw, to.bh,
+                  tex.data.data() + to.offset + face * to.layer_bytes, to.row_bytes);
+    }
+  }
+  ++frame.textures_decoded;
+  frame.texture_decode_bytes += tex.data.size();
+  ++textures_decoded_total;
+  texture_decode_bytes_total += tex.data.size();
+  {  // Decoded again frame after frame (its memory keeps changing): which one.
+    static std::unordered_map<uint32_t, std::pair<uint64_t, uint32_t>> streaks;  // address -> last frame, run
+    static std::set<uint32_t> said;
+    auto& [last, run] = streaks[tex.address];
+    run = (last + 1 == frame_counter || last == frame_counter) ? run + (last != frame_counter) : 1;
+    last = frame_counter;
+    if (run == 10 && said.size() < 20 && said.insert(tex.address).second) {
+      REXLOG_INFO("[native] texture {:08x} decoded every frame: {}x{} format {} ({} KiB, tiled {}, {} layers, "
+                  "resolved here before: {})",
+                  tex.address, width, height, uint32_t(t.format), tex.data.size() >> 10, bool(t.tiled), layers,
+                  resolve_destinations.count(tex.address) ? "yes" : "no");
+    }
+  }
+  frame.texture_decode_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - decode_start).count());
+  // DXT (BC1-3) to RGBA8 on the CPU where the GPU has no BC formats: the
+  // iPhone 14 Pro Max (A16) aborted making a BC1 texture (Metal validation).
+  if ((tex.format == MTLPixelFormatBC1_RGBA || tex.format == MTLPixelFormatBC2_RGBA ||
+       tex.format == MTLPixelFormatBC3_RGBA) && !GpuHasBC()) {
+    // Expanded on the GPU at upload (BcDecodeOnGpu): the blocks upload small
+    // and the CPU does nothing; 3D textures (rare) on the CPU.
+    if (tex.volume || !REXCVAR_GET(nfsmw_native_bc_gpu_decode)) {
+      DecodeBCToRGBA8(tex);
+    } else {
+      tex.bc_on_gpu = true;
+    }
+  }
+  // k_4_4_4_4 to RGBA8 on the CPU, exactly as rexglue's load shader
+  // (texture_load_r4g4b4a4_rgba8): R in bits 0-3, G 4-7, B 8-11, A 12-15,
+  // each nibble repeated into a byte. Metal's ABGR4 channel order did not
+  // match it (the tuning shop's reflection cube came out yellow, then pink).
+  if (xenos::TextureFormat(t.format) == xenos::TextureFormat::k_4_4_4_4 && tex.format == MTLPixelFormatABGR4Unorm) {
+    decltype(tex.data) out(tex.data.size() * 2);
+    for (size_t i = 0, n = tex.data.size() / 2; i < n; ++i) {
+      uint16_t v;
+      std::memcpy(&v, tex.data.data() + 2 * i, 2);
+      for (int k = 0; k < 4; ++k) out[4 * i + k] = uint8_t(((v >> (4 * k)) & 15) * 17);
+    }
+    tex.data.swap(out);
+    tex.format = MTLPixelFormatRGBA8Unorm;
+    tex.row_bytes *= 2;
+    tex.block_bytes = 4;
+    tex.bytes = tex.data.size();
+  }
+  // The fetch swizzle over what the console's fetch returns for formats with
+  // fewer components: one-component formats read as RRRR, two-component as
+  // RGGG, 5_6_5 as RGBB (rexglue texture_cache.cpp host swizzles). Metal
+  // gives 0 for the missing ones: a k_8_8 cube (the tuning shop's
+  // reflection) lost its blue and turned yellow.
+  uint32_t sw = t.swizzle;
+  {
+    uint8_t host[4] = {0, 1, 2, 3};
+    switch (xenos::TextureFormat(t.format)) {
+      case xenos::TextureFormat::k_8:
+      case xenos::TextureFormat::k_32_FLOAT:
+        host[1] = host[2] = host[3] = 0;
+        break;
+      case xenos::TextureFormat::k_8_8:
+        host[2] = host[3] = 1;
+        break;
+      case xenos::TextureFormat::k_5_6_5:
+        host[3] = 2;
+        break;
+      default:
+        break;
+    }
+    uint32_t mapped = 0;
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t sel = (sw >> (3 * i)) & 7;
+      mapped |= (sel < 4 ? host[sel] : sel) << (3 * i);
+    }
+    sw = mapped;
+  }
+  tex.swizzle = MTLTextureSwizzleChannelsMake(SwizzleOf(sw), SwizzleOf(sw >> 3), SwizzleOf(sw >> 6),
+                                              SwizzleOf(sw >> 9));
+  tex.clamp_x = uint32_t(t.clamp_x);
+  tex.clamp_y = uint32_t(t.clamp_y);
+  tex.linear_filter = uint32_t(t.min_filter) != 0;
+  tex.aniso_filter = t.aniso_filter;
+  if (tex.levels > 1) {
+    tex.mip_filter = t.mip_filter == xenos::TextureFilter::kPoint ? MTLSamplerMipFilterNearest
+                                                                  : MTLSamplerMipFilterLinear;
+  }
+  cached.value = std::make_shared<Texture>(std::move(tex));
+  cached.fingerprint = fingerprint;
+  frame.textures.push_back(cached.value);
+  const int index = int(frame.textures.size() - 1);
+  frame.texture_index[key] = index;
+  return index;
+}
+
+// --- Recording a draw -----------------------------------------------------------
+
+// The normalized Metal shader key omits fetch instructions. Layouts must use
+// the SDK's full microcode hash as well: stride, slot, swizzle and mini-fetch
+// inheritance can differ between shaders with the same Metal library.
+bool ResolveVertexFetch(const uint32_t* code, uint32_t dwords, const std::vector<VertexInput>& inputs,
+                        const VertexInput& input, VFetch& out) {
+  auto written = [](uint32_t swizzle) {
+    uint32_t mask = 0;
+    for (int i = 0; i < 4; ++i) mask |= (((swizzle >> (3 * i)) & 7) != 7) << i;
+    return mask;
+  };
+  uint32_t address = input.address;
+  if (input.dst >= 0) {
+    int fallback = -1;
+    bool found = false;
+    for (const VertexInput& other : inputs) {
+      const uint32_t at = other.address * 3;
+      if (at + 3 > dwords || (code[at] & 0x1F) != 0 ||
+          int32_t((code[at] >> 12) & 0x3F) != input.dst) {
+        continue;
+      }
+      if (written(code[at + 1] & 0xFFF) == written(input.swizzle)) {
+        address = other.address;
+        found = true;
+        break;
+      }
+      if (fallback < 0) fallback = int(other.address);
+    }
+    if (!found && fallback >= 0) address = uint32_t(fallback);
+  }
+  return ParseVFetch(code, dwords, address, out);
+}
+
+struct CachedVertexFetch {
+  VFetch fetch{};
+  bool valid = false;
+};
+struct CachedFetchLayout {
+  uint32_t dwords = 0;
+  std::vector<CachedVertexFetch> inputs;
+};
+// Recording-thread only. Shader objects own immutable microcode in the SDK.
+// A legacy capture without its full hash takes the original uncached path.
+std::map<std::pair<uint64_t, uint64_t>, CachedFetchLayout> fetch_layout_cache;
+constexpr size_t kFetchLayoutCacheLimit = 256;
+
+const CachedFetchLayout* FetchLayoutFor(const NfsmwNativeDraw& in, const std::vector<VertexInput>& inputs,
+                                       VertexDiagnostics& diagnostics) {
+  if (!REXCVAR_GET(nfsmw_native_vfetch_cache) || !in.vs_microcode_hash) {
+    ++diagnostics.fetch_layout_bypasses;
+    return nullptr;
+  }
+  const auto key = std::make_pair(in.vs_key, in.vs_microcode_hash);
+  auto found = fetch_layout_cache.find(key);
+  if (found != fetch_layout_cache.end() && found->second.dwords == in.vs_dwords) {
+    ++diagnostics.fetch_layout_hits;
+    return &found->second;
+  }
+  ++diagnostics.fetch_layout_misses;
+  if (fetch_layout_cache.size() >= kFetchLayoutCacheLimit) fetch_layout_cache.clear();
+  CachedFetchLayout& layout = fetch_layout_cache[key];
+  layout.dwords = in.vs_dwords;
+  layout.inputs.resize(inputs.size());
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    layout.inputs[i].valid = ResolveVertexFetch(in.vs_microcode, in.vs_dwords, inputs, inputs[i],
+                                               layout.inputs[i].fetch);
+  }
+  return &layout;
+}
+
+void Record(Frame& frame, const NfsmwNativeDraw& in) {
+  const uint32_t* regs = in.regs;
+  // Inline draws (DRAW_INDX_2: D3D's draws from user memory, e.g. the bloom
+  // chain): their vertices are in the ring, behind a vertex fetch constant
+  // like any other; drawn the same way. Most use vertex shaders D3D builds at
+  // run time (no Metal library yet): counted as "without a shader library".
+  if (in.inline_draw) {
+    ++frame.skipped_inline;  // counted, not skipped
+  }
+  if (in.from_arguments) {
+    ++frame.from_arguments;
+  }
+  Draw d(frame.attribute_arena.Resource());
+  d.vs_key = in.vs_key;
+  d.ps_key = in.ps_key;
+  {  // by key, without building the name (the store is loaded before any recording)
+    static std::unordered_map<uint64_t, id<MTLFunction>> by_key[2];
+    auto find = [](int kind, uint64_t key) {
+      auto [it, added] = by_key[kind].try_emplace(key, nil);
+      if (added) it->second = store.Find(kind ? "ps" : "vs", key);
+      return it->second;
+    };
+    d.vs = find(0, in.vs_key);
+    d.ps = find(1, in.ps_key);
+  }
+  if (REXCVAR_GET(nfsmw_native_shadow_debug) && in.ps_key == 0xaf393d4c46af230cull) {
+    static const auto start = std::chrono::steady_clock::now();
+    const uint32_t mode = uint32_t(std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::steady_clock::now() - start).count() / 6 % 4);
+    static uint32_t logged = UINT32_MAX;
+    if (mode != logged) {
+      logged = mode;
+      static const char* names[] = {"real shader", "shadow map value read", "the pixel's own shadow depth",
+                                    "difference (grey = equal, dark = shadowed)"};
+      REXLOG_INFO("[native] shadow debug: {} - {}", mode, names[mode]);
+    }
+    if (mode) {
+      id<MTLFunction> f = store.functions[fmt::format("ps_{:016x}_dbg{}", in.ps_key, mode)];
+      if (f) {
+        d.ps = f;
+        d.ps_key = in.ps_key ^ mode;
+      }
+    }
+  }
+  if (REXCVAR_GET(nfsmw_native_alpha_debug) &&
+      (in.ps_key == 0x684f4711f29b9f77ull || in.ps_key == 0x27d82ea0faa380a8ull)) {
+    static const auto start = std::chrono::steady_clock::now();
+    const uint32_t mode = uint32_t(std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::steady_clock::now() - start).count() / 6 % 3);
+    static uint32_t logged = UINT32_MAX;
+    if (mode != logged) {
+      logged = mode;
+      static const char* names[] = {"real shaders", "alpha as grey", "alpha test: white kept, red discarded"};
+      REXLOG_INFO("[native] alpha debug: {} - {}", mode, names[mode]);
+    }
+    if (mode) {
+      id<MTLFunction> f = store.functions[fmt::format("ps_{:016x}_dbg{}", in.ps_key, mode)];
+      if (f) {
+        d.ps = f;
+        d.ps_key = in.ps_key ^ mode;  // its own pipelines (no alpha test variant)
+      }
+    }
+  }
+  if (!d.vs || !d.ps) {
+    ++frame.skipped_shader;
+    // The video player's picture (the EA logo, the intro, the story movies):
+    // its shaders are the XMV player's, built into the executable, not the
+    // game's. The emulated renderer draws those frames (NativeSwap).
+    if (in.vs_key == 0xacc15ef6157ec934ull || in.ps_key == 0x2d2462de73d283deull) {
+      ++frame.movie_draws;
+    }
+    {  // Which shaders the renderer has no library for (once each): e.g. the
+       // movie player's, built into the executable, not the game's files.
+      static std::set<std::pair<uint64_t, uint64_t>> said;
+      if (said.size() < 40 && said.insert({in.vs_key, in.ps_key}).second) {
+        REXLOG_INFO("[native] no shader library: vs {:016x}{} ps {:016x}{}, prim {}, {} indices, target {:x} "
+                    "(frame {} draw {})",
+                    in.vs_key, d.vs ? "" : " (missing)", in.ps_key, d.ps ? "" : " (missing)", in.initiator & 0x3F,
+                    in.initiator >> 16, regs[kRbSurfaceInfo] & 0x3FFF, dump_number + 1,
+                    frame.draws.size() + frame.skipped_shader + frame.skipped_other);
+      }
+    }
+    return;
+  }
+  if ((regs[kRbSurfaceInfo] & 0x3FFF) < 16) {  // no real render target
+    ++frame.skipped_other;
+    return;
+  }
+
+  // Indices: DMA (a buffer), or auto (0..count-1), plus VGT_INDX_OFFSET.
+  const uint32_t prim = in.initiator & 0x3F, source = (in.initiator >> 6) & 3;
+  const uint32_t count = in.initiator >> 16;
+  const bool index32 = (in.initiator >> 11) & 1;
+  const uint32_t offset = in.from_arguments ? in.start_vertex : regs[kVgtIndxOffset];
+  // Converted before from the same memory: the cached indices.
+  const uint32_t endian_bits = source == 0 ? (in.index_size >> 30) : 0;
+  const IndexKey ikey{source == 0 ? in.index_base : 0u, count, offset,
+                      (in.initiator & 0xFFFF) | (endian_bits << 16)};
+  // Rectangle lists add vertices to the attributes: not cached.
+  IndexEntry* ientry = prim != 8 && count ? &index_cache[ikey] : nullptr;
+  const uint64_t ifp = source == 0 && count ? IndexFingerprint(Physical(in.index_base), size_t(count) * (index32 ? 4 : 2))
+                                            : 0;
+  const bool index_hit = ientry && ientry->indices && ientry->fingerprint == ifp;
+  uint32_t lo = UINT32_MAX, hi = 0;
+  static std::vector<uint32_t> raw_buffer;  // reused: no allocation or zeroing per draw
+  uint32_t* raw = nullptr;
+  if (index_hit) {
+    ++frame.vertex_diagnostics.index_cache_hits;
+    ientry->last_used = frame_counter;
+    lo = ientry->lo;
+    hi = ientry->hi;
+    d.indices = ientry->indices;
+    d.indices_fresh = false;
+    d.primitive = ientry->primitive;
+  } else {
+    ++frame.vertex_diagnostics.index_cache_misses;
+    if (raw_buffer.size() < count) raw_buffer.resize(count);
+    raw = raw_buffer.data();
+    if (source == 0) {
+      const auto endian = xenos::Endian(in.index_size >> 30);
+      const uint8_t* p = Physical(in.index_base);
+      for (uint32_t i = 0; i < count; ++i) {
+        if (index32) {
+          raw[i] = xenos::GpuSwap(LoadLE32(p + 4 * i), endian);
+        } else {
+          uint16_t v;
+          std::memcpy(&v, p + 2 * i, 2);
+          raw[i] = xenos::GpuSwap(v, endian);
+        }
+      }
+    } else if (source == 2) {
+      for (uint32_t i = 0; i < count; ++i) raw[i] = i;
+    } else {
+      ++frame.skipped_other;
+      Note(frame, fmt::format("index source {}", source));
+      return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t& v = raw[i];
+      v += offset;
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    if (count == 0 || hi - lo > (1u << 20)) {
+      ++frame.skipped_other;
+      return;
+    }
+  }
+  d.vertex_count = hi - lo + 1;
+
+  // Vertex inputs.
+  const auto vertex_start = timed_draw ? FastClock::now() : FastClock::time_point{};
+  const uint8_t* region_fp_base = nullptr;  // the fingerprint of this draw's vertex region, per stream
+  size_t region_fp_start = 0, region_fp_size = 0;
+  uint64_t region_fp = 0;
+  uint64_t geometry = MotionMix(in.vs_key, ikey.base ^ uint64_t(ikey.count) << 32);  // motion: the draw's identity
+  geometry = MotionMix(geometry, ikey.offset ^ uint64_t(ikey.flags) << 32);
+  auto inputs_it = store.inputs.find(in.vs_key);
+  if (inputs_it != store.inputs.end()) {
+    if (!inputs_it->second.empty()) {
+      ++frame.attribute_lists;
+      frame.attribute_hint_bytes += inputs_it->second.size() * sizeof(Attribute);
+      if (frame.attribute_arena.Enabled()) d.attributes.reserve(inputs_it->second.size());
+    }
+    const CachedFetchLayout* layout = FetchLayoutFor(in, inputs_it->second, frame.vertex_diagnostics);
+    for (size_t input_index = 0; input_index < inputs_it->second.size(); ++input_index) {
+      const VertexInput& input = inputs_it->second[input_index];
+      VFetch f{};
+      bool valid_fetch;
+      if (layout) {
+        f = layout->inputs[input_index].fetch;
+        valid_fetch = layout->inputs[input_index].valid;
+      } else {
+        valid_fetch = ResolveVertexFetch(in.vs_microcode, in.vs_dwords, inputs_it->second, input, f);
+      }
+      if (!valid_fetch) {
+        Note(frame, fmt::format("vs {:016x}: no vfetch at {}", in.vs_key, input.address));
+        continue;
+      }
+      const uint32_t* fc = regs + kFetchBase + (f.slot / 3) * 6 + (f.slot % 3) * 2;
+      const uint32_t buffer = fc[0] & ~3u;
+      const uint32_t size_bytes = ((fc[1] >> 2) & 0xFFFFFF) * 4;
+      const auto endian = xenos::Endian(fc[1] & 3);
+      Attribute a;
+      a.location = input.location;
+      a.integer = input.usage == 2;  // BLENDINDICES: uint4
+      // The translated shader applies the swizzle compiled in the game's
+      // file; the console applies the one D3D wrote at bind time (a
+      // D3DCOLOR's bytes are ARGB: its fetch picks them in another order).
+      // Where they differ, the components are moved so that the file's
+      // swizzle gives what the bound one would.
+      int remap[4] = {0, 1, 2, 3};  // input component k <- decoded component remap[k] (4 zero, 5 one)
+      bool remapped = false;
+      if (f.swizzle != input.swizzle) {
+        static std::set<std::pair<uint64_t, uint32_t>> logged_swizzles;
+        if (logged_swizzles.size() < 200 && logged_swizzles.insert({in.vs_key, input.address}).second) {
+          REXLOG_INFO("[native] vs {:016x} vfetch {} (usage {}, format {}): swizzle {:03x} in the file, {:03x} bound",
+                      in.vs_key, input.address, input.usage, f.format, input.swizzle, f.swizzle);
+        }
+        for (int i = 0; i < 4; ++i) {
+          const uint32_t file_sel = (input.swizzle >> (3 * i)) & 7, bound_sel = (f.swizzle >> (3 * i)) & 7;
+          if (file_sel < 4 && bound_sel < 6 && file_sel != bound_sel) {
+            remap[file_sel] = int(bound_sel);
+            remapped = true;
+          }
+        }
+      }
+      // DrawPrimitiveUP: its own vertices, where it reserved them.
+      const uint8_t* base = in.up_vertices ? Mem()->TranslateVirtual<const uint8_t*>(in.up_vertices)
+                                           : Physical(buffer);
+      // Decoded before from the same bytes: the cached array.
+      const AttributeKey akey{uintptr_t(base), f.stride, f.offset, f.format, uint32_t(endian), uint32_t(a.integer),
+                              lo, d.vertex_count,
+                              remapped ? uint32_t(remap[0] | remap[1] << 3 | remap[2] << 6 | remap[3] << 9) : 0u};
+      const size_t first = (size_t(lo) * f.stride + f.offset) * 4;
+      geometry = MotionMix(geometry, uint64_t(uintptr_t(base) + first) ^ uint64_t(f.stride) << 48);
+      const size_t range = size_t(d.vertex_count) * f.stride * 4 + 16;
+      CacheEntry<FloatArray>& acached = AttributeEntryFor(akey, frame.vertex_diagnostics);
+      acached.last_used = frame_counter;
+      const bool watchable = REXCVAR_GET(nfsmw_native_write_watch) && buffer && !in.up_vertices && !acached.dynamic;
+      if (acached.value && acached.watched && write_watch::Clean(buffer + uint32_t(first), range)) {
+        ++frame.vertex_diagnostics.watched_cache_hits;
+        a.values = acached.value;  // watched, not written since
+        d.attributes.push_back(std::move(a));
+        continue;
+      }
+      if (watchable) write_watch::Arm(buffer + uint32_t(first), range);
+      uint64_t afp = 0;
+      if (buffer) {
+        // The draw's other inputs usually sit in the same vertices (one
+        // interleaved buffer): the region of whole vertices is fingerprinted
+        // once per draw and stream, not once per input.
+        const size_t region = size_t(lo) * f.stride * 4;
+        const size_t region_size = size_t(d.vertex_count + 1) * f.stride * 4 + 16;
+        // Fingerprint memo: the same static mesh drawn again in this frame
+        // (reflection faces, shadows) reuses the fingerprint taken at its
+        // first draw. Only for entries not marked dynamic and not for
+        // DrawPrimitiveUP vertices; dynamic data is still checked per draw.
+        // A static region rewritten mid-frame is seen on the next frame.
+        struct MemoKey {
+          const uint8_t* base;
+          size_t start, size;
+          bool operator==(const MemoKey& o) const { return base == o.base && start == o.start && size == o.size; }
+        };
+        struct MemoHash {
+          size_t operator()(const MemoKey& k) const {
+            return std::hash<uintptr_t>()(uintptr_t(k.base) + k.start) ^ (k.size * 0x9E3779B97F4A7C15ull);
+          }
+        };
+        static std::unordered_map<MemoKey, uint64_t, MemoHash> memo;
+        static uint64_t memo_frame = UINT64_MAX;
+        static const bool memo_on = REXCVAR_GET(nfsmw_native_fingerprint_memo);
+        const bool memo_ok = memo_on && !acached.dynamic && !in.up_vertices;
+        if (memo_on && memo_frame != frame_counter) {
+          memo.clear();
+          memo_frame = frame_counter;
+        }
+        const MemoKey mkey{base, region, region_size};
+        const auto memo_hit = memo_ok ? memo.find(mkey) : memo.end();
+        if (base == region_fp_base && region == region_fp_start && region_size == region_fp_size) {
+          afp = region_fp;
+          ++frame.vertex_diagnostics.fingerprint_shared;
+        } else if (memo_hit != memo.end()) {
+          afp = memo_hit->second;
+          region_fp_base = base;
+          region_fp_start = region;
+          region_fp_size = region_size;
+          region_fp = afp;
+          ++frame.vertex_diagnostics.fingerprint_memo;
+        } else {
+        const uint64_t call = frame.vertex_diagnostics.fingerprint_calls++;
+        const bool sample = (call & 63) == 0;
+        const auto fingerprint_start = sample ? FastClock::now() : FastClock::time_point{};
+        afp = Fingerprint(base + region, region_size);
+        if (memo_ok) memo[mkey] = afp;
+        region_fp_base = base;
+        region_fp_start = region;
+        region_fp_size = region_size;
+        region_fp = afp;
+        if (sample) {
+          frame.vertex_diagnostics.fingerprint_sample_ns += uint64_t(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  FastClock::now() - fingerprint_start).count());
+          ++frame.vertex_diagnostics.fingerprint_sample_count;
+        }
+        }
+      }
+      if (acached.value && acached.fingerprint == afp) {
+        ++frame.vertex_diagnostics.fingerprint_cache_hits;
+        if (acached.watched) {  // a false alarm (see the textures)
+          if (frame_counter - acached.last_false_alarm <= 2) acached.dynamic = true;
+          acached.last_false_alarm = frame_counter;
+        }
+        acached.watched = watchable && !acached.dynamic;
+        a.values = acached.value;
+        d.attributes.push_back(std::move(a));
+        continue;
+      }
+      ++frame.vertex_diagnostics.cache_misses;
+      // Changed: rewritten two frames running, it is dynamic data (not
+      // watched from then on: every write would fault).
+      if (acached.value && frame_counter - acached.last_changed <= 2) acached.dynamic = true;
+      acached.last_changed = frame_counter;
+      acached.watched = watchable && !acached.dynamic;
+      const uint64_t decoded_bytes = uint64_t(d.vertex_count) * 4 * sizeof(float);
+      frame.vertex_diagnostics.decoded_bytes += decoded_bytes;
+      if (acached.dynamic) frame.vertex_diagnostics.dynamic_decoded_bytes += decoded_bytes;
+      a.values = std::make_shared<FloatArray>(size_t(d.vertex_count) * 4);
+      a.fresh = true;
+      FloatArray& values = *a.values;
+      bool ok = true;
+      for (uint32_t v = 0; v < d.vertex_count && ok; ++v) {
+        const uint32_t at = ((lo + v) * f.stride + f.offset) * 4;
+        float c[4];
+        // The fetch constant's size is not always the whole range a draw
+        // reads (D3D's dynamic buffers): only a missing buffer is refused.
+        if (!buffer || (size_bytes && at > size_bytes + (1u << 20)) || !DecodeElement(base + at, endian, f, c)) {
+          ok = false;
+          break;
+        }
+        ++frame.vertex_diagnostics.decoded_vertex_elements;
+        if (remapped) {
+          const float raw[6] = {c[0], c[1], c[2], c[3], 0.0f, 1.0f};
+          for (int k = 0; k < 4; ++k) c[k] = raw[remap[k]];
+        }
+        if (a.integer) {
+          for (int k = 0; k < 4; ++k) {
+            const uint32_t u = uint32_t(std::max(c[k], 0.0f));
+            std::memcpy(&values[v * 4 + k], &u, 4);
+          }
+        } else {
+          std::memcpy(&values[v * 4], c, sizeof(c));
+        }
+      }
+      if (!ok) {
+        Note(frame, fmt::format("vs {:016x}: vertex format {} at slot {} not decoded (buffer {:08x}, "
+                                "{} bytes, stride {} offset {}, vertices {}-{})",
+                                in.vs_key, f.format, f.slot, buffer, size_bytes, f.stride * 4,
+                                f.offset * 4, lo, hi));
+        ++frame.skipped_other;
+        return;
+      }
+      if (in.from_arguments && frame.from_arguments <= 8) {
+        Note(frame, fmt::format("from-args draw: vs {:016x} prim {} count {} start {} | input loc {} "
+                                "slot {} buffer {:08x} size {} stride {} offset {} fmt {} endian {} | "
+                                "v0 ({:.3f}, {:.3f}, {:.3f}, {:.3f}) v{} ({:.3f}, {:.3f}, {:.3f}, {:.3f})",
+                                in.vs_key, prim, count, in.start_vertex, input.location, f.slot, buffer,
+                                size_bytes, f.stride * 4, f.offset * 4, f.format, uint32_t(endian),
+                                values[0], values[1], values[2], values[3],
+                                d.vertex_count - 1, values[(d.vertex_count - 1) * 4],
+                                values[(d.vertex_count - 1) * 4 + 1], values[(d.vertex_count - 1) * 4 + 2],
+                                values[(d.vertex_count - 1) * 4 + 3]));
+      }
+      acached.value = a.values;
+      acached.fingerprint = afp;
+      d.attributes.push_back(std::move(a));
+    }
+  }
+
+  if (!index_hit) {
+    // Primitive: lists Metal has, or triangles made from fans/quads/rectangles.
+    auto made = std::make_shared<std::vector<uint32_t>>();
+    std::vector<uint32_t>& out = *made;
+    out.reserve(prim == 5 ? 3 * size_t(count) : prim == 13 ? 3 * size_t(count) / 2 : prim == 8 ? 2 * size_t(count) : count);
+    auto at = [&](uint32_t i) { return raw[i] - lo; };
+    switch (prim) {
+      case 1: d.primitive = MTLPrimitiveTypePoint; for (uint32_t i = 0; i < count; ++i) out.push_back(at(i)); break;
+      case 2: d.primitive = MTLPrimitiveTypeLine; for (uint32_t i = 0; i < count; ++i) out.push_back(at(i)); break;
+      case 3: d.primitive = MTLPrimitiveTypeLineStrip; for (uint32_t i = 0; i < count; ++i) out.push_back(at(i)); break;
+      case 4: for (uint32_t i = 0; i < count; ++i) out.push_back(at(i)); break;
+      case 6: d.primitive = MTLPrimitiveTypeTriangleStrip; for (uint32_t i = 0; i < count; ++i) out.push_back(at(i)); break;
+      case 5:  // fan
+        for (uint32_t i = 2; i < count; ++i) out.insert(out.end(), {at(0), at(i - 1), at(i)});
+        break;
+      case 13:  // quad list
+        for (uint32_t i = 0; i + 3 < count; i += 4)
+          out.insert(out.end(), {at(i), at(i + 1), at(i + 2), at(i), at(i + 2), at(i + 3)});
+        break;
+      case 8: {  // rectangle list: the fourth corner = v1 + v2 - v0, for every input
+        for (Attribute& a : d.attributes) {  // a copy: the cached arrays stay as they were
+          a.values = std::make_shared<FloatArray>(*a.values);
+          a.fresh = true;
+        }
+        for (uint32_t i = 0; i + 2 < count; i += 3) {
+          const uint32_t v0 = at(i), v1 = at(i + 1), v2 = at(i + 2), v3 = d.vertex_count++;
+          for (Attribute& a : d.attributes) {
+            FloatArray& values = *a.values;
+            values.resize(size_t(d.vertex_count) * 4);
+            for (int k = 0; k < 4; ++k) {
+              values[v3 * 4 + k] = values[v1 * 4 + k] + values[v2 * 4 + k] - values[v0 * 4 + k];
+            }
+          }
+          out.insert(out.end(), {v0, v1, v2, v1, v3, v2});
+        }
+        break;
+      }
+      default:
+        ++frame.skipped_other;
+        Note(frame, fmt::format("primitive {}", prim));
+        return;
+    }
+    if (prim == 5 || prim == 13 || prim == 8) {
+      frame.vertex_diagnostics.expanded_input_indices += count;
+      frame.vertex_diagnostics.expanded_output_indices += out.size();
+    }
+    d.indices = made;
+    if (ientry) {
+      ientry->indices = made;
+      ientry->fingerprint = ifp;
+      ientry->last_used = frame_counter;
+      ientry->lo = lo;
+      ientry->hi = hi;
+      ientry->primitive = d.primitive;
+    }
+  }
+
+  // Constants: c0-255 of each stage (VS at 0x4000, PS at 0x4400).
+  // The draw before's constants if they are the same (one compare instead of
+  // a copy per draw, and one upload of them).
+  // Only the registers the draw's shader reads are compared: the others may
+  // differ from the draw before's, unread.
+  // A new bank holds only those registers too (not zeroed, not all 4 KB
+  // copied): a draw whose shader reads others never matches it (their
+  // compare differs), so it never reads what was not copied.
+  auto constants = [&](std::shared_ptr<const ConstantBank>& last, const uint32_t* from,
+                       std::pair<uint16_t, uint16_t> range) {
+    const size_t at = size_t(range.first) * 4, n = size_t(range.second - range.first) * 16;
+    if (!last || (n && std::memcmp(last->data() + at, from + at, n) != 0)) {
+      auto bank = std::shared_ptr<ConstantBank>(new ConstantBank);  // default-initialized: no zeroing
+      std::memcpy(bank->data() + at, from + at, n);
+      last = std::move(bank);
+    }
+    return last;
+  };
+  const auto texture_start = timed_draw ? FastClock::now() : FastClock::time_point{};
+  if (timed_draw) {
+    record_vertex_ns += 8 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(texture_start - vertex_start).count());
+  }
+  d.vs_range = store.ConstantRange(false, d.vs_key);
+  d.ps_range = store.ConstantRange(true, d.ps_key);
+  d.vs_constants = constants(frame.last_vs_constants, regs + kAluBase, d.vs_range);
+  d.ps_constants = constants(frame.last_ps_constants, regs + kAluBase + 1024, d.ps_range);
+  // Motion vectors: matched with the frame before's draw of the same identity.
+  if ((regs[kRbDepthControl] & 6) == 6 && MotionVectorsWanted()) {
+    const uint64_t id = MotionMix(geometry, frame.motion_seen[geometry]++);
+    frame.motion_constants[id] = d.vs_constants;
+    auto previous = previous_motion_constants.find(id);
+    if (previous != previous_motion_constants.end()) d.previous_vs_constants = previous->second;
+  }
+  // The car's shadow casters: D3D's position-only vertex shader (2f583d7c,
+  // no texture coordinate) with the shadow-map pixel shader (4fbaecfb). That
+  // one cuts out see-through casters (g_bShadowMapAlphaEnabled, c1) by the
+  // diffuse texture's alpha at the texture coordinate; with none, here 0, it
+  // read the corner of the foliage texture left bound from the trees and
+  // threw every pixel of the car away (no car in the shadow map). Without a
+  // texture coordinate there is nothing to cut out: off for these draws.
+  // The same for 88e2dcfd (the bridge and other large static casters):
+  // position only too, so its cut-out tested whichever foliage texture was
+  // drawn last (their shadows came and went with the scenery).
+  if ((d.vs_key == 0x2f583d7c8ddf572aull || d.vs_key == 0x88e2dcfd95a47a7bull) &&
+      d.ps_key == 0x4fbaecfb8e7c4f40ull && (*d.ps_constants)[4] != 0) {
+    auto copy = std::make_shared<ConstantBank>(*d.ps_constants);
+    (*copy)[4] = 0;  // c1.x = 0.0f
+    d.ps_constants = copy;
+  }
+  // Booleans: VS 0-15 in bits 0-15, PS 128-143 in bits 16-31.
+  d.booleans = (regs[kBoolBase] & 0xFFFF) | ((regs[kBoolBase + 4] & 0xFFFF) << 16);
+
+  // Keep all bound textures for bring-up snapshots and diagnostic variants.
+  // The switch and diagnostic settings are launch options, as are the shader
+  // interfaces. No per-draw registry queries or atomics are needed here.
+  static const bool prune_texture_slots = [] {
+    const char* capture = getenv("MTL_CAPTURE_ENABLED");
+    return !(capture && strcmp(capture, "1") == 0) && REXCVAR_GET(nfsmw_native_texture_masks) &&
+      !REXCVAR_GET(nfsmw_native_dump) && !REXCVAR_GET(nfsmw_native_dump_manual) &&
+      !REXCVAR_GET(nfsmw_native_shadow_debug) &&
+      !REXCVAR_GET(nfsmw_native_alpha_debug) && !REXCVAR_GET(nfsmw_native_cost_probe) &&
+      !REXCVAR_GET(nfsmw_native_motion_debug) && !REXCVAR_GET(nfsmw_native_test_no_envcube) &&
+      !REXCVAR_GET(nfsmw_native_test_grey_volume);
+  }();
+  uint16_t texture_mask = 0xFFFF;
+  if (prune_texture_slots) {
+    const auto mask = store.texture_masks.ForDraw(d.vs_key, d.ps_key);
+    if (mask) texture_mask = *mask;
+    else ++frame.vertex_diagnostics.texture_mask_unknown_draws;
+  }
+  frame.vertex_diagnostics.texture_slots_considered += 16;
+  frame.vertex_diagnostics.texture_slots_skipped += 16 - __builtin_popcount(uint32_t(texture_mask));
+  // A slot whose fetch constant is the same as at the draw before: the same
+  // texture (most are; skips building the slot's key).
+  for (int s = 0; s < 16; ++s) {
+    if ((texture_mask & (1u << s)) == 0) {
+      d.textures[s] = -1;
+      // Do not update slot_fetch/slot_valid. If a later shader reads this
+      // slot, it must validate its current binding; resolves still invalidate
+      // all slots through the existing path.
+      continue;
+    }
+    const uint32_t* fetch = regs + kFetchBase + s * 6;
+    if (frame.slot_valid[s] && std::memcmp(frame.slot_fetch[s], fetch, 24) == 0) {
+      d.textures[s] = frame.slot_texture[s];
+      continue;
+    }
+    d.textures[s] = TextureOf(frame, fetch);
+    std::memcpy(frame.slot_fetch[s], fetch, 24);
+    frame.slot_texture[s] = d.textures[s];
+    frame.slot_valid[s] = true;
+  }
+  if (timed_draw) {
+    record_texture_ns += 8 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          FastClock::now() - texture_start).count());
+  }
+
+  d.surface_info = regs[kRbSurfaceInfo];
+  d.color_info = regs[kRbColorInfo];
+  d.depth_info = regs[kRbDepthInfo];
+  d.depth_control = regs[kRbDepthControl];
+  {
+    // As rexglue's GetPreferredFacePolygonOffset and its Vulkan renderer:
+    // the front offset unless front faces are culled, the back one then;
+    // points and lines by poly_offset_para_enable.
+    const uint32_t mode = regs[kPaSuScModeCntl];
+    float scale = 0, offset = 0;
+    if (prim > 3) {
+      if ((mode >> 11 & 1) && !(mode & 1)) {
+        scale = AsFloat(regs[0x2380]);
+        offset = AsFloat(regs[0x2381]);
+      }
+      if ((mode >> 12 & 1) && !(mode >> 1 & 1) && !scale && !offset) {
+        scale = AsFloat(regs[0x2382]);
+        offset = AsFloat(regs[0x2383]);
+      }
+    } else if (mode >> 13 & 1) {
+      scale = AsFloat(regs[0x2380]);
+      offset = AsFloat(regs[0x2381]);
+    }
+    // RB_DEPTH_INFO bit 16: 24-bit float depth, else 24-bit unorm.
+    d.depth_bias = offset * ((regs[kRbDepthInfo] >> 16 & 1) ? float(1u << 24) : float((1u << 24) - 1));
+    d.depth_slope = scale * (1.0f / 16.0f);
+  }
+  d.blend_control = regs[kRbBlendControl0];
+  d.color_mask = regs[kRbColorMask];
+  d.color1_info = regs[0x2003];
+  d.clip_disable = (regs[0x2204] >> 16) & 1;  // PA_CL_CLIP_CNTL
+  d.blend_control1 = regs[0x2209];
+  d.second_target = ((d.color_mask >> 4) & 0xF) != 0;
+  d.color_control = regs[0x2202];
+  d.alpha_ref = AsFloat(regs[0x210E]);
+  for (int i = 0; i < 6; ++i) d.viewport[i] = AsFloat(regs[kVportXScale + i]);
+  d.vte = regs[kPaClVteCntl];
+  const uint32_t wo = regs[kPaScWindowOffset];
+  d.window_offset_x = int32_t(wo << 17) >> 17;
+  d.window_offset_y = int32_t((wo >> 16) << 17) >> 17;
+  d.window_offset_enable = (regs[kPaSuScModeCntl] >> 16) & 1;
+  const uint32_t tl = regs[kPaScWindowScissorTl], br = regs[kPaScWindowScissorBr];
+  d.scissor[0] = tl & 0x7FFF;
+  d.scissor[1] = (tl >> 16) & 0x7FFF;
+  d.scissor[2] = br & 0x7FFF;
+  d.scissor[3] = (br >> 16) & 0x7FFF;
+  frame.draws.push_back(std::move(d));
+}
+
+// --- Drawing a recorded frame with Metal ----------------------------------------
+
+MTLBlendFactor BlendFactor(uint32_t f) {
+  switch (f) {
+    case 0: return MTLBlendFactorZero;
+    case 1: return MTLBlendFactorOne;
+    case 4: return MTLBlendFactorSourceColor;
+    case 5: return MTLBlendFactorOneMinusSourceColor;
+    case 6: return MTLBlendFactorSourceAlpha;
+    case 7: return MTLBlendFactorOneMinusSourceAlpha;
+    case 8: return MTLBlendFactorDestinationColor;
+    case 9: return MTLBlendFactorOneMinusDestinationColor;
+    case 10: return MTLBlendFactorDestinationAlpha;
+    case 11: return MTLBlendFactorOneMinusDestinationAlpha;
+    case 12: return MTLBlendFactorBlendColor;
+    case 13: return MTLBlendFactorOneMinusBlendColor;
+    case 14: return MTLBlendFactorBlendAlpha;
+    case 15: return MTLBlendFactorOneMinusBlendAlpha;
+    case 16: return MTLBlendFactorSourceAlphaSaturated;
+    default: return MTLBlendFactorOne;
+  }
+}
+
+MTLBlendOperation BlendOp(uint32_t op) {
+  switch (op) {
+    case 1: return MTLBlendOperationSubtract;
+    case 2: return MTLBlendOperationMin;
+    case 3: return MTLBlendOperationMax;
+    case 4: return MTLBlendOperationReverseSubtract;
+    default: return MTLBlendOperationAdd;
+  }
+}
+
+MTLPixelFormat ColorFormat(uint32_t f) {
+  switch (f) {
+    case 0: case 1: return MTLPixelFormatRGBA8Unorm;
+    case 2: case 10: return MTLPixelFormatRGB10A2Unorm;
+    case 3: case 12: case 5: case 7: return MTLPixelFormatRGBA16Float;
+    case 4: case 6: return MTLPixelFormatRG16Float;
+    case 14: return MTLPixelFormatR32Float;
+    case 15: return MTLPixelFormatRG32Float;
+    default: return MTLPixelFormatRGBA8Unorm;
+  }
+}
+
+MTLSamplerAddressMode AddressMode(uint32_t clamp) {
+  switch (clamp) {
+    case 0: return MTLSamplerAddressModeRepeat;
+    case 1: return MTLSamplerAddressModeMirrorRepeat;
+    case 3: return MTLSamplerAddressModeMirrorClampToEdge;
+    case 6: case 7: return MTLSamplerAddressModeClampToBorderColor;
+    default: return MTLSamplerAddressModeClampToEdge;
+  }
+}
+
+std::string EdramKey(uint32_t surface_info, uint32_t color_info, uint32_t depth_info) {
+  // Memoized: called for every draw (the few layouts of a frame repeat).
+  static thread_local std::unordered_map<uint64_t, std::string> cache;
+  const uint64_t k = uint64_t(color_info & 0xFFF) | uint64_t((color_info >> 16) & 0xF) << 12 |
+                     uint64_t(surface_info & 0x3FFF) << 16 | uint64_t(depth_info & 0xFFF) << 30 |
+                     uint64_t((surface_info >> 16) & 3) << 42;
+  auto it = cache.find(k);
+  if (it != cache.end()) return it->second;
+  return cache.emplace(k, fmt::format("{:03x}_{}_{}_d{:03x}_s{}", color_info & 0xFFF, surface_info & 0x3FFF,
+                                      (color_info >> 16) & 0xF, depth_info & 0xFFF,
+                                      1u << ((surface_info >> 16) & 3)))
+      .first->second;
+}
+
+std::vector<NSUInteger> ActiveAttributesUncached(id<MTLFunction> vs);
+// Per function, once (asking Metal allocates an array every time).
+const std::vector<NSUInteger>& ActiveAttributes(id<MTLFunction> vs) {
+  static std::unordered_map<const void*, std::vector<NSUInteger>> cache;
+  auto it = cache.find((__bridge const void*)vs);
+  if (it == cache.end()) it = cache.emplace((__bridge const void*)vs, ActiveAttributesUncached(vs)).first;
+  return it->second;
+}
+std::vector<NSUInteger> ActiveAttributesUncached(id<MTLFunction> vs) {
+  std::vector<NSUInteger> out;
+  for (MTLVertexAttribute* a in vs.vertexAttributes) {
+    if (a.active) out.push_back(a.attributeIndex);
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// --- Pipelines -------------------------------------------------------------------
+
+// A render pipeline by the state it is made from.
+struct PipelineKey {
+  uint64_t vs, ps;
+  uint32_t blend, blend1, mask, format, format1, alpha_spec, sample_count;
+  bool alpha_to_coverage;
+  // Motion vectors (colour target 4): 0 none in the pass; 1 in the pass, not
+  // written (D3D's own shaders); 2 the motion shaders, not written; 3 written.
+  uint32_t motion = 0;
+  bool operator==(const PipelineKey& o) const {
+    return vs == o.vs && ps == o.ps && blend == o.blend && blend1 == o.blend1 && mask == o.mask &&
+           format == o.format && format1 == o.format1 && alpha_spec == o.alpha_spec &&
+           sample_count == o.sample_count && alpha_to_coverage == o.alpha_to_coverage && motion == o.motion;
+  }
+};
+struct PipelineKeyHash {
+  size_t operator()(const PipelineKey& k) const {
+    uint64_t h = k.vs * 0x9E3779B97F4A7C15ull ^ k.ps;
+    for (uint64_t v : {uint64_t(k.blend), uint64_t(k.blend1), uint64_t(k.mask), uint64_t(k.format),
+                       uint64_t(k.format1), uint64_t(k.alpha_spec), uint64_t(k.sample_count),
+                       uint64_t(k.alpha_to_coverage), uint64_t(k.motion)}) {
+      h = (h ^ v) * 0x100000001B3ull;
+    }
+    return size_t(h ^ (h >> 31));
+  }
+};
+
+// Renderer queue only. Successful ready entries are never erased/replaced,
+// and unordered_map rehash preserves their addresses. Borrow the owning node:
+// no extra PSO reference, failed result or pending compilation is cached.
+template <typename Value>
+struct PipelineLookupCache {
+  using Map = std::unordered_map<PipelineKey, Value, PipelineKeyHash>;
+  typename Map::value_type* entry = nullptr;
+
+  __attribute__((always_inline)) typename Map::value_type* Find(Map& ready, const PipelineKey& key, bool enabled) {
+    if (enabled && entry && entry->first == key) return entry;
+    auto it = ready.find(key);
+    if (it == ready.end()) return nullptr;
+    if (enabled) entry = &*it;
+    return &*it;
+  }
+};
+
+bool PipelineLookupEnabled() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_pipeline_lookup);
+  return enabled;
+}
+
+// Motion vectors (in the viewport's 0-1 coordinates, y down: where the pixel
+// was in the frame before minus where it is).
+constexpr MTLPixelFormat kMotionFormat = MTLPixelFormatRG16Float;
+
+// The descriptor of a key's pipeline (format: the Xenos colour format of
+// target 0; format1: target 1's + 1, 0 without one; mask: RB_COLOR_MASK bits
+// of the targets drawn).
+MTLRenderPipelineDescriptor* PipelineDescriptor(const PipelineKey& k, id<MTLFunction> vs, id<MTLFunction> ps) {
+  MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+  // Named in GPU traces (Instruments' shader timeline) and the cache misses' log.
+  desc.label = [NSString stringWithFormat:@"ps_%016llx vs_%016llx alpha%u", (unsigned long long)k.ps,
+                                          (unsigned long long)k.vs, k.alpha_spec];
+  desc.vertexFunction = vs;
+  desc.fragmentFunction = k.alpha_spec ? store.PixelVariant(k.ps, k.alpha_spec) : ps;
+  if (!desc.fragmentFunction) {
+    desc.fragmentFunction = ps;
+  }
+  if (k.motion >= 2) {  // nil (no such entry point): the pipeline fails, its draws are left out
+    desc.vertexFunction = store.MotionVariant(false, k.vs, 0);
+    desc.fragmentFunction = store.MotionVariant(true, k.ps, k.alpha_spec);
+    if (!desc.vertexFunction || !desc.fragmentFunction) return nil;
+    desc.label = [desc.label stringByAppendingString:@" motion"];
+  }
+  MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+  const std::vector<NSUInteger>& active = ActiveAttributes(vs);
+  for (size_t i = 0; i < active.size(); ++i) {
+    const NSUInteger at = active[i];
+    MTLVertexAttribute* a = nil;
+    for (MTLVertexAttribute* x in vs.vertexAttributes) {
+      if (x.attributeIndex == at) a = x;
+    }
+    vd.attributes[at].format = a.attributeType == MTLDataTypeUInt4 ? MTLVertexFormatUInt4 : MTLVertexFormatFloat4;
+    vd.attributes[at].offset = 0;
+    vd.attributes[at].bufferIndex = 9 + i;
+    vd.layouts[9 + i].stride = 16;
+  }
+  desc.vertexDescriptor = vd;
+  desc.rasterSampleCount = k.sample_count;
+  desc.alphaToCoverageEnabled = k.alpha_to_coverage;
+  auto attachment = [&](int n, MTLPixelFormat format, uint32_t bc, uint32_t mask) {
+    MTLRenderPipelineColorAttachmentDescriptor* c = desc.colorAttachments[n];
+    c.pixelFormat = format;
+    c.blendingEnabled = (bc & 0x1FFF1FFF) != 0x00010001;  // not one/zero/add for both
+    c.sourceRGBBlendFactor = BlendFactor(bc & 0x1F);
+    c.rgbBlendOperation = BlendOp((bc >> 5) & 7);
+    c.destinationRGBBlendFactor = BlendFactor((bc >> 8) & 0x1F);
+    c.sourceAlphaBlendFactor = BlendFactor((bc >> 16) & 0x1F);
+    c.alphaBlendOperation = BlendOp((bc >> 21) & 7);
+    c.destinationAlphaBlendFactor = BlendFactor((bc >> 24) & 0x1F);
+    MTLColorWriteMask m = 0;
+    if (mask & 1) m |= MTLColorWriteMaskRed;
+    if (mask & 2) m |= MTLColorWriteMaskGreen;
+    if (mask & 4) m |= MTLColorWriteMaskBlue;
+    if (mask & 8) m |= MTLColorWriteMaskAlpha;
+    c.writeMask = m;
+  };
+  attachment(0, ColorFormat(k.format), k.blend, k.mask & 0xF);
+  if (k.format1) {
+    attachment(1, ColorFormat(k.format1 - 1), k.blend1, (k.mask >> 4) & 0xF);
+  }
+  if (k.motion) {
+    desc.colorAttachments[4].pixelFormat = kMotionFormat;
+    desc.colorAttachments[4].writeMask = k.motion == 3 ? MTLColorWriteMaskRed | MTLColorWriteMaskGreen
+                                                       : MTLColorWriteMaskNone;
+  }
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  return desc;
+}
+
+// The renderer's pipelines (render thread). A new one is compiled on the spot,
+// or, with nfsmw_native_async_pipelines, on a background queue while its draws
+// are left out (a few frames, the first time only). Every pipeline made is
+// listed in Library/Caches/nfsmw_native_pipelines.keys, and the next session
+// compiles them all in the background from its start (the menus): a race then
+// finds them ready, from the archive or compiled once more if the archive
+// lost them.
+class PipelineCache {
+ public:
+  // The key's pipeline, or nil: failed (*failed), or still compiling.
+  id<MTLRenderPipelineState> Get(id<MTLDevice> device, const PipelineKey& k, id<MTLFunction> vs,
+                                 id<MTLFunction> ps, bool async, bool* failed, bool reuse_ready_lookup) {
+    if (auto* entry = ready_lookup_.Find(ready_, k, reuse_ready_lookup)) return entry->second;
+    if (failed_.count(k)) {
+      *failed = true;
+      return nil;
+    }
+    MTLRenderPipelineDescriptor* desc = PipelineDescriptor(k, vs, ps);
+    if (!desc) {
+      Finish(k, nil, false, "no motion entry point");
+      *failed = true;
+      return nil;
+    }
+    if (async) {
+      ++draws_waiting_;
+      if (demanded_.insert(k).second) Start(device, k, desc, false);
+      return nil;
+    }
+    NSError* error = nil;
+    id<MTLRenderPipelineState> pso = nil;
+    @try {
+      pso = pipeline_archive.Make(device, desc, &error);
+    } @catch (NSException* e) {
+      pso = nil;
+    }
+    Finish(k, pso, false, error ? error.localizedDescription.UTF8String : "exception");
+    *failed = !pso;
+    return pso;
+  }
+
+  size_t size() const { return ready_.size(); }
+
+  // Once per frame (render thread): the background compiles finished since.
+  void Collect() {
+    std::vector<Done> done;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      done.swap(done_);
+    }
+    for (Done& d : done) {
+      Finish(d.key, d.pso, d.warm, d.error.c_str());
+      if (d.warm && --warm_left_ == 0) {
+        REXLOG_INFO("[native] pipelines warmed up: {} in {:.0f} ms (background)", warm_total_,
+                    std::chrono::duration<double, std::milli>(FastClock::now() - warm_start_).count());
+      }
+    }
+  }
+
+  // Once (render thread, the store loaded): the pipelines of earlier sessions,
+  // compiled in the background.
+  void WarmUp(id<MTLDevice> device) {
+    if (warmed_) return;
+    warmed_ = true;
+    NSData* data = [NSData dataWithContentsOfURL:KeysUrl()];
+    const size_t n = data.length / sizeof(SavedKey);
+    const SavedKey* saved = static_cast<const SavedKey*>(data.bytes);
+    warm_start_ = FastClock::now();
+    for (size_t i = 0; i < n; ++i) {
+      const PipelineKey k{saved[i].vs,     saved[i].ps,         saved[i].blend,       saved[i].blend1,
+                          saved[i].mask,   saved[i].format,     saved[i].format1,     saved[i].alpha_spec,
+                          saved[i].sample_count, (saved[i].alpha_to_coverage & 1) != 0,
+                          saved[i].alpha_to_coverage >> 8};
+      id<MTLFunction> vs = store.Find("vs", k.vs), ps = store.Find("ps", k.ps);
+      if (!vs || !ps || !known_.insert(k).second) continue;  // shaders no longer in this build
+      MTLRenderPipelineDescriptor* desc = PipelineDescriptor(k, vs, ps);
+      if (!desc) continue;
+      ++warm_total_;
+      Start(device, k, desc, true);
+    }
+    warm_left_ = warm_total_;
+    REXLOG_INFO("[native] pipelines: {} known from earlier sessions, compiling them in the background",
+                warm_total_);
+  }
+
+  // With the periodic log line: draws left out, and the key list written if it grew.
+  void Report() {
+    if (draws_waiting_) {
+      REXLOG_INFO("[native] pipelines: {} draws left out while theirs compiled", draws_waiting_);
+      draws_waiting_ = 0;
+    }
+    pipeline_archive.Report();
+    if (!keys_dirty_) return;
+    keys_dirty_ = false;
+    NSMutableData* data = [NSMutableData dataWithCapacity:known_.size() * sizeof(SavedKey)];
+    for (const PipelineKey& k : known_) {
+      const SavedKey s{k.vs,      k.ps,         k.blend,        k.blend1,
+                       k.mask,    k.format,     k.format1,      k.alpha_spec,
+                       k.sample_count, uint32_t(k.alpha_to_coverage) | k.motion << 8};
+      [data appendBytes:&s length:sizeof(s)];
+    }
+    if (![data writeToURL:KeysUrl() atomically:YES]) {
+      REXLOG_WARN("[native] pipeline list not saved");
+    }
+  }
+
+ private:
+  struct SavedKey {  // the file's records (no padding)
+    uint64_t vs, ps;
+    uint32_t blend, blend1, mask, format, format1, alpha_spec, sample_count, alpha_to_coverage;  // | motion << 8
+  };
+  static_assert(sizeof(SavedKey) == 48, "SavedKey layout");
+  struct Done {
+    PipelineKey key;
+    id<MTLRenderPipelineState> pso;
+    bool warm;
+    std::string error;
+  };
+
+  static NSURL* KeysUrl() {
+    NSURL* caches = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
+    return [caches URLByAppendingPathComponent:@"nfsmw_native_pipelines_v2.keys"];
+  }
+
+  // Compiled on a serial queue: the warm-up's at utility priority, the ones a
+  // frame waits for on their own, ahead of it.
+  void Start(id<MTLDevice> device, const PipelineKey& key, MTLRenderPipelineDescriptor* desc, bool warm) {
+    const PipelineKey k = key;  // a copy: a block captures a reference as a reference
+    static dispatch_queue_t warm_queue = dispatch_queue_create(
+        "nfsmw.pipelines.warm", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    static dispatch_queue_t demand_queue = dispatch_queue_create(
+        "nfsmw.pipelines", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+    dispatch_async(warm ? warm_queue : demand_queue, ^{
+      NSError* error = nil;
+      id<MTLRenderPipelineState> pso = nil;
+      @try {
+        pso = pipeline_archive.Make(device, desc, &error);
+      } @catch (NSException* e) {
+        pso = nil;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      done_.push_back({k, pso, warm, error ? error.localizedDescription.UTF8String : "exception"});
+    });
+  }
+
+  void Finish(const PipelineKey& k, id<MTLRenderPipelineState> pso, bool warm, const char* error) {
+    if (!warm) demanded_.erase(k);
+    if (ready_.count(k)) return;  // made twice (the warm-up and a draw): the first kept
+    if (pso) {
+      ready_[k] = pso;
+      if (known_.insert(k).second) keys_dirty_ = true;
+      return;
+    }
+    if (warm) return;  // the draws that need it will try once more and say why
+    failed_.insert(k);  // not retried every frame
+    if (++failures_logged_ <= 3) {
+      REXLOG_WARN("[native] pipeline vs {:016x} ps {:016x}: {}", k.vs, k.ps, error);
+    }
+  }
+
+  std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> ready_;
+  PipelineLookupCache<id<MTLRenderPipelineState>> ready_lookup_;
+  std::unordered_set<PipelineKey, PipelineKeyHash> failed_, demanded_, known_;
+  std::mutex mutex_;
+  std::vector<Done> done_;  // guarded by mutex_
+  bool warmed_ = false, keys_dirty_ = false;
+  uint32_t warm_total_ = 0, warm_left_ = 0, draws_waiting_ = 0, failures_logged_ = 0;
+  FastClock::time_point warm_start_;
+};
+PipelineCache pipeline_cache;
+
+struct Target {
+  id<MTLTexture> color;
+  id<MTLTexture> depth;
+  id<MTLTexture> multisample_color;
+  id<MTLTexture> multisample_depth;
+  uint32_t pitch, height, format;
+  float scale = 1;  // the resolution scale of this target (shadow maps 1)
+  uint32_t sample_count = 1;
+  uint32_t requested_sample_count = 1;
+  uint32_t draws = 0;
+  uint64_t depth_generation = 0;  // sampled audit only: possible writes or clears this frame
+  bool depth_audit_defined = false;  // contents preserved after the last sampled pass
+  bool used = false;
+  // A resolve with clear flags: the next pass on this target starts cleared.
+  bool clear_color = false, clear_depth = false;
+  MTLClearColor clear_color_value = MTLClearColorMake(0, 0, 0, 0);
+  double clear_depth_value = 1.0;
+};
+
+// One instance per traversal, on the serial render queue. The map owns the
+// targets and never erases them during a traversal; insertions keep pointers
+// valid. Cache the live value, not its textures or other mutable fields.
+struct TargetLookupCache {
+  std::pair<const std::string, Target>* entry = nullptr;
+
+  __attribute__((always_inline)) Target& Find(std::map<std::string, Target>& targets,
+                                             const std::string& requested, bool enabled) {
+    if (!enabled) return targets[requested];
+    if (entry && entry->first == requested) return entry->second;
+    // The same default insertion as operator[], retaining the map-owned key
+    // with its live value so a miss does not copy a second string.
+    entry = &*targets.try_emplace(requested).first;
+    return entry->second;
+  }
+};
+
+bool TargetLookupEnabled() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_target_lookup);
+  return enabled;
+}
+
+// Depth resolves: the depth buffer read into an R32Float texture (the game
+// samples the shadow map as a 24-bit depth texture: the value in [0, 1]).
+id<MTLRenderPipelineState> DepthCopyPipeline(id<MTLDevice> device) {
+  static id<MTLRenderPipelineState> pso;
+  if (pso) {
+    return pso;
+  }
+  NSString* source = @"#include <metal_stdlib>\n"
+                      "using namespace metal;\n"
+                      "struct V { float4 p [[position]]; };\n"
+                      "vertex V vs(uint id [[vertex_id]]) {\n"
+                      "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                      "  V v; v.p = float4(uv * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+                      "fragment float ps(V in [[stage_in]], depth2d<float> d [[texture(0)]], constant float& scale [[buffer(0)]]) {\n"
+                      "  return d.read(uint2(in.p.xy)) * scale; }\n";
+  NSError* error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+  if (!library) {
+    REXLOG_WARN("[native] depth copy shader: {}", error.localizedDescription.UTF8String);
+    return nil;
+  }
+  MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+  desc.vertexFunction = [library newFunctionWithName:@"vs"];
+  desc.fragmentFunction = [library newFunctionWithName:@"ps"];
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
+  pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  return pso;
+}
+
+// Motion vectors: the scene's depth (the target's, depth and stencil) copied
+// into a depth-only texture for MetalFX, and the motion shown as a picture
+// (nfsmw_native_motion_debug: grey still, red/green moving right/down).
+id<MTLRenderPipelineState> MotionPipeline(id<MTLDevice> device, bool debug, MTLPixelFormat format) {
+  static std::map<std::pair<bool, MTLPixelFormat>, id<MTLRenderPipelineState>> made;
+  auto it = made.find({debug, format});
+  if (it != made.end()) return it->second;
+  NSString* source = @"#include <metal_stdlib>\n"
+                      "using namespace metal;\n"
+                      "struct V { float4 p [[position]]; };\n"
+                      "vertex V vs(uint id [[vertex_id]]) {\n"
+                      "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                      "  V v; v.p = float4(uv * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+                      "struct D { float d [[depth(any)]]; };\n"
+                      "fragment D depth_ps(V in [[stage_in]], depth2d<float> d [[texture(0)]]) {\n"
+                      "  D o; o.d = d.read(uint2(in.p.xy)); return o; }\n"
+                      "fragment float4 debug_ps(V in [[stage_in]], texture2d<float> m [[texture(0)]]) {\n"
+                      "  float2 v = m.read(uint2(in.p.xy)).xy * 40.0;\n"
+                      "  return float4(saturate(0.5 - v.x), saturate(0.5 - v.y), 0.5, 1.0); }\n";
+  NSError* error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+  if (!library) {
+    REXLOG_WARN("[native] motion shaders: {}", error.localizedDescription.UTF8String);
+    return made[{debug, format}] = nil;
+  }
+  MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+  desc.vertexFunction = [library newFunctionWithName:@"vs"];
+  desc.fragmentFunction = [library newFunctionWithName:debug ? @"debug_ps" : @"depth_ps"];
+  if (debug) {
+    desc.colorAttachments[0].pixelFormat = format;
+  } else {
+    desc.depthAttachmentPixelFormat = format;
+  }
+  return made[{debug, format}] = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+}
+
+// Colour resolves with an exponent bias (RB_COPY_DEST_INFO bits 16-21: the
+// console writes colour * 2^bias): a copy that scales, per destination format.
+// The source is read at the destination pixel plus an offset.
+id<MTLRenderPipelineState> ScaledCopyPipeline(id<MTLDevice> device, MTLPixelFormat format) {
+  static std::map<MTLPixelFormat, id<MTLRenderPipelineState>> made;
+  auto it = made.find(format);
+  if (it != made.end()) {
+    return it->second;
+  }
+  static id<MTLLibrary> library;
+  if (!library) {
+    NSString* source = @"#include <metal_stdlib>\n"
+                        "using namespace metal;\n"
+                        "struct V { float4 p [[position]]; };\n"
+                        "struct C { float scale; int2 offset; };\n"
+                        "vertex V vs(uint id [[vertex_id]]) {\n"
+                        "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                        "  V v; v.p = float4(uv * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+                        "fragment float4 ps(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant C& c [[buffer(0)]]) {\n"
+                        "  return t.read(uint2(int2(in.p.xy) + c.offset)) * c.scale; }\n";
+    NSError* error = nil;
+    library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+      REXLOG_WARN("[native] scaled copy shader: {}", error.localizedDescription.UTF8String);
+      return made[format] = nil;
+    }
+  }
+  MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+  desc.vertexFunction = [library newFunctionWithName:@"vs"];
+  desc.fragmentFunction = [library newFunctionWithName:@"ps"];
+  desc.colorAttachments[0].pixelFormat = format;
+  NSError* error = nil;
+  return made[format] = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+}
+
+// --- GPU-side state kept across frames (render queue only) ----------------------
+
+struct GpuBuffer {
+  id<MTLBuffer> buffer;  // an arena chunk's
+  size_t offset = 0, size = 0;
+  uint32_t chunk = 0;
+  std::shared_ptr<const void> keep;
+  uint64_t last_used = 0;
+  uint32_t last_submission = 0;
+};
+
+// The cached vertex and index arrays' GPU copies, packed into large shared
+// buffers: one Metal allocation (and one residency set change) per 32 MB
+// instead of one per array. Thousands of small buffers made as a race starts
+// meant thousands of allocations, each wired and added to the residency set.
+// Completed, expired arrays return their ranges for reuse. Surplus empty
+// chunks leave the residency set; the legacy bump allocator is a control.
+struct BufferArena {
+  static constexpr size_t kChunk = 32u << 20;
+  struct Chunk {
+    id<MTLBuffer> buffer;
+    size_t used = 0, live = 0;  // bytes handed out, still in use
+  };
+  std::vector<Chunk> chunks;
+  uint32_t current = UINT32_MAX;
+  nfsmw::ArenaRanges ranges;
+  bool reuse_ranges = false, configured = false;
+  uint64_t chunks_released = 0;
+
+  // Room for `size` bytes: its chunk, buffer and offset.
+  bool Allocate(id<MTLDevice> device, size_t size, uint32_t& chunk, __strong id<MTLBuffer>& buffer, size_t& offset) {
+    size = (size + 255) & ~size_t(255);
+    if (!configured) {
+      reuse_ranges = REXCVAR_GET(nfsmw_native_reclaim_geometry);
+      configured = true;  // allocation policy is fixed for this app launch
+    }
+    if (reuse_ranges) {
+      if (!ranges.Allocate(size, chunk, offset)) {
+        if (!Fresh(device, std::max(size, kChunk))) return false;
+        if (!ranges.Allocate(size, chunk, offset)) return false;
+      }
+      Chunk& c = chunks[chunk];
+      c.live += size;
+      buffer = c.buffer;
+      return true;
+    }
+    if (current == UINT32_MAX || chunks[current].buffer.length - chunks[current].used < size) {
+      if (!Fresh(device, std::max(size, kChunk))) return false;  // larger than a chunk: one of its size
+    }
+    Chunk& c = chunks[current];
+    chunk = current;
+    buffer = c.buffer;
+    offset = c.used;
+    c.used += size;
+    c.live += size;
+    return true;
+  }
+
+  void Release(uint32_t chunk, size_t offset, size_t size) {
+    size = (size + 255) & ~size_t(255);
+    Chunk& c = chunks[chunk];
+    c.live -= std::min(c.live, size);
+    if (reuse_ranges) ranges.Release(chunk, offset, size);
+    else if (c.live == 0 && chunk != current) c.used = 0;
+  }
+
+  void Trim() {
+    if (!reuse_ranges) return;
+    bool kept_spare = false;
+    for (uint32_t i = 0; i < chunks.size(); ++i) {
+      Chunk& c = chunks[i];
+      if (!c.buffer || c.live) continue;
+      if (!kept_spare && c.buffer.length == kChunk) {
+        kept_spare = true;  // avoid allocation churn during streaming
+        continue;
+      }
+      ranges.RemoveEmptyChunk(i, c.buffer.length);
+      residency::Remove(c.buffer);
+      c.buffer = nil;
+      c.used = 0;
+      ++chunks_released;
+    }
+  }
+
+  size_t LiveBytes() const {
+    size_t n = 0;
+    for (const Chunk& c : chunks) n += c.live;
+    return n;
+  }
+
+  size_t Bytes() const {
+    size_t n = 0;
+    for (const Chunk& c : chunks) n += c.buffer.length;
+    return n;
+  }
+
+ private:
+  bool Fresh(id<MTLDevice> device, size_t size) {
+    // An empty chunk big enough, else a new one.
+    for (uint32_t i = 0; i < chunks.size(); ++i) {
+      if (!reuse_ranges && i != current && chunks[i].used == 0 && chunks[i].buffer.length >= size) {
+        current = i;
+        return true;
+      }
+    }
+    id<MTLBuffer> b = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    if (!b) return false;
+    residency::Add(b);
+    if (reuse_ranges) {
+      for (uint32_t i = 0; i < chunks.size(); ++i) {
+        if (chunks[i].buffer) continue;
+        chunks[i] = {b, 0, 0};
+        current = i;
+        ranges.AddChunk(i, size);
+        return true;
+      }
+    }
+    chunks.push_back({b, 0, 0});
+    current = uint32_t(chunks.size() - 1);
+    if (reuse_ranges) ranges.AddChunk(current, size);
+    return true;
+  }
+};
+BufferArena buffer_arena;
+// The renderer's resolve outputs kept across frames, by address (and whether
+// the resolve swapped red and blue).
+struct KeptResolve {
+  id<MTLTexture> texture;
+  bool swap;
+  float scale;  // its source target's resolution scale
+};
+std::unordered_map<uint32_t, KeptResolve> kept_resolves;
+// The cubes the renderer assembles from face resolves (the race's environment
+// map), by address: one texture kept from frame to frame, the faces copied
+// into it as they are resolved (in GPU order: draws before a face's copy see
+// the frame before's face, as the console's sampling of that memory would).
+std::unordered_map<uint32_t, id<MTLTexture>> kept_cubes;
+std::unordered_map<uint32_t, bool> kept_cube_swaps;  // whether their faces' resolves swapped red and blue
+
+// --- Recycled GPU memory (the renderer's queue) ------------------------------------
+//
+// Made anew every frame, the frame's buffers and resolve textures (some the
+// size of the 2x screen, 17 MiB) cost the driver a wire and an unwire each:
+// 4 GB a second at 2x. While iOS is short of free memory (the race loading
+// and its first seconds, when it compresses the app's memory) every one
+// waited for pages, and the GPU sat idle in the middle of frames: 50-150 ms
+// frames. They are reused instead, back in the pool once the last frame that
+// may use them is done on the GPU (frames complete in order on one queue).
+std::atomic<uint32_t> gpu_frames_done{0};
+
+void FrameDoneOnGpu(uint32_t number) {
+  uint32_t done = gpu_frames_done.load();
+  while (number > done && !gpu_frames_done.compare_exchange_weak(done, number)) {
+  }
+}
+
+struct GpuPool {
+  struct Retired {
+    id object;
+    std::string key;
+    uint32_t after;  // reusable once this frame is done
+  };
+  struct Free {
+    id object;
+    uint32_t since;  // the frame it was freed at
+  };
+  std::unordered_map<std::string, std::vector<Free>> free;
+  std::deque<Retired> retired;
+  std::unordered_map<const void*, std::string> keys;  // the pool's objects
+  uint32_t made = 0, reused = 0;
+
+  void Reclaim(uint32_t now) {
+    const uint32_t done = gpu_frames_done.load();
+    while (!retired.empty() && retired.front().after <= done) {
+      free[retired.front().key].push_back({retired.front().object, now});
+      retired.pop_front();
+    }
+    // Unused for 10 s or so: released (a scene that needed more).
+    if ((now & 63) == 0) {
+      for (auto it = free.begin(); it != free.end();) {
+        auto& list = it->second;
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const Free& f) {
+                                    if (now - f.since <= 600) return false;
+                                    keys.erase((__bridge const void*)f.object);
+                                    residency::Remove(f.object);
+                                    return true;
+                                  }),
+                   list.end());
+        it = list.empty() ? free.erase(it) : std::next(it);
+      }
+    }
+  }
+
+  id Take(const std::string& key) {
+    auto it = free.find(key);
+    if (it == free.end() || it->second.empty()) return nil;
+    id object = it->second.back().object;
+    it->second.pop_back();
+    ++reused;
+    return object;
+  }
+
+  void Add(id object, std::string key) {
+    keys[(__bridge const void*)object] = std::move(key);
+    residency::Add(object);
+    ++made;
+  }
+
+  // Back to the pool once frame `after` is done (objects not the pool's: dropped).
+  void Retire(id object, uint32_t after) {
+    if (!object) return;
+    auto it = keys.find((__bridge const void*)object);
+    if (it == keys.end()) return;
+    retired.push_back({object, it->second, after});
+  }
+
+  // Zeroed up to `length` like a new buffer (the texture heaps' unset slots
+  // must read as no texture: a stale ID of a released texture hangs the GPU).
+  // Zeroed when reused (heap and argument buffers must not keep stale
+  // resource IDs), unless the caller writes every byte it uses (zero false).
+  id<MTLBuffer> Buffer(id<MTLDevice> device, size_t length, MTLResourceOptions options, bool zero = true) {
+    size_t size = 4096;
+    while (size < length) size *= 2;
+    const std::string key = fmt::format("b {} {}", size, uint64_t(options));
+    id<MTLBuffer> b = Take(key);
+    if (!b) {
+      b = [device newBufferWithLength:size options:options];
+      Add(b, key);
+    } else if (zero && b.contents) {
+      std::memset(b.contents, 0, length);
+    }
+    return b;
+  }
+
+  // `row`: a linear texture over a buffer of its own with this row pitch (0: none).
+  id<MTLTexture> Texture(id<MTLDevice> device, MTLTextureDescriptor* d, NSUInteger row = 0) {
+    const std::string key = fmt::format("t {} {} {}x{}x{} {} {} {}", uint64_t(d.textureType), uint64_t(d.pixelFormat),
+                                        d.width, d.height, d.depth, uint64_t(d.usage), uint64_t(d.storageMode), row);
+    id<MTLTexture> t = Take(key);
+    if (!t) {
+      if (row) {
+        id<MTLBuffer> backing = [device newBufferWithLength:row * d.height
+                                                    options:MTLResourceOptions(d.storageMode) << MTLResourceStorageModeShift];
+        t = [backing newTextureWithDescriptor:d offset:0 bytesPerRow:row];
+      } else {
+        t = NewTexture(device, d, "d@2");
+      }
+      if (!t) return nil;
+      Add(t, key);
+    }
+    return t;
+  }
+};
+GpuPool gpu_pool;
+std::unordered_map<const void*, GpuBuffer> gpu_buffers;
+std::map<uint32_t, id<MTLSamplerState>> gpu_samplers;
+uint64_t gpu_frame = 0;
+uint32_t gpu_submission_frame = 0;
+
+uint64_t ProcessPhysicalFootprint() {
+  task_vm_info_data_t info = {};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return info.phys_footprint;
+}
+
+// The Metal texture for a decoded texture: made once, kept while the cache
+// keeps the decoded data (a new decode is a new object).
+// BC1-3 blocks expanded to RGBA8 by a compute kernel, for GPUs without BC
+// formats (A16 and older): the blocks upload as they are, 4-8x smaller than
+// texels, and the CPU decodes nothing (it did, at ~10 ms a frame on an
+// iPhone 14 Pro Max while a track streamed in). Encoded into one command
+// buffer per frame on the frame's queue, committed before the frame's own
+// (BcFlush), so it runs first.
+id<MTLCommandQueue> bc_queue;           // the frame's queue (render thread)
+id<MTLCommandBuffer> bc_cb;             // this frame's decodes, if any
+id<MTLComputeCommandEncoder> bc_enc;
+
+id<MTLComputePipelineState> BcPipeline(id<MTLDevice> device, bool cube) {
+  static id<MTLComputePipelineState> pso[2];
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    NSString* source = @"#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct P { uint bw; uint bh; uint w; uint h; uint kind; uint layer_bytes; };\n"
+        "float3 c565(uint c) { return float3((c >> 11) & 31, (c >> 5) & 63, c & 31) / float3(31.0, 63.0, 31.0); }\n"
+        "float4 texel(device const uchar* b, uint kind, uint i) {\n"
+        "  device const uchar* c = kind == 1 ? b : b + 8;\n"
+        "  uint c0 = c[0] | (c[1] << 8), c1 = c[2] | (c[3] << 8);\n"
+        "  uint idx = (c[4 + i / 4] >> (2 * (i % 4))) & 3;\n"
+        "  float3 p0 = c565(c0), p1 = c565(c1);\n"
+        "  float4 col;\n"
+        "  if (kind != 1 || c0 > c1) {\n"
+        "    col = float4(idx == 0 ? p0 : idx == 1 ? p1 : idx == 2 ? (2.0 * p0 + p1) / 3.0 : (p0 + 2.0 * p1) / 3.0, 1.0);\n"
+        "  } else {\n"
+        "    col = idx == 0 ? float4(p0, 1) : idx == 1 ? float4(p1, 1) : idx == 2 ? float4((p0 + p1) * 0.5, 1) : float4(0);\n"
+        "  }\n"
+        "  if (kind == 2) { col.a = float((b[i / 2] >> (4 * (i % 2))) & 15) / 15.0; }\n"
+        "  if (kind == 3) {\n"
+        "    float a0 = b[0] / 255.0, a1 = b[1] / 255.0;\n"
+        "    uint bit = 3 * i; uint byte = 2 + bit / 8; uint shift = bit % 8;\n"
+        "    uint v = (b[byte] | (b[min(byte + 1, 7u)] << 8)) >> shift; uint ai = v & 7;\n"
+        "    float a;\n"
+        "    if (b[0] > b[1]) a = ai == 0 ? a0 : ai == 1 ? a1 : (float(8 - ai) * a0 + float(ai - 1) * a1) / 7.0;\n"
+        "    else a = ai == 0 ? a0 : ai == 1 ? a1 : ai == 6 ? 0.0 : ai == 7 ? 1.0 : (float(6 - ai) * a0 + float(ai - 1) * a1) / 5.0;\n"
+        "    col.a = a;\n"
+        "  }\n"
+        "  return col;\n"
+        "}\n"
+        "kernel void bc2d(device const uchar* data [[buffer(0)]], constant P& p [[buffer(1)]],\n"
+        "                 texture2d<float, access::write> out [[texture(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+        "  if (g.x >= p.bw || g.y >= p.bh) return;\n"
+        "  device const uchar* b = data + (g.y * p.bw + g.x) * (p.kind == 1 ? 8 : 16);\n"
+        "  for (uint i = 0; i < 16; ++i) { uint2 xy = g * 4 + uint2(i % 4, i / 4);\n"
+        "    if (xy.x < p.w && xy.y < p.h) out.write(texel(b, p.kind, i), xy); }\n"
+        "}\n"
+        "kernel void bccube(device const uchar* data [[buffer(0)]], constant P& p [[buffer(1)]],\n"
+        "                   texturecube<float, access::write> out [[texture(0)]], uint3 g [[thread_position_in_grid]]) {\n"
+        "  if (g.x >= p.bw || g.y >= p.bh || g.z >= 6) return;\n"
+        "  device const uchar* b = data + g.z * p.layer_bytes + (g.y * p.bw + g.x) * (p.kind == 1 ? 8 : 16);\n"
+        "  for (uint i = 0; i < 16; ++i) { uint2 xy = g.xy * 4 + uint2(i % 4, i / 4);\n"
+        "    if (xy.x < p.w && xy.y < p.h) out.write(texel(b, p.kind, i), xy, g.z); }\n"
+        "}\n";
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+      REXLOG_WARN("[native] BC decode kernels: {}", error.localizedDescription.UTF8String);
+    } else {
+      pso[0] = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"bc2d"] error:&error];
+      pso[1] = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"bccube"] error:&error];
+    }
+  }
+  return pso[cube ? 1 : 0];
+}
+
+// The texture for BC blocks, expanded on the GPU; nil if the kernel is
+// unavailable (the caller then decodes on the CPU).
+id<MTLTexture> BcDecodeOnGpu(id<MTLDevice> device, const Texture& t) {
+  id<MTLComputePipelineState> pso = BcPipeline(device, t.cube);
+  if (!pso || !bc_queue) return nil;
+  MTLTextureDescriptor* desc = [MTLTextureDescriptor new];
+  desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+  desc.width = t.width;
+  desc.height = t.height;
+  desc.mipmapLevelCount = t.levels;
+  if (t.cube) desc.textureType = MTLTextureTypeCube;
+  desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+  desc.storageMode = MTLStorageModePrivate;
+  id<MTLTexture> base = NewTexture(device, desc, "bc-gpu");
+  if (!base) return nil;
+  id<MTLBuffer> blocks = [device newBufferWithBytes:t.data.data() length:t.data.size()
+                                            options:MTLResourceStorageModeShared];
+  if (!bc_cb) {
+    bc_cb = [bc_queue commandBuffer];
+    bc_cb.label = @"BC decode";
+    bc_enc = [bc_cb computeCommandEncoder];
+  }
+  const uint32_t kind = t.format == MTLPixelFormatBC1_RGBA ? 1 : t.format == MTLPixelFormatBC2_RGBA ? 2 : 3;
+  [bc_enc setComputePipelineState:pso];
+  for (uint32_t level = 0; level < t.levels; ++level) {
+    const LevelSpan span = SpanOf(t, level);
+    struct { uint32_t bw, bh, w, h, kind, layer_bytes; } params = {
+        span.bw, span.bh, span.width, span.height, kind, uint32_t(span.layer_bytes)};
+    // Each level through a view of its own (the kernel writes level 0).
+    id<MTLTexture> target = level == 0 ? base
+                                       : [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                 textureType:base.textureType
+                                                                      levels:NSMakeRange(level, 1)
+                                                                      slices:NSMakeRange(0, t.cube ? 6 : 1)];
+    [bc_enc setBuffer:blocks offset:span.offset atIndex:0];
+    [bc_enc setBytes:&params length:sizeof(params) atIndex:1];
+    [bc_enc setTexture:target atIndex:0];
+    [bc_enc dispatchThreads:MTLSizeMake(span.bw, span.bh, t.cube ? 6 : 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+  }
+  // The fetch swizzle on a view: a texture the kernel writes carries none.
+  const MTLTextureSwizzleChannels identity = MTLTextureSwizzleChannelsDefault;
+  if (std::memcmp(&t.swizzle, &identity, sizeof(identity)) == 0) return base;
+  return [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                 textureType:base.textureType
+                                      levels:NSMakeRange(0, t.levels)
+                                      slices:NSMakeRange(0, t.cube ? 6 : 1)
+                                     swizzle:t.swizzle];
+}
+
+// This frame's decodes, committed ahead of the frame (same queue).
+void BcFlush() {
+  if (!bc_cb) return;
+  [bc_enc endEncoding];
+  [bc_cb commit];
+  bc_cb = nil;
+  bc_enc = nil;
+}
+
+id<MTLTexture> GpuTextureFor(id<MTLDevice> device, const std::shared_ptr<const Texture>& tp) {
+  const Texture& t = *tp;
+  if (t.format == MTLPixelFormatInvalid) {
+    return nil;
+  }
+  if (t.gpu.texture) {
+    return t.gpu.texture;
+  }
+  if (t.data.empty()) {
+    return nil;  // not expected: uploaded textures keep their Metal copy
+  }
+  const auto upload_start = std::chrono::steady_clock::now();
+  if (t.bc_on_gpu) {
+    if (id<MTLTexture> tex = BcDecodeOnGpu(device, t)) {
+      t.gpu.texture = tex;
+      t.gpu.bytes = tex.allocatedSize;
+      residency::Add(tex);
+      ++gpu_texture_count;
+      gpu_texture_bytes += int64_t(t.gpu.bytes);
+      ++frame_uploads;
+      frame_upload_bytes += t.data.size();
+      frame_upload_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - upload_start).count());
+      decltype(t.data)().swap(t.data);
+      return tex;
+    }
+    return nil;  // no kernel: drawn without it (logged once at its compile)
+  }
+  MTLTextureDescriptor* desc = [MTLTextureDescriptor new];
+  desc.pixelFormat = t.format;
+  desc.width = t.width;
+  desc.height = t.height;
+  desc.mipmapLevelCount = t.levels;
+  desc.swizzle = t.swizzle;
+  if (t.volume) {
+    desc.textureType = MTLTextureType3D;
+    desc.depth = t.depth;
+  } else if (t.cube) {
+    desc.textureType = MTLTextureTypeCube;
+  }
+  id<MTLTexture> tex = NewTexture(device, desc, "desc@3");
+  const size_t layers = LayersOf(t);
+  const size_t layer_bytes = SpanOf(t, 0).layer_bytes;
+  if (t.volume) {
+    [tex replaceRegion:MTLRegionMake3D(0, 0, 0, t.width, t.height, t.depth)
+           mipmapLevel:0
+                 slice:0
+             withBytes:t.data.data()
+           bytesPerRow:t.row_bytes
+         bytesPerImage:layer_bytes];
+  } else {
+    for (uint32_t level = 0; level < t.levels; ++level) {
+      const LevelSpan span = SpanOf(t, level);
+      for (NSUInteger layer = 0; layer < layers; ++layer) {
+        [tex replaceRegion:MTLRegionMake2D(0, 0, span.width, span.height)
+               mipmapLevel:level
+                     slice:layer
+                 withBytes:t.data.data() + span.offset + layer * span.layer_bytes
+               bytesPerRow:span.row_bytes
+             bytesPerImage:span.layer_bytes];
+      }
+    }
+  }
+  t.gpu.texture = tex;
+  t.gpu.bytes = tex.allocatedSize;
+  residency::Add(tex);
+  ++gpu_texture_count;
+  gpu_texture_bytes += int64_t(t.gpu.bytes);
+  ++frame_uploads;
+  frame_upload_bytes += t.data.size();
+  frame_upload_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - upload_start).count());
+  decltype(t.data)().swap(t.data);  // the CPU copy is not needed any more
+  return tex;
+}
+
+// MetalFX temporal: mip levels chosen for the shown size, not the drawn one
+// (log2 of drawn / shown, in eighths; 0 otherwise), as temporal upscalers
+// want: the textures as sharp as the picture it builds (render thread).
+int32_t temporal_lod_bias_eighths = 0;
+bool metalfx_failed = false;  // no temporal scaler for the last size asked: no jitter either
+
+id<MTLSamplerState> SamplerFor(id<MTLDevice> device, bool linear, uint32_t clamp_x, uint32_t clamp_y,
+                               bool volume_or_cube, uint32_t max_anisotropy = 1,
+                               MTLSamplerMipFilter mip_filter = MTLSamplerMipFilterNotMipmapped) {
+  max_anisotropy = std::clamp(max_anisotropy, 1u, 16u);
+  const int32_t bias = mip_filter == MTLSamplerMipFilterNotMipmapped ? 0 : temporal_lod_bias_eighths;
+  const uint32_t key = (linear ? 1u : 0u) | (clamp_x << 1) | (clamp_y << 4) |
+                       (volume_or_cube ? 1u << 7 : 0u) | (max_anisotropy << 8) | (uint32_t(mip_filter) << 13) |
+                       uint32_t(-bias) << 16;
+  auto found = gpu_samplers.find(key);
+  if (found != gpu_samplers.end()) {
+    return found->second;
+  }
+  id<MTLSamplerState> s;
+  {
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = sd.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    sd.mipFilter = mip_filter;
+    sd.sAddressMode = volume_or_cube ? MTLSamplerAddressModeClampToEdge : AddressMode(clamp_x);
+    sd.tAddressMode = volume_or_cube ? MTLSamplerAddressModeClampToEdge : AddressMode(clamp_y);
+    sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.maxAnisotropy = max_anisotropy;
+    if (@available(iOS 26.0, *)) sd.lodBias = float(bias) / 8.0f;
+    sd.supportArgumentBuffers = YES;
+    s = [device newSamplerStateWithDescriptor:sd];
+  }
+  gpu_samplers[key] = s;
+  return s;
+}
+
+// The array's GPU copy (made once, in the arena): its buffer, and the offset
+// in it.
+// A small direct-mapped cache in front of gpu_buffers (one hash lookup per
+// vertex input per draw added up to ~0.5 ms a frame): its entries point into
+// the map, whose nodes stay put until erased; SweepGpu clears an erased
+// entry's slot.
+struct GpuBufferSlot {
+  const void* key = nullptr;
+  GpuBuffer* entry = nullptr;
+};
+// Sized by nfsmw_native_gpu_lookup_slots_log2 (4096 before IPA64: a pursuit
+// binds ~10k arrays a frame, so most lookups fell through to the map).
+GpuBufferSlot gpu_buffer_slots[32768];
+
+size_t GpuBufferSlotMask() {
+  static const size_t mask = (size_t(1) << std::clamp(REXCVAR_GET(nfsmw_native_gpu_lookup_slots_log2), 12, 15)) - 1;
+  return mask;
+}
+
+bool GpuBufferLookupHashEnabled() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_gpu_lookup_hash);
+  return enabled;
+}
+
+size_t GpuBufferSlotIndex(const void* pointer) {
+  uint64_t key = uint64_t(uintptr_t(pointer)) >> 4;
+  if (GpuBufferLookupHashEnabled()) {
+    // Mix the region's higher 12-bit groups, then use its salt as a fixed
+    // XOR within that 64 KiB region. Preserve that region's unique slots
+    // while avoiding identical placement for nearby regions. The multiply
+    // spreads small region differences across the slot bits; it is not a
+    // resource identity check. Every hit still compares the full pointer.
+    uint64_t region = key >> 12;
+    region ^= region >> 12;
+    region ^= region >> 24;
+    key ^= region * 0x9E37u;
+  }
+  return size_t(key & GpuBufferSlotMask());
+}
+
+// Render-queue-only diagnostics. A collision means a different full pointer
+// occupied this direct-cache slot; it is not a backing-map bucket collision.
+struct GpuBufferLookupStats {
+  uint64_t frames = 0, snapshot_frames = 0;
+  uint64_t hits = 0, empty_misses = 0, collisions = 0;
+  uint64_t existing_entries = 0, new_entries = 0;
+};
+GpuBufferLookupStats gpu_buffer_lookup_stats;
+
+bool GpuBufferLookupStatsEnabled() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_gpu_lookup_stats);
+  return enabled;
+}
+
+template <typename T>
+id<MTLBuffer> GpuBufferFor(id<MTLDevice> device, const std::shared_ptr<T>& values, size_t& offset) {
+  GpuBufferSlot& slot = gpu_buffer_slots[GpuBufferSlotIndex(values.get())];
+  const bool lookup_stats = GpuBufferLookupStatsEnabled();
+  if (slot.key != values.get()) {
+    if (lookup_stats) {
+      if (slot.key) ++gpu_buffer_lookup_stats.collisions;
+      else ++gpu_buffer_lookup_stats.empty_misses;
+    }
+    slot.key = values.get();
+    const size_t entries_before = lookup_stats ? gpu_buffers.size() : 0;
+    slot.entry = &gpu_buffers[values.get()];
+    if (lookup_stats) {
+      if (gpu_buffers.size() == entries_before) ++gpu_buffer_lookup_stats.existing_entries;
+      else ++gpu_buffer_lookup_stats.new_entries;
+    }
+  } else if (lookup_stats) {
+    ++gpu_buffer_lookup_stats.hits;
+  }
+  GpuBuffer& g = *slot.entry;
+  g.last_used = gpu_frame;
+  g.last_submission = gpu_submission_frame;
+  if (!g.buffer) {
+    const size_t size = std::max<size_t>(values->size() * sizeof(values->front()), 16);
+    if (!buffer_arena.Allocate(device, size, g.chunk, g.buffer, g.offset)) {
+      offset = 0;
+      return nil;
+    }
+    ++frame_new_buffers;
+    ++geometry_upload_arrays;
+    geometry_upload_bytes += values->size() * sizeof(values->front());
+    g.keep = values;
+    g.size = size;
+    std::memcpy(static_cast<uint8_t*>(g.buffer.contents) + g.offset, values->data(),
+                values->size() * sizeof(values->front()));
+  }
+  offset = g.offset;
+  return g.buffer;
+}
+
+void SweepGpu() {
+  if ((gpu_frame & 63) != 0) return;
+
+  const uint32_t completed = gpu_frames_done.load(std::memory_order_acquire);
+  for (auto it = gpu_buffers.begin(); it != gpu_buffers.end();) {
+    if (gpu_frame - it->second.last_used > 600 && it->second.last_submission <= completed) {
+      if (it->second.buffer) buffer_arena.Release(it->second.chunk, it->second.offset, it->second.size);
+      GpuBufferSlot& slot = gpu_buffer_slots[GpuBufferSlotIndex(it->first)];
+      if (slot.key == it->first) slot = GpuBufferSlot{};  // only this entry's slot
+      it = gpu_buffers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  buffer_arena.Trim();
+}
+
+// The on-screen layer (made on the main thread) and its pipeline.
+CAMetalLayer* present_layer = nil;
+UIView* present_view = nil;
+// The external display's (HDMI, AirPlay), while one is connected.
+CAMetalLayer* external_layer = nil;
+UIWindow* external_window = nil;
+std::atomic<int> external_in_flight{0};
+std::atomic<bool> layer_visible{true};
+
+// Shows or hides the native layer (on the main thread), only on a change.
+void UpdateLayerVisibility(bool visible) {
+  if (!present_view || layer_visible.exchange(visible) == visible) {
+    return;
+  }
+  dispatch_async(dispatch_get_main_queue(), ^{
+    present_view.hidden = !visible;
+  });
+  REXLOG_INFO("[native] native layer {}", visible ? "shown" : "hidden (no native output: the emulated "
+                                                              "renderer's shows)");
+}
+// The FPS counter's picture (nfsmw_native_set_fps_overlay): a new texture at
+// each change (twice a second at most), so frames still in flight keep theirs.
+std::mutex fps_overlay_mutex;
+std::vector<uint8_t> fps_overlay_pixels;
+int fps_overlay_w = 0, fps_overlay_h = 0;
+float fps_overlay_rect[4] = {};
+bool fps_overlay_changed = false;
+std::atomic<int> shown_drawable_width{0};
+// The touch controls' picture (nfsmw_native_set_touch_overlay): one texture,
+// updated where it changed (a knob moving redraws a small rectangle).
+std::mutex touch_overlay_mutex;
+std::vector<uint8_t> touch_overlay_pixels;
+int touch_overlay_w = 0, touch_overlay_h = 0;
+int touch_overlay_dirty[4] = {0, 0, 0, 0};  // x0, y0, x1, y1
+bool touch_overlay_changed = false;
+// The touch overlay: the texture as it is (premultiplied), blended over the
+// picture.
+id<MTLRenderPipelineState> OverlayPipeline(id<MTLDevice> device) {
+  static id<MTLRenderPipelineState> pso;
+  if (pso) {
+    return pso;
+  }
+  NSString* source = @"#include <metal_stdlib>\n"
+                      "using namespace metal;\n"
+                      "struct V { float4 p [[position]]; float2 uv; };\n"
+                      "vertex V vs(uint id [[vertex_id]]) {\n"
+                      "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                      "  V v; v.p = float4(uv * 2.0 - 1.0, 0.0, 1.0); v.uv = float2(uv.x, 1.0 - uv.y); return v; }\n"
+                      "fragment float4 ps(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+                      "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+                      "  return t.sample(s, in.uv); }\n";
+  NSError* error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+  if (!library) {
+    REXLOG_WARN("[native] touch overlay shader: {}", error.localizedDescription.UTF8String);
+    return nil;
+  }
+  MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+  desc.vertexFunction = [library newFunctionWithName:@"vs"];
+  desc.fragmentFunction = [library newFunctionWithName:@"ps"];
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  desc.colorAttachments[0].blendingEnabled = YES;
+  desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  if (!pso) REXLOG_WARN("[native] touch overlay pipeline: {}", error.localizedDescription.UTF8String);
+  return pso;
+}
+id<MTLRenderPipelineState> PresentPipeline(id<MTLDevice> device) {
+  static id<MTLRenderPipelineState> pso;
+  if (pso) {
+    return pso;
+  }
+  NSString* source = @"#include <metal_stdlib>\n"
+                      "using namespace metal;\n"
+                      "struct V { float4 p [[position]]; float2 uv; };\n"
+                      "vertex V vs(uint id [[vertex_id]], constant float4& fit [[buffer(0)]]) {\n"
+                      "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                      "  V v; v.p = float4((uv * 2.0 - 1.0) * fit.xy, 0.0, 1.0); v.uv = float2(uv.x, 1.0 - uv.y); return v; }\n"
+                      "fragment float4 ps(V in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+                      "                   constant float4& crop [[buffer(0)]]) {\n"
+                      "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+                      "  return float4(t.sample(s, in.uv * crop.xy).rgb, 1.0); }\n";
+  NSError* error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+  if (!library) {
+    REXLOG_WARN("[native] present shader: {}", error.localizedDescription.UTF8String);
+    return nil;
+  }
+  MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+  desc.vertexFunction = [library newFunctionWithName:@"vs"];
+  desc.fragmentFunction = [library newFunctionWithName:@"ps"];
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  return pso;
+}
+
+// FXAA (Timothy Lottes' FXAA 3.11, quality version, as commonly written out)
+// over the final picture: the native renderer's own, as the emulated
+// renderer's swap_post_effect. Into a texture the size of the picture.
+// Vertex: crop = the picture's rectangle in its texture (uv scale). Fragment:
+// p.xy = 1 / texture size, p.zw = the last uv inside the picture; q.x = the
+// edge threshold, q.y = the sub-pixel amount.
+id<MTLRenderPipelineState> FxaaPipeline(id<MTLDevice> device, MTLPixelFormat format) {
+  static std::map<MTLPixelFormat, id<MTLRenderPipelineState>> psos;
+  if (auto it = psos.find(format); it != psos.end()) return it->second;
+  NSString* source =
+      @"#include <metal_stdlib>\n"
+       "using namespace metal;\n"
+       "struct V { float4 p [[position]]; float2 uv; };\n"
+       "vertex V vs(uint id [[vertex_id]], constant float4& crop [[buffer(0)]]) {\n"
+       "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+       "  V v; v.p = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0); v.uv = uv * crop.xy; return v; }\n"
+       "struct P { float4 p; float4 q; };\n"
+       "static float L(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+       "fragment float4 ps(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant P& k [[buffer(0)]]) {\n"
+       "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+       "  const float2 r = k.p.xy, hi = k.p.zw;\n"
+       "#define S(x) t.sample(s, clamp((x), float2(0.0), hi)).rgb\n"
+       "  float2 uv = in.uv;\n"
+       "  float3 cM = S(uv); float lM = L(cM);\n"
+       "  float lN = L(S(uv + float2(0, -r.y))), lS = L(S(uv + float2(0, r.y)));\n"
+       "  float lW = L(S(uv + float2(-r.x, 0))), lE = L(S(uv + float2(r.x, 0)));\n"
+       "  float lMin = min(lM, min(min(lN, lS), min(lW, lE))), lMax = max(lM, max(max(lN, lS), max(lW, lE)));\n"
+       "  float range = lMax - lMin;\n"
+       "  if (range < max(0.0312, lMax * k.q.x)) return float4(cM, 1.0);\n"
+       "  float lNW = L(S(uv + float2(-r.x, -r.y))), lNE = L(S(uv + float2(r.x, -r.y)));\n"
+       "  float lSW = L(S(uv + float2(-r.x, r.y))), lSE = L(S(uv + float2(r.x, r.y)));\n"
+       "  float lNS = lN + lS, lWE = lW + lE;\n"
+       "  float eH = abs(-2.0 * lW + lNW + lSW) + abs(-2.0 * lM + lNS) * 2.0 + abs(-2.0 * lE + lNE + lSE);\n"
+       "  float eV = abs(-2.0 * lN + lNW + lNE) + abs(-2.0 * lM + lWE) * 2.0 + abs(-2.0 * lS + lSW + lSE);\n"
+       "  bool horz = eH >= eV;\n"
+       "  float l1 = horz ? lN : lW, l2 = horz ? lS : lE;\n"
+       "  float g1 = l1 - lM, g2 = l2 - lM;\n"
+       "  bool steep1 = abs(g1) >= abs(g2);\n"
+       "  float gs = 0.25 * max(abs(g1), abs(g2));\n"
+       "  float step = horz ? r.y : r.x;\n"
+       "  float lLocal;\n"
+       "  if (steep1) { step = -step; lLocal = 0.5 * (l1 + lM); } else { lLocal = 0.5 * (l2 + lM); }\n"
+       "  float2 c = uv; if (horz) c.y += step * 0.5; else c.x += step * 0.5;\n"
+       "  float2 off = horz ? float2(r.x, 0) : float2(0, r.y);\n"
+       "  float2 u1 = c - off, u2 = c + off;\n"
+       "  float e1 = L(S(u1)) - lLocal, e2 = L(S(u2)) - lLocal;\n"
+       "  bool d1 = abs(e1) >= gs, d2 = abs(e2) >= gs;\n"
+       "  const float Q[10] = {1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 4.0, 8.0};\n"
+       "  for (int i = 0; i < 10 && !(d1 && d2); ++i) {\n"
+       "    if (!d1) { u1 -= off * Q[i]; e1 = L(S(u1)) - lLocal; d1 = abs(e1) >= gs; }\n"
+       "    if (!d2) { u2 += off * Q[i]; e2 = L(S(u2)) - lLocal; d2 = abs(e2) >= gs; }\n"
+       "  }\n"
+       "  float dist1 = horz ? uv.x - u1.x : uv.y - u1.y, dist2 = horz ? u2.x - uv.x : u2.y - uv.y;\n"
+       "  bool dir1 = dist1 < dist2;\n"
+       "  float pix = -min(dist1, dist2) / (dist1 + dist2) + 0.5;\n"
+       "  bool correct = ((dir1 ? e1 : e2) < 0.0) != (lM < lLocal);\n"
+       "  float fo = correct ? pix : 0.0;\n"
+       "  float lAvg = (1.0 / 12.0) * (2.0 * (lNS + lWE) + lNW + lSW + lNE + lSE);\n"
+       "  float sp1 = clamp(abs(lAvg - lM) / range, 0.0, 1.0);\n"
+       "  float sp2 = (-2.0 * sp1 + 3.0) * sp1 * sp1;\n"
+       "  fo = max(fo, sp2 * sp2 * k.q.y);\n"
+       "  float2 f = uv; if (horz) f.y += fo * step; else f.x += fo * step;\n"
+       "  return float4(S(f), 1.0); }\n";
+  NSError* error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+  id<MTLRenderPipelineState> pso = nil;
+  if (!library) {
+    REXLOG_WARN("[native] FXAA shader: {}", error.localizedDescription.UTF8String);
+  } else {
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.vertexFunction = [library newFunctionWithName:@"vs"];
+    desc.fragmentFunction = [library newFunctionWithName:@"ps"];
+    desc.colorAttachments[0].pixelFormat = format;
+    pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!pso) REXLOG_WARN("[native] FXAA pipeline: {}", error.localizedDescription.UTF8String);
+  }
+  psos[format] = pso;
+  return pso;
+}
+
+struct CubeTarget {
+  uint32_t base, width, height, face_stride;
+};
+
+// Binding descriptors can differ in filtering or swizzle while naming the
+// same cube storage. Keep those bindings, but assemble that storage once.
+// If a base has conflicting layouts, preserve every entry and its order.
+size_t ConsolidateCubeTargets(std::vector<CubeTarget>& targets) {
+  std::vector<CubeTarget> unique;
+  unique.reserve(targets.size());
+  for (const CubeTarget& target : targets) {
+    const auto same_layout = [&](const CubeTarget& other) {
+      return target.width == other.width && target.height == other.height &&
+             target.face_stride == other.face_stride;
+    };
+    const bool conflict = std::any_of(targets.begin(), targets.end(), [&](const CubeTarget& other) {
+      return other.base == target.base && !same_layout(other);
+    });
+    const bool duplicate = !conflict && std::any_of(unique.begin(), unique.end(), [&](const CubeTarget& other) {
+      return other.base == target.base && same_layout(other);
+    });
+    if (!duplicate) unique.push_back(target);
+  }
+  const size_t removed = targets.size() - unique.size();
+  targets.swap(unique);
+  return removed;
+}
+
+bool NativeRenderUtility() {
+  static const bool enabled = REXCVAR_GET(nfsmw_native_render_utility);
+  return enabled;
+}
+
+void RenderFrame(std::unique_ptr<Frame> frame, uint32_t number, bool present, bool dump) {
+  // RenderFrame is called on the renderer's serial dispatch queue. Accumulate
+  // the game-thread capture diagnostics here so the hot draw path stays local.
+  static VertexDiagnostics vertex_diagnostics;
+  if (!dump) vertex_diagnostics += frame->vertex_diagnostics;
+  // Entry samples describe the executing worker, not core affinity or QoS
+  // throughout the frame. The OS can still promote work to resolve dependencies.
+  static uint64_t render_qos_entries[6] = {};
+  if (!dump) {
+    size_t slot = 5;
+    switch (qos_class_self()) {
+      case QOS_CLASS_UTILITY: slot = 0; break;
+      case QOS_CLASS_DEFAULT: slot = 1; break;
+      case QOS_CLASS_USER_INITIATED: slot = 2; break;
+      case QOS_CLASS_USER_INTERACTIVE: slot = 3; break;
+      case QOS_CLASS_BACKGROUND: slot = 4; break;
+      default: break;
+    }
+    ++render_qos_entries[slot];
+  }
+  const auto render_start = std::chrono::steady_clock::now();
+  struct RenderTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RenderTimer() {
+      render_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0).count());
+    }
+  } render_timer{render_start};
+  gpu_pool.Reclaim(number);
+  // This frame's pooled buffers and textures: retired when it ends.
+  struct FrameResources {
+    uint32_t number;
+    std::vector<id> objects;
+    ~FrameResources() {
+      for (id o : objects) gpu_pool.Retire(o, number);
+    }
+  } frame_resources{number, {}};
+  auto pooled_buffer = [&](size_t length, MTLResourceOptions options, bool zero = true) {
+    id<MTLBuffer> b = gpu_pool.Buffer(store.device, length, options, zero);
+    frame_resources.objects.push_back(b);
+    return b;
+  };
+  frame_uploads = 0;
+  frame_new_buffers = 0;
+  frame_upload_bytes = 0;
+  frame_upload_us = 0;
+  double drawable_wait_ms = 0;
+  @autoreleasepool {
+    id<MTLDevice> device = store.device;
+    static id<MTLCommandQueue> queue = [device newCommandQueue];
+    bc_queue = queue;  // BC decodes go on the frame's queue (BcDecodeOnGpu)
+    residency::Apply(device, queue);
+    static const bool lazy_diagnostics = REXCVAR_GET(nfsmw_native_lazy_diagnostics);
+    const bool prepare_snapshots = dump || !lazy_diagnostics;
+    const bool compressible_resolves = REXCVAR_GET(nfsmw_native_compressible_resolves);
+    // Same-format swizzles do not require PixelFormatView. That usage would
+    // prohibit lossless compression, even on otherwise eligible textures.
+    const MTLTextureUsage resolve_view_usage = compressible_resolves ? MTLTextureUsageUnknown
+                                                                    : MTLTextureUsagePixelFormatView;
+    struct FrameCapture {
+      bool active;
+      void Finish() {
+        if (active) {
+          active = false;
+          nfsmw::gpu_capture::EndNativeFrame();
+        }
+      }
+      ~FrameCapture() { Finish(); }
+    } capture{nfsmw::gpu_capture::BeginNativeFrame(queue)};
+    ++gpu_frame;
+    if (GpuBufferLookupStatsEnabled()) {
+      ++gpu_buffer_lookup_stats.frames;
+      if (dump) ++gpu_buffer_lookup_stats.snapshot_frames;
+    }
+    gpu_submission_frame = number;
+    SweepGpu();
+
+    // Textures and samplers, and the shaders' descriptor heaps (argument
+    // buffers of resource IDs): 2D textures by index, index 0 a 1x1 white.
+    MTLTextureDescriptor* white_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                          width:1
+                                                                                         height:1
+                                                                                      mipmapped:NO];
+    static id<MTLTexture> white = NewTexture(device, white_desc, "white_desc@4");
+    static bool white_filled = false;
+    if (!white_filled) {
+      const uint32_t white_pixel = 0xFFFFFFFF;
+      [white replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&white_pixel bytesPerRow:4];
+      white_filled = true;
+    }
+    NSMutableArray<id<MTLTexture>>* textures = [NSMutableArray arrayWithObject:white];
+    NSMutableArray<id<MTLSamplerState>>* samplers = [NSMutableArray array];
+    // Match the launcher's anisotropic_override values: -1 uses each Xenos
+    // texture's fetch constant, 0 disables it, and 1..5 select 1x..16x.
+    // Query by name because this cvar is owned by the Vulkan GPU plugin and
+    // the native renderer lives in the app binary.
+    const int32_t anisotropic_override = rex::cvar::Query<int32_t>("anisotropic_override");
+    // Cube and 3D textures go to their own heaps (index 0 a placeholder);
+    // their slot in the 2D list holds white so indices stay aligned.
+    NSMutableArray<id<MTLTexture>>* cubes = [NSMutableArray array];
+    std::vector<uint32_t> cube_index(frame->textures.size(), 0);
+    NSMutableArray<id<MTLTexture>>* volumes = [NSMutableArray array];
+    std::vector<uint32_t> volume_index(frame->textures.size(), 0);
+    for (size_t i = 0; i < frame->textures.size(); ++i) {
+      const Texture& t = *frame->textures[i];
+      id<MTLTexture> tex = GpuTextureFor(device, frame->textures[i]);
+      if (tex && t.volume) {
+        [volumes addObject:tex];
+        volume_index[i] = uint32_t(volumes.count);  // 0 is the placeholder
+        tex = nil;
+      } else if (tex && t.cube) {
+        [cubes addObject:tex];
+        cube_index[i] = uint32_t(cubes.count);
+        tex = nil;
+      }
+      [textures addObject:tex ?: white];
+      uint32_t anisotropy = 1;
+      if (t.linear_filter && !t.cube && !t.volume) {
+        const uint32_t fetch_anisotropy = uint32_t(t.aniso_filter);
+        const uint32_t selected = anisotropic_override < 0
+                                      ? fetch_anisotropy
+                                      : anisotropic_override == 0
+                                            ? 0u
+                                            : uint32_t(std::min(anisotropic_override, 5));
+        if (selected >= uint32_t(xenos::AnisoFilter::kMax_1_1) &&
+            selected <= uint32_t(xenos::AnisoFilter::kMax_16_1)) {
+          anisotropy = 1u << (selected - uint32_t(xenos::AnisoFilter::kMax_1_1));
+        }
+      }
+      [samplers addObject:SamplerFor(device, t.linear_filter || t.cube || t.volume, t.clamp_x, t.clamp_y,
+                                     t.cube || t.volume, anisotropy, t.mip_filter)];
+    }
+    [samplers insertObject:SamplerFor(device, true, 2, 2, false) atIndex:0];
+    BcFlush();  // the frame's BC decodes run before the frame
+
+    auto heap = [&](NSArray* objects, bool are_samplers) {
+      // Room for the textures resolves make while the frame is encoded.
+      id<MTLBuffer> b = pooled_buffer((std::max<NSUInteger>(objects.count, 1) + frame->resolves.size() * 4 +
+                                       frame->textures.size() * 2) * 8,
+                                      MTLResourceStorageModeShared);
+      auto* ids = static_cast<MTLResourceID*>(b.contents);
+      for (NSUInteger i = 0; i < objects.count; ++i) {
+        ids[i] = are_samplers ? [(id<MTLSamplerState>)objects[i] gpuResourceID]
+                              : [(id<MTLTexture>)objects[i] gpuResourceID];
+      }
+      return b;
+    };
+    id<MTLBuffer> texture_heap = heap(textures, false);
+    id<MTLBuffer> sampler_heap = heap(samplers, true);
+    {
+      // The resolves (and their views) get heap indices past the frame's
+      // textures, and draws use the same index for the sampler: those sampler
+      // entries were left 0, no sampler. The A19 and M4 sample with defaults
+      // anyway; the A16 (iPhone 14 Pro Max) and the M1 read black: the whole
+      // scene, which reaches the screen through resolves, was black there.
+      // A linear, clamped sampler in every entry past the textures'.
+      id<MTLSamplerState> resolve_sampler = SamplerFor(device, true, 2, 2, false);
+      auto* ids = static_cast<MTLResourceID*>(sampler_heap.contents);
+      const NSUInteger capacity = sampler_heap.length / sizeof(MTLResourceID);
+      for (NSUInteger i = samplers.count; i < capacity; ++i) ids[i] = resolve_sampler.gpuResourceID;
+    }
+    // Array, 3D and cube textures: not decoded yet; every index reads a 1x1
+    // placeholder of the right type (a heap of one entry is enough: all the
+    // indices of those types are 0).
+    // Filled with black: a texture that is missing must not show garbage.
+    auto dummy = [&](MTLTextureType type) {
+      // Built the canonical way for each type (a cube from its own factory):
+      // the A16 (iPhone 14 Pro Max) aborted in MTLTextureDescriptor
+      // validation on the hand-filled 1x1 cube descriptor.
+      MTLTextureDescriptor* desc = nil;
+      if (type == MTLTextureTypeCube) {
+        desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                     size:1
+                                                                mipmapped:NO];
+      } else {
+        desc = [MTLTextureDescriptor new];
+        desc.textureType = type;
+        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.width = desc.height = 1;
+        desc.depth = 1;
+        desc.arrayLength = 1;
+      }
+      desc.usage = MTLTextureUsageShaderRead;
+      desc.storageMode = MTLStorageModeShared;
+      id<MTLTexture> tex = NewTexture(device, desc, "desc@5");
+      const uint32_t black = 0xFF000000;
+      const NSUInteger slices = type == MTLTextureTypeCube ? 6 : 1;
+      for (NSUInteger s = 0; s < slices; ++s) {
+        [tex replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:s withBytes:&black
+               bytesPerRow:4 bytesPerImage:4];
+      }
+      return tex;
+    };
+    static id<MTLTexture> dummy_array = dummy(MTLTextureType2DArray);
+    static id<MTLTexture> dummy_volume = dummy(MTLTextureType3D);
+    static id<MTLTexture> dummy_cube = dummy(MTLTextureTypeCube);
+    static id<MTLTexture> grey_volume = [&] {  // the 3D texture test: mid grey
+      id<MTLTexture> t = dummy(MTLTextureType3D);
+      const uint32_t grey = 0xFF808080;
+      [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&grey
+           bytesPerRow:4 bytesPerImage:4];
+      residency::Add(t);
+      return t;
+    }();
+    static const bool dummies_resident = [] {
+      residency::Add(dummy_array);
+      residency::Add(dummy_volume);
+      residency::Add(dummy_cube);
+      return true;
+    }();
+    (void)dummies_resident;
+    id<MTLBuffer> array_heap = heap(@[ dummy_array ], false);
+    [volumes insertObject:dummy_volume atIndex:0];
+    [volumes addObject:grey_volume];  // last: the 3D texture test's index
+    const uint32_t grey_volume_index = uint32_t(volumes.count - 1);
+    id<MTLBuffer> volume_heap = heap(volumes, false);
+    [cubes insertObject:dummy_cube atIndex:0];
+    id<MTLBuffer> cube_heap = heap(cubes, false);
+    static id<MTLBuffer> zeros = [device newBufferWithLength:1 << 16 options:MTLResourceStorageModeShared];
+    static const bool zeros_resident = (residency::Add(zeros), true);
+    (void)zeros_resident;
+
+    // Per-draw data in one shared buffer: VS constants, PS constants, shared
+    // constants, vertex attributes, indices.
+    // Constants: the registers the draw's shader reads, uploaded again only
+    // when they are not already (the same set, a range that covers them).
+    static const bool fused_upload_sizing = REXCVAR_GET(nfsmw_native_fused_upload_sizing);
+    struct UploadedConstants {
+      const void* set = nullptr;
+      std::pair<uint16_t, uint16_t> range{0, 0};
+      size_t at = 0;
+      bool Covers(const void* s, std::pair<uint16_t, uint16_t> r) const {
+        return r.first >= r.second || (set == s && range.first <= r.first && r.second <= range.second);
+      }
+    };
+    size_t total = 0;
+    {
+      UploadedConstants vs, ps, previous_vs;
+      // Keep the budget arithmetic in each loop instead of a call per draw.
+      auto size_constants = [&](const Draw& d) __attribute__((always_inline)) {
+        if (!vs.Covers(d.vs_constants.get(), d.vs_range)) {
+          total += (d.vs_range.second - d.vs_range.first) * 16 + 256;
+          vs = {d.vs_constants.get(), d.vs_range};
+        }
+        if (d.previous_vs_constants && !previous_vs.Covers(d.previous_vs_constants.get(), d.vs_range)) {
+          total += (d.vs_range.second - d.vs_range.first) * 16 + 256;
+          previous_vs = {d.previous_vs_constants.get(), d.vs_range};
+        }
+        if (!ps.Covers(d.ps_constants.get(), d.ps_range)) {
+          total += (d.ps_range.second - d.ps_range.first) * 16 + 256;
+          ps = {d.ps_constants.get(), d.ps_range};
+        }
+      };
+      auto size_geometry = [&](const Draw& d) __attribute__((always_inline)) {
+        total += 1024 + 256 + (d.indices_fresh ? d.index_count() * 4 + 256 : 0);
+        for (const Attribute& a : d.attributes) {
+          if (a.fresh && a.values) total += a.values->size() * 4 + 256;
+        }
+      };
+      // Only the budget calculation is fused. The same per-stage coverage
+      // state and byte allowances size the same buffer; put() below still
+      // writes every upload in the original encoding order.
+      if (fused_upload_sizing) {
+        for (const Draw& d : frame->draws) {
+          size_constants(d);
+          size_geometry(d);
+        }
+      } else {
+        for (const Draw& d : frame->draws) size_constants(d);
+        for (const Draw& d : frame->draws) size_geometry(d);
+      }
+    }
+    // Every byte read from it is written by put() first: not zeroed.
+    id<MTLBuffer> data = pooled_buffer(std::max<size_t>(total, 256), MTLResourceStorageModeShared, false);
+    uint8_t* cursor = static_cast<uint8_t*>(data.contents);
+    size_t used = 0;
+    enum UploadKind { kConstantUpload, kSharedUpload, kVertexUpload, kIndexUpload, kUploadKinds };
+    uint64_t upload_bytes[kUploadKinds] = {}, upload_padding = 0;
+    UploadedConstants uploaded_vs, uploaded_ps, uploaded_previous_vs;
+    // What the current encoder already has set: a draw sets only what differs
+    // from the draw before (each set costs the driver; most draws in a pass
+    // share their pipeline, depth state, viewport and vertex buffers, and the
+    // cached arrays share a few large buffers, so mostly only the offset
+    // changes). Reset with each new encoder.
+    struct EncoderState {
+      __unsafe_unretained id<MTLRenderCommandEncoder> enc = nil;
+      __unsafe_unretained id<MTLRenderPipelineState> pso = nil;
+      __unsafe_unretained id<MTLDepthStencilState> ds = nil;
+      bool viewport_set = false, scissor_set = false, push_set = false;
+      uint32_t stencil_ref = 0;  // a new encoder's
+      MTLViewport viewport{};
+      MTLScissorRect scissor{};
+      uint64_t push[4] = {};
+      __unsafe_unretained id<MTLBuffer> vb[31] = {};
+      NSUInteger vb_offset[31] = {};
+      void For(id<MTLRenderCommandEncoder> e) {
+        if (e == enc) return;
+        *this = EncoderState{};
+        enc = e;
+      }
+      void VertexBuffer(id<MTLBuffer> b, NSUInteger offset, NSUInteger index) {
+        if (vb[index] == b) {
+          if (vb_offset[index] != offset) {
+            [enc setVertexBufferOffset:offset atIndex:index];
+            vb_offset[index] = offset;
+          }
+          return;
+        }
+        [enc setVertexBuffer:b offset:offset atIndex:index];
+        vb[index] = b;
+        vb_offset[index] = offset;
+      }
+    } state;
+    uint32_t last_shared[256];
+    size_t last_shared_at = 0;
+    bool have_last_shared = false;
+    auto put = [&](const void* bytes, size_t size, UploadKind kind) {
+      const size_t aligned = (used + 255) & ~size_t(255);
+      upload_padding += aligned - used;
+      upload_bytes[kind] += size;
+      used = aligned;
+      std::memcpy(cursor + used, bytes, size);
+      const size_t at = used;
+      used += size;
+      return at;
+    };
+
+    // Render targets: one per EDRAM colour base + pitch + format; the height
+    // from the largest scissor bottom of their draws.
+    // Kept across frames: recreated only when a size or format changes.
+    static std::map<std::string, Target> targets;
+    for (auto& [key, t] : targets) {
+      t.used = false;
+      t.clear_color = t.clear_depth = false;
+      t.draws = 0;
+      t.depth_generation = 0;
+      t.depth_audit_defined = false;
+    }
+    std::map<std::string, std::pair<uint32_t, uint32_t>> sizes;  // this frame's pitch, height (guest pixels)
+    std::map<std::string, uint32_t> sample_counts;
+    // Depth-only draws per target (no colour written): a target drawn mostly
+    // that way is a shadow map, kept at 1x unless nfsmw_native_scale_shadows
+    // (a 1600 x 1600 map is 3200 x 3200 at 2x, for little visible gain).
+    std::map<std::string, uint32_t> depth_only_draws;
+    std::map<std::string, std::string> second_of;  // MRT: the second target's first target
+    const float resolution_scale = NativeResolutionScale();
+    const bool msaa_disabled = rex::cvar::Query<bool>("gpu_sin_msaa");
+    const int32_t configured_maximum = rex::cvar::Query<int32_t>("gpu_msaa_muestras");
+    const uint32_t maximum_samples = configured_maximum >= 4 ? 4u : configured_maximum >= 2 ? 2u : 1u;
+    const int32_t forced_setting = REXCVAR_GET(nfsmw_native_force_msaa);
+    const uint32_t forced_samples = msaa_disabled ? 1u : forced_setting >= 4 ? 4u : forced_setting >= 2 ? 2u : 1u;
+    static bool settings_logged = false;
+    if (!settings_logged) {
+      settings_logged = true;
+      REXLOG_INFO("[native] internal resolution {:.3f}x (setting {}), MSAA {} (up to {}x)", resolution_scale,
+                  REXCVAR_GET(nfsmw_native_resolution_scale),
+                  msaa_disabled ? "off" : "from game targets", maximum_samples);
+      if (forced_samples > 1) {
+        REXLOG_INFO("[native] MSAA {}x forced on the scene where the game draws without", forced_samples);
+      }
+    }
+    // A new scale while playing (hot phone, battery.mm): the targets below are
+    // made again at its size.
+    static float last_scale = resolution_scale;
+    if (resolution_scale != last_scale) {
+      REXLOG_INFO("[native] internal resolution now {:.3f}x (was {:.3f}x)", resolution_scale, last_scale);
+      last_scale = resolution_scale;
+    }
+    // A target per pass: each time the render target registers change, a
+    // fresh image (the shadow map and the final UI pass share colour base,
+    // pitch and depth buffer). A pass resumed later is not merged yet.
+    std::vector<uint32_t> pass_of(frame->draws.size());
+    {
+      uint32_t pass = 0;
+      for (size_t i = 0; i < frame->draws.size(); ++i) {
+        const Draw& d = frame->draws[i];
+        if (i && (d.surface_info != frame->draws[i - 1].surface_info ||
+                  d.color_info != frame->draws[i - 1].color_info ||
+                  d.depth_info != frame->draws[i - 1].depth_info)) {
+          ++pass;
+        }
+        pass_of[i] = pass;
+      }
+    }
+    size_t draw_number = 0;
+    auto target_key = [&](const Draw& d) {
+      const size_t i = &d - frame->draws.data();
+      (void)draw_number;
+      // Keyed by EDRAM location, shared across the frame like the console's
+      // EDRAM: a resolve copies everything drawn there since its last clear
+      // (pass_of is kept for the log only).
+      (void)pass_of[i];
+      return EdramKey(d.surface_info, d.color_info, d.depth_info);
+    };
+    const bool reuse_target_lookup = TargetLookupEnabled();
+    const bool reuse_pipeline_lookup = PipelineLookupEnabled();
+    TargetLookupCache setup_target_lookup;
+    // Draws in a row mostly share their target (same surface, colour and
+    // depth info): its key, map entries and sample count found once per run
+    // of draws. Map entries stay valid as the maps grow (node-based).
+    const Draw* setup_prev = nullptr;
+    std::string setup_key;
+    Target* setup_target = nullptr;
+    std::pair<uint32_t, uint32_t>* setup_size = nullptr;
+    uint32_t* setup_depth_only = nullptr;
+    for (const Draw& d : frame->draws) {
+      if (!setup_prev || setup_prev->surface_info != d.surface_info || setup_prev->color_info != d.color_info ||
+          setup_prev->depth_info != d.depth_info) {
+        setup_key = target_key(d);
+        setup_target = &setup_target_lookup.Find(targets, setup_key, reuse_target_lookup);
+        setup_size = &sizes[setup_key];
+        setup_depth_only = nullptr;
+        sample_counts[setup_key] = NativeSampleCount(device, d.surface_info, msaa_disabled, maximum_samples);
+      }
+      setup_prev = &d;
+      const std::string& key = setup_key;
+      Target& t = *setup_target;
+      auto& size = *setup_size;
+      size.first = std::max<uint32_t>(d.surface_info & 0x3FFF, 1);
+      if ((d.color_mask & 0xF) == 0) {
+        if (!setup_depth_only) setup_depth_only = &depth_only_draws[key];
+        ++*setup_depth_only;
+      }
+      // The height: the viewport's bottom (the scissor is often the whole
+      // EDRAM range).
+      const float viewport_bottom = ((d.vte & 8) ? d.viewport[3] : 0.0f) + std::fabs((d.vte & 4) ? d.viewport[2] : 1.0f);
+      const uint32_t bottom = viewport_bottom >= 16 ? uint32_t(std::ceil(viewport_bottom)) : d.scissor[3];
+      size.second = std::max(size.second, std::min<uint32_t>(bottom, 2048));
+      t.draws++;
+      t.format = (d.color_info >> 16) & 0xF;
+      if (d.second_target) {
+        const std::string key1 = EdramKey(d.surface_info, d.color1_info, d.depth_info);
+        Target& t1 = targets[key1];
+        auto& size1 = sizes[key1];
+        size1.first = size.first;
+        size1.second = std::max(size1.second, size.second);
+        t1.draws++;
+        t1.format = (d.color1_info >> 16) & 0xF;
+        sample_counts[key1] = sample_counts[key];
+        second_of[key1] = key;
+      }
+    }
+    // Forced MSAA: on the targets the game draws at 1x that are a scene (640
+    // or more pixels wide, mostly drawn with colour: not a shadow map), and
+    // their second targets. Small targets (reflections, the bloom chain) and
+    // shadow maps keep the game's.
+    if (forced_samples > 1) {
+      for (auto& [key, size] : sizes) {
+        if (second_of.count(key) || sample_counts[key] > 1 || size.first < 640) continue;
+        if (depth_only_draws[key] * 2 > targets[key].draws) continue;
+        uint32_t samples = forced_samples;
+        while (samples > 1 && ![device supportsTextureSampleCount:samples]) samples >>= 1;
+        sample_counts[key] = samples;
+      }
+      for (auto& [key1, key] : second_of) sample_counts[key1] = sample_counts[key];
+    }
+    const bool scale_shadows = REXCVAR_GET(nfsmw_native_scale_shadows);
+    // The environment cube's faces (targets resolved only into a cube) stay at
+    // 1x unless nfsmw_native_scale_reflections, like the 360 draws them: six
+    // 320 x 256 passes were ~1.5 ms of an iPad frame at 1x and ~3 ms at 2x.
+    std::set<std::string> cube_sources, other_sources;
+    if (!REXCVAR_GET(nfsmw_native_scale_reflections)) {
+      // The race's cube is six 2D resolves at the faces of a cube the frame
+      // samples (assembled below, see cube_targets), not cube-slice resolves.
+      std::vector<CubeTarget> sampled_cubes;
+      for (const auto& tp : frame->textures) {
+        if (tp->cube && tp->format == MTLPixelFormatInvalid && tp->width) {
+          const uint32_t w32 = (tp->width + 31) & ~31u;
+          const uint32_t stride = (w32 * 4 * ((tp->height + 31) & ~31u) + 4095) & ~4095u;
+          sampled_cubes.push_back({tp->address, tp->width, tp->height, stride});
+        }
+      }
+      auto into_cube = [&](const ResolveEvent& ev) {
+        if (ev.array) return true;
+        for (const CubeTarget& ct : sampled_cubes) {
+          if (ev.dest_base >= ct.base && (ev.dest_base - ct.base) % ct.face_stride == 0 &&
+              (ev.dest_base - ct.base) / ct.face_stride < 6) {
+            return true;
+          }
+        }
+        return false;
+      };
+      for (const ResolveEvent& ev : frame->resolves) {
+        if (ev.depth) continue;
+        std::string key = EdramKey(ev.surface_info, ev.color_info, ev.depth_info);
+        if (!sizes.count(key) && ev.after_draws > 0 && ev.after_draws <= frame->draws.size()) {
+          key = target_key(frame->draws[ev.after_draws - 1]);  // as the resolve below picks its source
+        }
+        (into_cube(ev) ? cube_sources : other_sources).insert(std::move(key));
+      }
+      for (const std::string& key : other_sources) cube_sources.erase(key);
+      static size_t logged = 0;
+      if (logged < 3 && !cube_sources.empty()) {
+        ++logged;
+        REXLOG_INFO("[native] reflections at 1x: {} environment cube target(s), e.g. {}", cube_sources.size(),
+                    *cube_sources.begin());
+      }
+    }
+    auto scale_of = [&](const std::string& key) -> float {
+      const auto first = second_of.find(key);
+      const std::string& k = first != second_of.end() ? first->second : key;
+      if (cube_sources.count(k)) return 1.0f;
+      const bool shadow = depth_only_draws[k] * 2 > targets[k].draws;
+      if (!shadow) return resolution_scale;
+      const float shadow_scale = std::clamp(float(REXCVAR_GET(nfsmw_native_shadow_scale)), 0.25f, 1.0f);
+      return (scale_shadows ? resolution_scale : 1.0f) * shadow_scale;
+    };
+    for (auto& [key, size] : sizes) {
+      Target& t = targets[key];
+      const float scale = scale_of(key);
+      const uint32_t pitch = Px(size.first, scale);
+      const uint32_t height = std::max<uint32_t>(Px(size.second, scale), 16);
+      t.scale = scale;
+      if (t.color && t.pitch == pitch && t.height == height &&
+          t.color.pixelFormat == ColorFormat(t.format) &&
+          t.requested_sample_count == sample_counts[key]) {
+        continue;  // the same target as the last frame's
+      }
+      // Replaced (another size or format): the old ones leave the residency set.
+      if (t.multisample_color != t.color) residency::Remove(t.multisample_color);
+      if (t.multisample_depth != t.depth) residency::Remove(t.multisample_depth);
+      residency::Remove(t.color);
+      residency::Remove(t.depth);
+      t.pitch = pitch;
+      t.height = height;
+      t.requested_sample_count = sample_counts[key];
+      t.sample_count = sample_counts[key];
+      MTLTextureDescriptor* cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:ColorFormat(t.format)
+                                                                                    width:t.pitch
+                                                                                   height:t.height
+                                                                                mipmapped:NO];
+      cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+      t.color = NewTexture(device, cd, "cd@6");
+      MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                                                    width:t.pitch
+                                                                                   height:t.height
+                                                                                mipmapped:NO];
+      dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;  // depth resolves read it
+      dd.storageMode = MTLStorageModePrivate;
+      t.depth = NewTexture(device, dd, "dd@7");
+      if (t.sample_count > 1) {
+        MTLTextureDescriptor* cm = [MTLTextureDescriptor new];
+        cm.textureType = MTLTextureType2DMultisample;
+        cm.pixelFormat = cd.pixelFormat;
+        cm.width = t.pitch;
+        cm.height = t.height;
+        cm.sampleCount = t.sample_count;
+        cm.usage = MTLTextureUsageRenderTarget;
+        cm.storageMode = MTLStorageModePrivate;
+        MTLTextureDescriptor* dm = [MTLTextureDescriptor new];
+        dm.textureType = MTLTextureType2DMultisample;
+        dm.pixelFormat = dd.pixelFormat;
+        dm.width = t.pitch;
+        dm.height = t.height;
+        dm.sampleCount = t.sample_count;
+        dm.usage = MTLTextureUsageRenderTarget;
+        dm.storageMode = MTLStorageModePrivate;
+        @try {
+          t.multisample_color = NewTexture(device, cm, "cm@8");
+          t.multisample_depth = NewTexture(device, dm, "dm@9");
+        } @catch (NSException* e) {
+          t.multisample_color = nil;
+          t.multisample_depth = nil;
+        }
+        if (!t.multisample_color || !t.multisample_depth) {
+          REXLOG_WARN("[native] {}x MSAA target allocation failed; using 1x for {}", t.sample_count, key);
+          t.sample_count = 1;
+        }
+      }
+      if (t.sample_count == 1) {
+        t.multisample_color = t.color;
+        t.multisample_depth = t.depth;
+      }
+      residency::Add(t.color);
+      residency::Add(t.depth);
+      if (t.multisample_color != t.color) residency::Add(t.multisample_color);
+      if (t.multisample_depth != t.depth) residency::Add(t.multisample_depth);
+    }
+
+    // Motion vectors (MetalFX temporal, or their debug view): on the scene's
+    // target (640+ pixels wide, not a shadow map, the most draws that write
+    // colour and depth), up to its last such draw. Its passes until then
+    // have a fifth colour target with each pixel's motion, drawn by the
+    // shaders' motion entry points; after that draw the scene's depth is
+    // copied for MetalFX (later passes on the target do not keep it).
+    const bool temporal = MetalFxTemporal();
+    const bool motion_debug = REXCVAR_GET(nfsmw_native_motion_debug);
+    std::string motion_key;
+    size_t last_motion_draw = 0;
+    static id<MTLTexture> motion_texture, motion_multisample, motion_depth;
+    bool motion_ready = false;  // this frame's motion and depth are in those
+    if (temporal || motion_debug) {
+      std::map<std::string, uint32_t> scene_draws;
+      auto writes_motion = [&](const Draw& d) {
+        return (d.depth_control & 6) == 6 && (d.color_mask & 0xF) && !store.internal_keys.count(d.vs_key);
+      };
+      // Draws in a row mostly share their target: its key made once.
+      const Draw* keyed = nullptr;
+      std::string keyed_key;
+      auto key_of = [&](const Draw& d) -> const std::string& {
+        if (!keyed || keyed->surface_info != d.surface_info || keyed->color_info != d.color_info ||
+            keyed->depth_info != d.depth_info) {
+          keyed_key = target_key(d);
+        }
+        keyed = &d;
+        return keyed_key;
+      };
+      for (const Draw& d : frame->draws) {
+        if (writes_motion(d)) ++scene_draws[key_of(d)];
+      }
+      uint32_t most = 0;
+      for (const auto& [key, n] : scene_draws) {
+        if (n <= most || sizes[key].first < 640 || second_of.count(key) || depth_only_draws[key] * 2 > targets[key].draws) {
+          continue;
+        }
+        most = n;
+        motion_key = key;
+      }
+      for (size_t i = 0; i < frame->draws.size() && !motion_key.empty(); ++i) {
+        if (writes_motion(frame->draws[i]) && key_of(frame->draws[i]) == motion_key) last_motion_draw = i;
+      }
+      if (!motion_key.empty()) {
+        const Target& t = targets[motion_key];
+        if (!(motion_texture && motion_texture.width == t.pitch && motion_texture.height == t.height &&
+              (t.sample_count > 1 ? motion_multisample && motion_multisample.sampleCount == t.sample_count
+                                  : motion_multisample == motion_texture))) {
+          for (id<MTLTexture> old : {motion_texture, motion_depth}) residency::Remove(old);
+          if (motion_multisample != motion_texture) residency::Remove(motion_multisample);
+          MTLTextureDescriptor* md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kMotionFormat
+                                                                                         width:t.pitch
+                                                                                        height:t.height
+                                                                                     mipmapped:NO];
+          md.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+          md.storageMode = MTLStorageModePrivate;
+          motion_texture = NewTexture(device, md, "motion");
+          motion_multisample = motion_texture;
+          if (t.sample_count > 1) {
+            md.textureType = MTLTextureType2DMultisample;
+            md.sampleCount = t.sample_count;
+            md.usage = MTLTextureUsageRenderTarget;
+            motion_multisample = NewTexture(device, md, "motion msaa");
+          }
+          MTLTextureDescriptor* zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                         width:t.pitch
+                                                                                        height:t.height
+                                                                                     mipmapped:NO];
+          zd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+          zd.storageMode = MTLStorageModePrivate;
+          motion_depth = NewTexture(device, zd, "motion depth");
+          for (id<MTLTexture> made : {motion_texture, motion_depth}) residency::Add(made);
+          if (motion_multisample != motion_texture) residency::Add(motion_multisample);
+          REXLOG_INFO("[native] motion vectors: {} at {}x{}, {}x MSAA", motion_key, t.pitch, t.height, t.sample_count);
+        }
+        if (!motion_texture || !motion_multisample || !motion_depth) motion_key.clear();
+      }
+    }
+    // The jitter of a temporal frame (Halton 2, 3: 8 positions), in the
+    // scene's pixels; each scene draw's position moved by it (MetalFX takes
+    // the samples of several frames as the finer picture's).
+    float jitter[2] = {0, 0};
+    if (temporal && !motion_key.empty() && !metalfx_failed) {
+      auto halton = [](uint32_t i, uint32_t b) {
+        float f = 1, r = 0;
+        for (; i; i /= b) {
+          f /= float(b);
+          r += f * float(i % b);
+        }
+        return r;
+      };
+      const uint32_t phase = number % 8 + 1;
+      jitter[0] = halton(phase, 2) - 0.5f;
+      jitter[1] = halton(phase, 3) - 0.5f;
+    }
+    bool motion_pass = false;  // the current pass draws motion
+    bool motion_cleared = false;
+
+    // A target starts the frame as the game's resolves clear it (they clear
+    // for the next frame): the clear values of the last clearing resolve of
+    // that layout in this frame.
+    for (const ResolveEvent& ev : frame->resolves) {
+      auto it = targets.find(EdramKey(ev.surface_info, ev.color_info, ev.depth_info));
+      if (it == targets.end()) continue;
+      if (ev.clear_color) {
+        const uint32_t c = ev.clear_color_value;
+        it->second.clear_color = true;
+        it->second.clear_color_value = MTLClearColorMake(((c >> 16) & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0,
+                                                         (c & 0xFF) / 255.0, (c >> 24) / 255.0);
+      }
+      if (ev.clear_depth) {
+        it->second.clear_depth = true;
+        it->second.clear_depth_value = double(ev.clear_depth_value >> 8) / double(0xFFFFFF);
+      }
+    }
+
+    // Pipelines by their state (no strings per draw).
+    pipeline_cache.WarmUp(device);
+    pipeline_cache.Collect();
+    const bool async_pipelines = REXCVAR_GET(nfsmw_native_async_pipelines);
+    static std::map<uint32_t, id<MTLDepthStencilState>> depth_states;
+    uint32_t drawn = 0, pipeline_failures = 0, screen_space_game_draws = 0;
+    std::vector<std::string> order;  // targets in order of first use
+
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    // Early commit (nfsmw_native_early_commit): at a pass boundary, once
+    // enough draws are encoded, the command buffer so far goes to the GPU and
+    // the frame continues in a new one on the same queue (same order, same
+    // passes), so the GPU starts while the rest is still being encoded.
+    // Resources are retained by each command buffer; the frame's completion
+    // work stays on the last one, which the queue completes last.
+    static const bool early_commit = REXCVAR_GET(nfsmw_native_early_commit);
+    // At most three per frame, each after at least 250 draws, with at least
+    // 100 left: the reflection and shadow passes go first while the main
+    // scene (most of the draws, one long pass) is still being encoded.
+    const size_t early_commit_draws = 250, early_commit_rest = 100, early_commit_max = 3;
+    size_t early_commit_from = 0;
+    uint32_t early_commits = 0;
+    auto early_gpu_start = std::make_shared<std::atomic<double>>(0.0);
+    // Resolved textures by destination address -> heap index.
+    std::map<uint32_t, uint32_t> resolved;
+    // For sampling a resolve the way the console does: what it swapped in
+    // memory (RB_COPY_DEST_INFO swap) then the fetch constant's swizzle.
+    std::map<uint32_t, id<MTLTexture>> resolved_texture;
+    std::map<uint32_t, bool> resolved_swap;
+    std::map<uint32_t, float> resolved_scale;  // the resolution scale of its source target
+    // (resolved texture, swizzle | swap << 12, width, height) -> heap index:
+    // keyed by the texture, not the address (one address can be resolved
+    // several times in a frame: each resolve is a new texture).
+    std::map<std::tuple<uintptr_t, uint32_t, uint32_t, uint32_t>, uint32_t> resolved_views;
+    // Cubes the frame samples at addresses it resolves to (placeholders):
+    // each face resolved to base + face * face size (the race's environment
+    // map: six 256x256 resolves 0x40000 apart).
+    std::vector<CubeTarget> cube_targets;
+    NSMutableArray<id<MTLTexture>>* assembled_cubes = [NSMutableArray array];  // made resident
+    for (const auto& tp : frame->textures) {
+      if (tp->cube && tp->format == MTLPixelFormatInvalid && tp->width) {
+        const uint32_t w32 = (tp->width + 31) & ~31u;
+        const uint32_t stride = (w32 * 4 * ((tp->height + 31) & ~31u) + 4095) & ~4095u;
+        cube_targets.push_back({tp->address, tp->width, tp->height, stride});
+      }
+    }
+    const size_t cube_binding_count = cube_targets.size();
+    const bool deduplicate_cubes = REXCVAR_GET(nfsmw_native_deduplicate_cubes) && !dump;
+    const size_t cube_duplicates_removed = deduplicate_cubes ? ConsolidateCubeTargets(cube_targets) : 0;
+    uint32_t cube_assembly_copies = 0;
+    // Resolved cubes (faces resolved one by one) by address -> cube heap index.
+    std::map<uint32_t, id<MTLTexture>> resolved_cubes;
+    std::map<uint32_t, uint32_t> resolved_cube_index;
+    // Whether the faces' resolves swapped red and blue in memory (sampled
+    // like 2D resolves: that swap, then the fetch swizzle), and the swizzled
+    // views made for them: (cube, swizzle | swap << 12) -> cube heap index.
+    std::map<uint32_t, bool> resolved_cube_swap;
+    std::map<std::pair<uintptr_t, uint32_t>, uint32_t> cube_views;
+    uint32_t next_cube = uint32_t(cubes.count);
+    const uint32_t cube_capacity = uint32_t(cubes.count + frame->resolves.size() + cube_targets.size());
+    // Cubes kept from earlier frames: bound from the frame's start.
+    for (const CubeTarget& ct : cube_targets) {
+      auto kept = kept_cubes.find(ct.base);
+      if (kept == kept_cubes.end() || next_cube >= cube_capacity) continue;
+      resolved_cubes[ct.base] = kept->second;
+      resolved_cube_swap[ct.base] = kept_cube_swaps[ct.base];
+      [assembled_cubes addObject:kept->second];
+      static_cast<MTLResourceID*>(cube_heap.contents)[next_cube] = kept->second.gpuResourceID;
+      resolved_cube_index[ct.base] = next_cube++;
+    }
+    NSMutableArray<id<MTLTexture>>* resolved_textures = [NSMutableArray array];
+    uint32_t next_heap = uint32_t(textures.count);
+    uint32_t resolves_done = 0, resolves_skipped = 0;
+    std::vector<std::string> resolve_names;  // what each resolve copied, to save
+    std::vector<CGRect> resolve_rects;
+    const NSUInteger heap_capacity = textures.count + frame->resolves.size() * 4 + frame->textures.size() * 2;
+
+    // What each 2D heap index holds (for the snapshot of watched draws' inputs).
+    // Diagnostic-only extra ownership. The actual texture lists and resource
+    // declarations below remain required on ordinary frames.
+    std::vector<id<MTLTexture>> heap_object;
+    if (prepare_snapshots) {
+      heap_object.resize(heap_capacity + 1);
+      for (NSUInteger i = 0; i < textures.count; ++i) heap_object[i] = textures[i];
+    }
+    // Watched draws (snapshot frames only): the first draws of these pixel
+    // shaders save every 2D texture they are given, as Metal sees it.
+    // The wet road, and the car body's two shaders.
+    // Shadow receivers: the wet road and the fence/plant/static shader.
+    static const std::set<uint64_t> watched = {0xaf393d4c46af230cull, 0x684f4711f29b9f77ull};
+    std::map<uint64_t, int> watched_seen;
+    struct WatchSave {
+      id<MTLTexture> texture;
+      std::string name;
+    };
+    std::vector<WatchSave> watch_saves;
+    // Resolves from earlier frames the recording found unchanged: in the
+    // heap from the start (a resolve in this frame replaces them).
+    uint32_t kept_used = 0;
+    for (const auto& tp : frame->textures) {
+      if (!tp->persistent || resolved.count(tp->address)) continue;
+      auto kept = kept_resolves.find(tp->address);
+      if (kept == kept_resolves.end() || next_heap >= heap_capacity || kept->second.texture.textureType != MTLTextureType2D) continue;
+      static_cast<MTLResourceID*>(texture_heap.contents)[next_heap] = kept->second.texture.gpuResourceID;
+      if (prepare_snapshots) heap_object[next_heap] = kept->second.texture;
+      resolved[tp->address] = next_heap++;
+      resolved_texture[tp->address] = kept->second.texture;
+      resolved_swap[tp->address] = kept->second.swap;
+      resolved_scale[tp->address] = kept->second.scale;
+      [resolved_textures addObject:kept->second.texture];
+      if (prepare_snapshots) {
+        resolve_names.push_back("kept");
+        resolve_rects.push_back(CGRectZero);
+      }
+      ++kept_used;
+    }
+    id<MTLTexture> final_texture = nil;
+    CGRect final_rect = CGRectZero;
+    uint32_t final_dest = 0;      // the displayed resolve's guest address
+    uint32_t final_index = 0;     // and which resolve of the frame it was
+    uint32_t color_resolves = 0;
+    int32_t final_guest_width = 0, final_guest_height = 0;  // the displayed resolve's size in guest pixels
+    std::vector<std::string> diagnostics;
+    if (dump) {  // textures read with an exp_adjust (values * 2^n)
+      std::set<std::string> seen;
+      for (const auto& tp : frame->textures) {
+        if (!tp->exp_adjust) continue;
+        const std::string line = fmt::format("group exp_adjust: texture {:08x} {}x{} format {}{} exp_adjust {}", tp->address,
+                                             tp->width, tp->height, int(tp->format),
+                                             tp->format == MTLPixelFormatInvalid ? " (a resolve)" : "", tp->exp_adjust);
+        if (seen.insert(line).second) diagnostics.push_back(line);
+      }
+    }
+    size_t next_resolve = 0;
+
+    id<MTLRenderCommandEncoder> enc = nil;
+    std::string current;
+    // Occlusion queries: each query's draws counted into a slot per pass
+    // (counts are per render pass), summed when the GPU is done.
+    id<MTLBuffer> visibility = nil;
+    struct VisibilitySlot {
+      int query;
+      double divisor;  // samples per guest pixel: scale squared times MSAA samples
+    };
+    std::vector<VisibilitySlot> visibility_slots;
+    std::vector<int> pass_slot(frame->queries.size(), -1);  // in the current pass
+    __unsafe_unretained id<MTLRenderCommandEncoder> visibility_encoder = nil;
+    int visibility_slot = -1;  // the slot the current encoder counts into
+    // Snapshot frames: what each query's draws are, per pass (IPA62, the sun
+    // that is never hidden).
+    struct QueryNote {
+      size_t draws = 0, indices = 0, first = SIZE_MAX, last = 0;
+      std::set<uint64_t> ps;
+      std::set<uint32_t> depth, mask;
+    };
+    std::map<std::pair<int, std::string>, QueryNote> query_notes;
+    if (!frame->queries.empty() && REXCVAR_GET(nfsmw_native_occlusion)) {
+      static id<MTLBuffer> ring[kVisibilityBuffers];
+      const int at = number % kVisibilityBuffers;
+      if (!ring[at]) ring[at] = [device newBufferWithLength:kVisibilitySlots * 8 options:MTLResourceStorageModeShared];
+      std::memset(ring[at].contents, 0, kVisibilitySlots * 8);
+      visibility = ring[at];
+    }
+    size_t pass_indices = 0;  // indices drawn in the current pass (see nfsmw_native_pass_split_indices)
+    uint32_t pass_splits = 0;
+    uint32_t stores_discarded = 0;  // passes that wrote out nothing unread
+    uint32_t sky_deferred = 0, sky_covered_draws = 0;  // the sky drawn last: times, solid draws before it
+    const size_t split_after = size_t(std::max(REXCVAR_GET(nfsmw_native_pass_split_indices), 0));
+    std::vector<__unsafe_unretained id<MTLResource>> resident;  // the arrays above keep them alive
+    std::map<std::string, std::pair<size_t, size_t>> groups;  // snapshot: draw groups of the pass (first draw, count)
+    std::string group_target;
+    __unsafe_unretained id<MTLRenderCommandEncoder> clip_mode_encoder = nil;  // the depth clip mode set on
+    __unsafe_unretained id<MTLRenderCommandEncoder> bias_encoder = nil;  // the depth bias set on it:
+    float bias_constant = 0, bias_slope = 0;
+    bool clip_mode_clamp = false;
+    // GPU profile (every frame while hitches are logged, else every 300th; not
+    // in snapshots): a timestamp at the start and end of each pass and blit.
+    // The log lists the costliest of every 300th frame and of slow frames.
+    // One sample buffer per frame in flight.
+    constexpr int kProfileBuffers = 4;
+    static id<MTLCounterSampleBuffer> profile_buffers[kProfileBuffers] = {};
+    static bool profile_checked = false;
+    static MTLTimestamp profile_cpu0 = 0, profile_gpu0 = 0;
+    if (!profile_checked) {
+      profile_checked = true;
+      if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        for (id<MTLCounterSet> set in device.counterSets) {
+          if (![set.name isEqualToString:MTLCommonCounterSetTimestamp]) continue;
+          MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+          sd.counterSet = set;
+          sd.sampleCount = 512;
+          sd.storageMode = MTLStorageModeShared;
+          for (auto& b : profile_buffers) b = [device newCounterSampleBufferWithDescriptor:sd error:nil];
+          [device sampleTimestamps:&profile_cpu0 gpuTimestamp:&profile_gpu0];
+        }
+      }
+      REXLOG_INFO("[native] GPU pass profiling {}", profile_buffers[kProfileBuffers - 1] ? "available" : "not available");
+    }
+    id<MTLCounterSampleBuffer> profile_buffer = profile_buffers[number % kProfileBuffers];
+    const bool profile_report = number % 300 == 150;
+    const bool profile = profile_buffer && !dump && !capture.active && (profile_report || hitch_lines_left.load() > 0);
+    auto profile_labels = std::make_shared<std::vector<std::string>>();
+    auto profile_pass = [&](MTLRenderPassDescriptor* rp, std::string label) {
+      if (!profile || profile_labels->size() >= 255) return;
+      const NSUInteger i = profile_labels->size();
+      rp.sampleBufferAttachments[0].sampleBuffer = profile_buffer;
+      rp.sampleBufferAttachments[0].startOfVertexSampleIndex = 2 * i;
+      rp.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
+      rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+      rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = 2 * i + 1;
+      profile_labels->push_back(std::move(label));
+    };
+    auto new_blit = [&](const char* label) -> id<MTLBlitCommandEncoder> {
+      if (!profile || profile_labels->size() >= 255) return [cb blitCommandEncoder];
+      const NSUInteger i = profile_labels->size();
+      MTLBlitPassDescriptor* bd = [MTLBlitPassDescriptor blitPassDescriptor];
+      bd.sampleBufferAttachments[0].sampleBuffer = profile_buffer;
+      bd.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * i;
+      bd.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * i + 1;
+      profile_labels->push_back(label);
+      return [cb blitCommandEncoderWithDescriptor:bd];
+    };
+    // A colour resolve with an exponent bias: copied by a draw that scales by
+    // 2^bias (a blit cannot). False when there is no bias: the caller blits.
+    auto scaled_copy = [&](id<MTLTexture> from, id<MTLTexture> to, NSUInteger slice, NSUInteger fx, NSUInteger fy,
+                           NSUInteger tx, NSUInteger ty, NSUInteger cw, NSUInteger ch, const ResolveEvent& ev,
+                           const char* label) -> bool {
+      if (!ev.exp_bias || !REXCVAR_GET(nfsmw_native_exp_bias) || !(to.usage & MTLTextureUsageRenderTarget)) {
+        return false;
+      }
+      id<MTLRenderPipelineState> copy = ScaledCopyPipeline(device, to.pixelFormat);
+      if (!copy || !cw || !ch) return false;
+      {
+        static std::set<std::pair<uint32_t, int32_t>> said;
+        if (said.size() < 32 && said.insert({ev.dest_base, ev.exp_bias}).second) {
+          REXLOG_INFO("[native] resolve to {:08x}{}: exponent bias {} (colour x {})", ev.dest_base,
+                      ev.array ? fmt::format(" face {}", ev.slice) : std::string(), ev.exp_bias,
+                      std::ldexp(1.0, ev.exp_bias));
+        }
+      }
+      MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.colorAttachments[0].texture = to;
+      rp.colorAttachments[0].slice = slice;
+      rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+        profile_pass(rp, label);
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      [e setRenderPipelineState:copy];
+      [e setFragmentTexture:from atIndex:0];
+      struct {
+        float scale;
+        float pad;  // int2 is 8-byte aligned in the shader
+        int32_t offset[2];
+      } c = {std::ldexp(1.0f, ev.exp_bias), 0.0f, {int32_t(fx) - int32_t(tx), int32_t(fy) - int32_t(ty)}};
+      [e setFragmentBytes:&c length:sizeof(c) atIndex:0];
+      [e setScissorRect:(MTLScissorRect){tx, ty, cw, ch}];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e endEncoding];
+      return true;
+    };
+    // After the scene's last motion pass (its encoder ended, the next draw
+    // NEXT): its depth copied for MetalFX.
+    auto finish_motion = [&](size_t next) {
+      if (!motion_pass) return;
+      motion_pass = false;
+      if (next <= last_motion_draw || motion_ready) return;
+      id<MTLRenderPipelineState> copy = MotionPipeline(device, false, MTLPixelFormatDepth32Float);
+      const Target& t = targets[motion_key];
+      if (!copy || !t.depth) return;
+      MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.depthAttachment.texture = motion_depth;
+      rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+      rp.depthAttachment.storeAction = MTLStoreActionStore;
+      if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+        profile_pass(rp, "motion: scene depth");
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      static id<MTLDepthStencilState> always;
+      if (!always) {
+        MTLDepthStencilDescriptor* dsd = [MTLDepthStencilDescriptor new];
+        dsd.depthCompareFunction = MTLCompareFunctionAlways;
+        dsd.depthWriteEnabled = YES;
+        always = [device newDepthStencilStateWithDescriptor:dsd];
+      }
+      [e setRenderPipelineState:copy];
+      [e setDepthStencilState:always];
+      [e setFragmentTexture:t.depth atIndex:0];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e endEncoding];
+      motion_ready = true;
+    };
+    // Inspect one frame in 300 without changing any copies. A generation
+    // advances on clears and potentially depth-writing draws. MSAA snapshots
+    // are reported but excluded from reuse candidates for now.
+    const bool depth_audit = !dump && number % 300 == 150;
+    using DepthSnapshot = std::tuple<uintptr_t, uint64_t, NSUInteger, NSUInteger, NSUInteger, NSUInteger,
+                                     NSUInteger, NSUInteger, uint32_t>;
+    std::set<DepthSnapshot> depth_snapshots;
+    uint32_t depth_audit_copies = 0, depth_audit_candidates = 0;
+    auto writebacks = std::make_shared<std::vector<WriteBack>>();
+    std::vector<char> skip_draw, skip_resolve;  // battery: cube faces kept from the frame before (below)
+    auto do_resolve = [&](const ResolveEvent& ev, const Draw& last) {
+      if (!skip_resolve.empty() && skip_resolve[&ev - frame->resolves.data()]) {
+        ++resolves_skipped;
+        return;
+      }
+      // The source: the EDRAM layout in the resolve's own registers (a
+      // thumbnail drawn in another layout may come between the scene and
+      // its resolve); the last draw's target if that layout was not drawn.
+      const std::string own_key = EdramKey(ev.surface_info, ev.color_info, ev.depth_info);
+      auto found = targets.find(own_key);
+      const bool own = found != targets.end() && found->second.color;
+      Target& src = own ? found->second : targets[target_key(last)];
+      if (prepare_snapshots) diagnostics.push_back(fmt::format(
+          "resolve {} after draw {}: ctrl {:08x} ({} rt{}, clear {}{}), reads {} ({}), last draw {}, "
+          "rect {},{}-{},{} -> {:08x} {}x{} swap {} exp {}",
+          resolves_done + resolves_skipped, ev.after_draws, ev.control, ev.depth ? "depth" : "color",
+          ev.control & 3, ev.clear_color ? "C" : "-", ev.clear_depth ? "D" : "-", own_key,
+          own ? "found" : "NOT drawn, using the last draw's", target_key(last), ev.x0, ev.y0, ev.x1, ev.y1,
+          ev.dest_base, ev.dest_pitch, ev.dest_height, ev.swap, ev.exp_bias));
+      [enc endEncoding];
+      enc = nil;
+      current.clear();
+      finish_motion(ev.after_draws);
+      const float scale = src.scale;
+      NSUInteger dw = Px(ev.dest_pitch ? ev.dest_pitch : uint32_t(std::max(ev.x1, 1)), scale);
+      NSUInteger dh = Px(ev.dest_height ? ev.dest_height : uint32_t(std::max(ev.y1, 1)), scale);
+
+      // Edges rounded on their own, so that rectangles side by side meet.
+      const NSUInteger x0 = Px(std::max(ev.x0, 0), scale);
+      const NSUInteger y0 = Px(std::max(ev.y0, 0), scale);
+      const NSUInteger x1 = std::max<NSUInteger>(Px(std::max(ev.x1, 0), scale), x0);
+      const NSUInteger y1 = std::max<NSUInteger>(Px(std::max(ev.y1, 0), scale), y0);
+      const NSUInteger w = std::min({x1 - x0, NSUInteger(src.pitch) - std::min<NSUInteger>(x0, src.pitch),
+                                     dw - std::min(x0, dw)});
+      const NSUInteger h = std::min({y1 - y0, NSUInteger(src.height) - std::min<NSUInteger>(y0, src.height),
+                                     dh - std::min(y0, dh)});
+      if (ev.array && !ev.depth && w && h) {
+        // Into a face of a cube (the race's environment map, from its 320
+        // passes): a Metal cube made at the first face, the face copied.
+        id<MTLTexture> cube = resolved_cubes[ev.dest_base];
+        if (!cube && next_cube < cube_capacity) {
+          MTLTextureDescriptor* cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:src.color.pixelFormat
+                                                                                         size:std::max(w, h)
+                                                                                    mipmapped:NO];
+          cd.usage = MTLTextureUsageShaderRead | resolve_view_usage | MTLTextureUsageRenderTarget;
+          cube = gpu_pool.Texture(device, cd);
+          frame_resources.objects.push_back(cube);
+          resolved_cubes[ev.dest_base] = cube;
+          static_cast<MTLResourceID*>(cube_heap.contents)[next_cube] = cube.gpuResourceID;
+          resolved_cube_index[ev.dest_base] = next_cube++;
+          [resolved_textures addObject:cube];
+          if (prepare_snapshots) {
+            resolve_names.push_back(fmt::format("resolve_{:02}_cube_{}x{}_to_{:08x}", resolves_done, w, h, ev.dest_base));
+            resolve_rects.push_back(CGRectMake(0, 0, w, h));
+          }
+        }
+        if (cube && ev.slice < 6) {
+          resolved_cube_swap[ev.dest_base] = ev.swap;
+          if (scaled_copy(src.color, cube, ev.slice, x0, y0, 0, 0, std::min(w, cube.width), std::min(h, cube.height),
+                          ev, "cube face (exp bias)")) {
+            ++resolves_done;
+          } else {
+          id<MTLBlitCommandEncoder> blit = new_blit("blit: cube face");
+          [blit copyFromTexture:src.color
+                    sourceSlice:0
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(x0, y0, 0)
+                     sourceSize:MTLSizeMake(std::min(w, cube.width), std::min(h, cube.height), 1)
+                      toTexture:cube
+               destinationSlice:ev.slice
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [blit endEncoding];
+          ++resolves_done;
+          }
+        } else {
+          ++resolves_skipped;
+        }
+      } else if (!w || !h || dw > 8192 || dh > 8192 || next_heap >= heap_capacity) {
+        ++resolves_skipped;
+      } else {
+        MTLTextureDescriptor* rd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:(ev.depth ? MTLPixelFormatR32Float : src.color.pixelFormat)
+                                         width:dw
+                                        height:dh
+                                     mipmapped:NO];
+        rd.usage = ev.depth ? (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget)
+                            : (MTLTextureUsageShaderRead | resolve_view_usage);
+        if (!ev.depth && ev.exp_bias && REXCVAR_GET(nfsmw_native_exp_bias)) {
+          rd.usage |= MTLTextureUsageRenderTarget;  // the scaled copy draws into it
+        }
+        id<MTLTexture> dest = nil;
+        // Linear (slow for the GPU to write: a 1600 x 1600 shadow map copy took
+        // 2.5 ms) only when the resolve does not fill its pitch, i.e. when
+        // draws may sample it at a smaller size than the texture.
+        // (In the texture's pixels: the guest rectangle times the scale. In
+        // guest pixels, below 1x a rectangle short of the pitch looked as wide
+        // as the scaled texture: no crop, and the game's coordinates for its
+        // own size read past the picture, a dark bar on the right.)
+        const bool may_crop = Px(std::max(ev.x1 - ev.x0, 0), scale) < dw || Px(std::max(ev.y1 - ev.y0, 0), scale) < dh;
+        if (may_crop) {
+          // Linear, in a buffer, so draws sampling it at a smaller size get a
+          // texture over the same memory (see the binding). Depth too: its
+          // copy is an R32Float colour target (the depth-based post effects
+          // sample it at the scene's size, e.g. 960 in a 1024 pitch).
+          const MTLPixelFormat pf = rd.pixelFormat;
+          const NSUInteger bpp = (pf == MTLPixelFormatRGBA16Float || pf == MTLPixelFormatRG32Float) ? 8 : 4;
+          const NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:pf];
+          const NSUInteger row = (dw * bpp + align - 1) / align * align;
+          rd.storageMode = MTLStorageModePrivate;
+          dest = gpu_pool.Texture(device, rd, row);
+        }
+        if (!dest) {
+          rd.storageMode = MTLStorageModePrivate;
+          dest = gpu_pool.Texture(device, rd);
+        }
+        if (ev.depth) {
+          id<MTLRenderPipelineState> copy = DepthCopyPipeline(device);
+          MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+          rp.colorAttachments[0].texture = dest;
+          rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+          rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 1, 1, 1);
+          rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+          if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+            profile_pass(rp, depth_audit
+                               ? fmt::format("depth copy: {} rect {},{} {}x{} -> {}x{}", own ? own_key : target_key(last),
+                                             x0, y0, w, h, dw, dh)
+                               : "depth copy");
+          id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+          if (copy) {
+            [e setRenderPipelineState:copy];
+            [e setFragmentTexture:src.depth atIndex:0];
+            // The fetch constant's exp_adjust (2^n), applied where the
+            // console's texture fetch applies it: the shadow map's depth is
+            // compared with the receivers' own depth in that scale.
+            float scale = 1.0f;
+            for (const auto& tp : frame->textures) {
+              if (tp->address == ev.dest_base && tp->exp_adjust) {
+                scale = std::ldexp(1.0f, tp->exp_adjust);
+                break;
+              }
+            }
+            if (depth_audit) {
+              uint32_t scale_bits;
+              std::memcpy(&scale_bits, &scale, sizeof(scale_bits));
+              const DepthSnapshot snapshot{uintptr_t((__bridge void*)src.depth), src.depth_generation,
+                                           dw, dh, x0, y0, w, h, scale_bits};
+              const bool identical = src.sample_count == 1 && src.depth_audit_defined &&
+                                     !depth_snapshots.insert(snapshot).second;
+              ++depth_audit_copies;
+              depth_audit_candidates += identical;
+              REXLOG_INFO("[native] depth audit: frame {} source {} generation {} samples {} -> {:08x}, "
+                          "rect {},{} {}x{}, output {}x{}, value scale {}, linear {}, unchanged snapshot {}",
+                          number, own ? own_key : target_key(last), src.depth_generation, src.sample_count,
+                          ev.dest_base, x0, y0, w, h, dw, dh, scale, dest.buffer != nil, identical ? "yes" : "no");
+            }
+            [e setFragmentBytes:&scale length:sizeof(scale) atIndex:0];
+            [e setScissorRect:(MTLScissorRect){x0, y0, w, h}];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          }
+          [e endEncoding];
+        } else {
+          id<MTLBlitCommandEncoder> blit = nil;
+          if (!scaled_copy(src.color, dest, 0, x0, y0, x0, y0, w, h, ev, "resolve copy (exp bias)")) {
+          blit = new_blit("blit: resolve copy");
+          [blit copyFromTexture:src.color
+                    sourceSlice:0
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(x0, y0, 0)
+                     sourceSize:MTLSizeMake(w, h, 1)
+                      toTexture:dest
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(x0, y0, 0)];
+          }
+          // Small 8-bit colour resolves also go to guest memory (WriteBack).
+          // Up to nfsmw_native_writeback_kb: what the game reads on the CPU is
+          // small (the scene's brightness for the exposure); the environment
+          // cube's faces (256 KB each) and the bloom buffer were copied back
+          // too, ~1.3 ms of CPU a frame, for nobody.
+          const size_t writeback_bytes = size_t(ev.dest_pitch) * ev.dest_height * 4;
+          if (ev.dest_format == 6 && dest.pixelFormat == MTLPixelFormatRGBA8Unorm && ev.dest_pitch) {
+            static std::set<uint32_t> said;
+            if (said.size() < 24 && said.insert(ev.dest_base).second) {
+              REXLOG_INFO("[native] resolve {:08x} {}x{} ({} KiB): {} to guest memory", ev.dest_base, ev.dest_pitch,
+                          ev.dest_height, writeback_bytes >> 10,
+                          writeback_bytes <= size_t(REXCVAR_GET(nfsmw_native_writeback_kb)) * 1024 ? "written back"
+                                                                                                  : "not written back");
+            }
+          }
+          if (ev.dest_format == 6 && dest.pixelFormat == MTLPixelFormatRGBA8Unorm && ev.dest_pitch &&
+              writeback_bytes <= size_t(REXCVAR_GET(nfsmw_native_writeback_kb)) * 1024 &&
+              x0 + w <= Px(ev.dest_pitch, scale) && y0 + h <= Px(ev.dest_height, scale)) {
+            const uint32_t row_bytes = uint32_t((w * 4 + 255) & ~NSUInteger(255));
+            id<MTLBuffer> pixels = pooled_buffer(row_bytes * h, MTLResourceStorageModeShared);
+            if (!blit) blit = new_blit("blit: write-back");
+            [blit copyFromTexture:dest
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(x0, y0, 0)
+                       sourceSize:MTLSizeMake(w, h, 1)
+                         toBuffer:pixels
+                destinationOffset:0
+           destinationBytesPerRow:row_bytes
+         destinationBytesPerImage:row_bytes * h];
+            // In guest pixels: the resolve's own rectangle (as far as was copied).
+            const uint32_t gx0 = uint32_t(std::max(ev.x0, 0)), gy0 = uint32_t(std::max(ev.y0, 0));
+            const uint32_t gw = std::min(uint32_t(std::max(ev.x1 - ev.x0, 0)), uint32_t(w / scale));
+            const uint32_t gh = std::min(uint32_t(std::max(ev.y1 - ev.y0, 0)), uint32_t(h / scale));
+            writebacks->push_back({pixels, row_bytes, uint32_t(w), uint32_t(h), ev.dest_base, ev.dest_pitch,
+                                   gx0, gy0, gw, gh, scale, ev.swap, ev.dest_endian});
+          }
+          [blit endEncoding];  // nil when the scaled copy did it and nothing was written back: no-op
+        }
+        static_cast<MTLResourceID*>(texture_heap.contents)[next_heap] = dest.gpuResourceID;
+        // A depth copy (R32Float) where the GPU cannot filter 32-bit floats
+        // (A16, M1): sampled nearest, not linear (undefined there).
+        if (dest.pixelFormat == MTLPixelFormatR32Float && !device.supports32BitFloatFiltering) {
+          static_cast<MTLResourceID*>(sampler_heap.contents)[next_heap] =
+              SamplerFor(device, false, 2, 2, false).gpuResourceID;
+        }
+        if (prepare_snapshots) heap_object[next_heap] = dest;
+        resolved[ev.dest_base] = next_heap++;
+        resolved_texture[ev.dest_base] = dest;
+        resolved_swap[ev.dest_base] = !ev.depth && ev.swap;
+        resolved_scale[ev.dest_base] = scale;
+        // The texture it replaces: back to the pool after this frame (which
+        // may still sample it, from before this resolve).
+        if (auto old = kept_resolves.find(ev.dest_base); old != kept_resolves.end() && old->second.texture != dest) {
+          gpu_pool.Retire(old->second.texture, number);
+        }
+        kept_resolves[ev.dest_base] = {dest, !ev.depth && ev.swap, scale};
+        // A face of a cube the frame samples: also copied into that cube.
+        for (const CubeTarget& ct : cube_targets) {
+          if (ev.dest_base < ct.base || (ev.dest_base - ct.base) % ct.face_stride != 0) continue;
+          const uint32_t face = (ev.dest_base - ct.base) / ct.face_stride;
+          if (face >= 6) continue;
+          id<MTLTexture> cube = resolved_cubes[ct.base];
+          if (cube && (cube.pixelFormat != dest.pixelFormat || cube.width != Px(ct.width, scale))) {
+            cube = nil;  // the kept one no longer matches (another scale or format): a new one
+          }
+          if (!cube && next_cube < cube_capacity) {
+            MTLTextureDescriptor* cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:dest.pixelFormat
+                                                                                           size:Px(ct.width, scale)
+                                                                                      mipmapped:NO];
+            cd.usage = MTLTextureUsageShaderRead | resolve_view_usage;
+            cd.storageMode = MTLStorageModePrivate;
+            cube = NewTexture(device, cd, "cd@10");
+            residency::Add(cube);
+            if (auto old = kept_cubes.find(ct.base); old != kept_cubes.end()) {
+              // Frames in flight keep it alive (their command buffers retain it).
+              residency::Remove(old->second);
+            }
+            kept_cubes[ct.base] = cube;
+            resolved_cubes[ct.base] = cube;
+            [assembled_cubes addObject:cube];
+            static_cast<MTLResourceID*>(cube_heap.contents)[next_cube] = cube.gpuResourceID;
+            resolved_cube_index[ct.base] = next_cube++;
+          }
+          if (cube && cube.pixelFormat == dest.pixelFormat) {
+            resolved_cube_swap[ct.base] = kept_cube_swaps[ct.base] = ev.swap;
+            ++cube_assembly_copies;
+            id<MTLBlitCommandEncoder> blit = new_blit("blit: cube assembly");
+            [blit copyFromTexture:dest
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(x0, y0, 0)
+                       sourceSize:MTLSizeMake(std::min<NSUInteger>(w, cube.width), std::min<NSUInteger>(h, cube.height), 1)
+                        toTexture:cube
+                 destinationSlice:face
+                 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+          }
+        }
+        [resolved_textures addObject:dest];
+        if (!ev.depth) {  // the frame's last colour resolve: what is displayed
+          final_dest = ev.dest_base;
+          final_index = resolves_done;
+          ++color_resolves;
+          final_texture = dest;
+          final_rect = CGRectMake(x0, y0, w, h);
+          final_guest_width = std::max(ev.x1 - ev.x0, 0);
+          final_guest_height = std::max(ev.y1 - ev.y0, 0);
+        }
+        if (prepare_snapshots) {
+          resolve_names.push_back(fmt::format("resolve_{:02}_{}_{}x{}_to_{:08x}", resolves_done,
+                                              ev.depth ? "depth" : "color", w, h, ev.dest_base));
+          resolve_rects.push_back(CGRectMake(x0, y0, w, h));
+        }
+        ++resolves_done;
+      }
+      if (ev.clear_color) {
+        src.clear_color = true;
+        const uint32_t c = ev.clear_color_value;  // A8R8G8B8
+        src.clear_color_value = MTLClearColorMake(((c >> 16) & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0,
+                                                  (c & 0xFF) / 255.0, (c >> 24) / 255.0);
+      }
+      if (ev.clear_depth) {
+        src.clear_depth = true;
+        src.clear_depth_value = double(ev.clear_depth_value >> 8) / double(0xFFFFFF);
+      }
+    };
+    // The cost probe (nfsmw_native_cost_probe): this frame's left-out shader.
+    uint64_t probe_ps = 0;
+    size_t probe_draws = 0;
+    if (REXCVAR_GET(nfsmw_native_cost_probe)) {
+      static bool said = false;
+      if (!said) {
+        said = true;
+        REXLOG_INFO("[cost-probe] on: one pixel shader left out every 60th frame of over 1000 draws");
+      }
+    }
+    if (!dump && REXCVAR_GET(nfsmw_native_cost_probe) && number % 60 == 30 && frame->draws.size() > 1000) {
+      std::unordered_map<uint64_t, size_t> counts;
+      for (const Draw& d : frame->draws) ++counts[d.ps_key];
+      std::vector<std::pair<size_t, uint64_t>> top;
+      for (const auto& [k, c] : counts) top.push_back({c, k});
+      std::sort(top.rbegin(), top.rend());
+      static size_t turn = 0;
+      if (!top.empty()) {
+        const auto& pick = top[turn++ % std::min<size_t>(top.size(), 16)];
+        probe_ps = pick.second;
+        probe_draws = pick.first;
+      }
+    }
+    // What is read after a target's last pass of the frame: every target
+    // starts the next frame cleared (used = false above), so its depth,
+    // stencil and multisample samples are only kept for a later pass, a
+    // depth resolve or the motion copy; else not written out at all
+    // (bandwidth only, the picture is the same). Pass keys here may be
+    // longer than the loop's (a second target it leaves out): that only
+    // ends a pass sooner, which keeps more.
+    const bool discard_unread = REXCVAR_GET(nfsmw_native_discard_unread) && !dump;
+    std::vector<std::string> draw_keys, draw_pass_keys;
+    std::unordered_map<std::string, size_t> last_use;  // target -> its last draw
+    std::unordered_map<std::string, size_t> last_depth_read;  // target -> after_draws of its last depth resolve
+    std::unordered_map<std::string, size_t> last_color_read;  // target -> after_draws of its last colour resolve
+    if (discard_unread) {
+      draw_keys.reserve(frame->draws.size());
+      draw_pass_keys.reserve(frame->draws.size());
+      for (size_t i = 0; i < frame->draws.size(); ++i) {
+        const Draw& d = frame->draws[i];
+        draw_keys.push_back(target_key(d));
+        last_use[draw_keys.back()] = i;
+        if (d.second_target) {
+          const std::string k1 = EdramKey(d.surface_info, d.color1_info, d.depth_info);
+          last_use[k1] = i;
+          draw_pass_keys.push_back(draw_keys.back() + "+" + k1);
+        } else {
+          draw_pass_keys.push_back(draw_keys.back());
+        }
+      }
+      for (const ResolveEvent& ev : frame->resolves) {
+        if (ev.after_draws == 0) continue;
+        const std::string own_key = EdramKey(ev.surface_info, ev.color_info, ev.depth_info);
+        auto found = targets.find(own_key);
+        const bool own = found != targets.end() && found->second.color;
+        const size_t before = std::min<size_t>(ev.after_draws, frame->draws.size()) - 1;
+        if (ev.depth) {
+          last_depth_read[own ? own_key : draw_keys[before]] = ev.after_draws;
+        } else {
+          // Both candidates: the resolve's own layout and the last draw's
+          // target (a second render target's resolve names its own).
+          last_color_read[own_key] = ev.after_draws;
+          last_color_read[draw_keys[before]] = ev.after_draws;
+        }
+      }
+    }
+    // Battery: the environment cube's faces drawn half each frame (even
+    // faces, then odd), the others kept from the frame before in the cube
+    // the renderer keeps. Only once a kept cube exists for that address.
+    if (REXCVAR_GET(nfsmw_native_half_rate_reflections) && !dump && !cube_targets.empty()) {
+      skip_draw.assign(frame->draws.size(), 0);
+      skip_resolve.assign(frame->resolves.size(), 0);
+      size_t from = 0;  // the first draw after the resolve before
+      for (size_t r = 0; r < frame->resolves.size(); ++r) {
+        const ResolveEvent& ev = frame->resolves[r];
+        const size_t upto = std::min<size_t>(ev.after_draws, frame->draws.size());
+        bool skip = false;
+        if (!ev.depth && !ev.array && upto > 0) {
+          for (const CubeTarget& ct : cube_targets) {
+            if (ev.dest_base < ct.base || (ev.dest_base - ct.base) % ct.face_stride != 0) continue;
+            const uint32_t face = (ev.dest_base - ct.base) / ct.face_stride;
+            skip = face < 6 && kept_cubes.count(ct.base) && ((face + number) & 1);
+            break;
+          }
+        }
+        if (skip) {
+          skip_resolve[r] = 1;
+          const std::string own_key = EdramKey(ev.surface_info, ev.color_info, ev.depth_info);
+          auto found = targets.find(own_key);
+          const std::string source = found != targets.end() && found->second.color ? own_key
+                                                                                    : target_key(frame->draws[upto - 1]);
+          for (size_t i = from; i < upto; ++i) {
+            if (target_key(frame->draws[i]) == source) skip_draw[i] = 1;
+          }
+        }
+        from = std::max(from, upto);
+      }
+    }
+    // The sky drawn after the solid geometry that follows it, only where
+    // that left the pixels untouched. The game draws it near the start of a
+    // pass without writing depth, so its 5-texture shader ran on nearly the
+    // whole target, then was mostly painted over. The draws after it, while
+    // they are opaque (no blending, every channel, depth written, no stencil
+    // or alpha to coverage), mark the pixels they write in the stencil
+    // (unused otherwise); the sky then draws where none was marked. There the
+    // depth buffer is what it was at the sky's own place, and the opaque
+    // draws replaced every pixel they wrote: the same picture.
+    std::vector<size_t> draw_order;          // empty: as recorded
+    std::vector<uint8_t> stencil_mode;       // 1: marks, 2: drawn where unmarked
+    std::vector<uint8_t> stencil_ref_of;
+    if (REXCVAR_GET(nfsmw_native_sky_last) && !dump) {
+      constexpr uint64_t kSky = 0xfe510d2d256c173bull;
+      const size_t n = frame->draws.size();
+      auto opaque = [&](const Draw& e) {
+        const bool a2c = !(e.color_control & 8) && (e.color_control & 0x10);
+        return (e.depth_control & 7) == 6 && (e.blend_control & 0x1FFF1FFF) == 0x00010001 &&
+               (e.color_mask & 0xF) == 0xF && !e.second_target && !a2c;
+      };
+      uint8_t next_ref = 0;
+      size_t r = 0;  // resolves before the draw looked at
+      for (size_t i = 0; i < n && next_ref < 255; ++i) {
+        const Draw& sky = frame->draws[i];
+        while (r < frame->resolves.size() && frame->resolves[r].after_draws <= i) ++r;
+        if (sky.ps_key != kSky || (sky.depth_control & 7) != 2 || sky.second_target || sky.query >= 0) continue;
+        const size_t next_event = r < frame->resolves.size() ? frame->resolves[r].after_draws : n;
+        const std::string key = target_key(sky);
+        size_t j = i + 1;
+        while (j < n && j < next_event && opaque(frame->draws[j]) && target_key(frame->draws[j]) == key) ++j;
+        if (j - i < 2) continue;  // nothing solid after it
+        if (draw_order.empty()) {
+          draw_order.resize(n);
+          for (size_t k = 0; k < n; ++k) draw_order[k] = k;
+          stencil_mode.assign(n, 0);
+          stencil_ref_of.assign(n, 0);
+        }
+        const uint8_t ref = ++next_ref;
+        // Positions i..j-1 of the order: the opaque draws, then the sky.
+        for (size_t k = i; k + 1 < j; ++k) {
+          draw_order[k] = k + 1;
+          stencil_mode[k + 1] = 1;
+          stencil_ref_of[k + 1] = ref;
+        }
+        draw_order[j - 1] = i;
+        stencil_mode[i] = 2;
+        stencil_ref_of[i] = ref;
+        sky_deferred += 1;
+        sky_covered_draws += uint32_t(j - i - 1);
+        i = j - 1;
+      }
+    }
+    TargetLookupCache draw_target_lookup;
+    for (size_t position = 0; position < frame->draws.size(); ++position) {
+      const size_t di = draw_order.empty() ? position : draw_order[position];
+      const Draw& d = frame->draws[di];
+      while (next_resolve < frame->resolves.size() && frame->resolves[next_resolve].after_draws <= di) {
+        if (di > 0) {
+          do_resolve(frame->resolves[next_resolve], frame->draws[di - 1]);
+        }
+        ++next_resolve;
+      }
+      if (!skip_draw.empty() && skip_draw[di]) continue;  // a cube face kept from the frame before
+      // The key once per run of draws on the same target (as key_of above).
+      static thread_local const Draw* tk_prev = nullptr;
+      static thread_local std::string tk_cached;
+      if (position == 0 || !tk_prev || tk_prev->surface_info != d.surface_info || tk_prev->color_info != d.color_info ||
+          tk_prev->depth_info != d.depth_info) {
+        tk_cached = target_key(d);
+      }
+      tk_prev = &d;
+      const std::string& tk = tk_cached;
+      if (dump) {
+        // Snapshots: each pass's draws grouped (shaders, viewport, depth,
+        // mask, clipping), with the first draw of each group.
+        if (tk != group_target) {
+          for (const auto& [g, c] : groups) diagnostics.push_back(fmt::format("group {}: {} x {}", group_target, c.second, g + fmt::format(" (first draw {})", c.first)));
+          groups.clear();
+          group_target = tk;
+        }
+        const std::string g = fmt::format("vs {:016x} ps {:016x} vp {:.0f}x{:.0f} at {:.0f},{:.0f} z {:.3f}+{:.3f} vte {:x} zc {:03x} mask {:x} clipoff {} prim {}",
+                                          d.vs_key, d.ps_key, 2 * d.viewport[0], 2 * d.viewport[2], d.viewport[1] - d.viewport[0],
+                                          d.viewport[3] - d.viewport[2], d.viewport[5], d.viewport[4], d.vte, d.depth_control & 0xFFF,
+                                          d.color_mask & 0xF, d.clip_disable, uint32_t(d.primitive));
+        auto& c = groups[g];
+        if (!c.second) c.first = di;
+        ++c.second;
+        if (di + 1 == frame->draws.size()) {
+          for (const auto& [gg, cc] : groups) diagnostics.push_back(fmt::format("group {}: {} x {}", group_target, cc.second, gg + fmt::format(" (first draw {})", cc.first)));
+        }
+      }
+      if (dump && di + 40 >= frame->draws.size()) {  // the post-processing chain, in snapshots
+        std::string tex;
+        for (int s = 0; s < 16; ++s) {
+          if (d.textures[s] < 0) continue;
+          const Texture& ft = *frame->textures[d.textures[s]];
+          tex += fmt::format(" t{}={:08x}:{}x{}", s, ft.address, ft.width, ft.height);
+        }
+        diagnostics.push_back(fmt::format("post draw {}: ps {:016x} vs {:016x} target {}{} blend {:08x} mask {:x}{}", di,
+                                          d.ps_key, d.vs_key, tk,
+                                          d.second_target ? "+" + EdramKey(d.surface_info, d.color1_info, d.depth_info) : "",
+                                          d.blend_control, d.color_mask, tex));
+      }
+      Target& t = draw_target_lookup.Find(targets, tk, reuse_target_lookup);
+      const std::string tk1 = d.second_target ? EdramKey(d.surface_info, d.color1_info, d.depth_info) : std::string();
+      Target* t1 = d.second_target ? &targets[tk1] : nullptr;
+      if (t1 && (!t1->color || t1->color.width != t.color.width || t1->color.height != t.color.height)) {
+        t1 = nullptr;  // not the same size: drawn without it
+      }
+      const std::string pass_key = t1 ? tk + "+" + tk1 : tk;
+      const bool split = pass_key == current && split_after && t.scale > 1.0f && pass_indices >= split_after;
+      pass_splits += split;
+      if (pass_key != current || split) {
+        pass_indices = 0;
+        if (dump) diagnostics.push_back(fmt::format("draw {}: target {}{}{} (z {:08x}, viewport {}x{} at {},{})", di, tk,
+                                          !t.used ? " first use" : "", t.clear_color ? " clear-color" : "",
+                                          d.depth_control, 2 * std::fabs(d.viewport[2] == 0 ? 0.f : d.viewport[0]),
+                                          2 * std::fabs(d.viewport[2]), d.viewport[1], d.viewport[3]));
+        [enc endEncoding];
+        finish_motion(di);
+        if (early_commit && !dump && !capture.active && early_commits < early_commit_max &&
+            position >= early_commit_from + early_commit_draws && frame->draws.size() - position >= early_commit_rest) {
+          if (early_commits == 0) {
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+              early_gpu_start->store(done.GPUStartTime, std::memory_order_relaxed);
+            }];
+          }
+          [cb commit];
+          cb = [queue commandBuffer];
+          early_commit_from = position;
+          ++early_commits;
+          early_commit_total.fetch_add(1, std::memory_order_relaxed);
+        }
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        const bool clear_color = !t.used || t.clear_color, clear_depth = !t.used || t.clear_depth;
+        // The target's last pass this frame: nothing loads it again.
+        bool last_pass = false, depth_read_later = true, color_read_later = true;
+        if (discard_unread && !(split_after && t.scale > 1.0f) && tk != motion_key) {
+          size_t end = di + 1;
+          const size_t next_event = next_resolve < frame->resolves.size() ? frame->resolves[next_resolve].after_draws
+                                                                         : frame->draws.size();
+          while (end < frame->draws.size() && end < next_event && draw_pass_keys[end] == draw_pass_keys[di]) ++end;
+          last_pass = last_use[tk] < end;
+          auto read = last_depth_read.find(tk);
+          depth_read_later = read != last_depth_read.end() && read->second > di;
+          auto color_read = last_color_read.find(tk);
+          color_read_later = color_read != last_color_read.end() && color_read->second > di;
+        }
+        if (!motion_key.empty() && tk == motion_key && di <= last_motion_draw) {
+          motion_pass = true;
+          rp.colorAttachments[4].texture = motion_multisample;
+          rp.colorAttachments[4].loadAction = motion_cleared ? MTLLoadActionLoad : MTLLoadActionClear;
+          rp.colorAttachments[4].clearColor = MTLClearColorMake(0, 0, 0, 0);
+          if (motion_multisample != motion_texture) {
+            rp.colorAttachments[4].resolveTexture = motion_texture;
+            rp.colorAttachments[4].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+          } else {
+            rp.colorAttachments[4].storeAction = MTLStoreActionStore;
+          }
+          motion_cleared = true;
+        }
+        rp.colorAttachments[0].texture = t.multisample_color;
+        rp.colorAttachments[0].loadAction = clear_color ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.colorAttachments[0].clearColor = t.clear_color ? t.clear_color_value : MTLClearColorMake(0, 0, 0, 0);
+        if (last_pass && !color_read_later && !t1) {
+          // No resolve reads its colour (a shadow map's: only its depth).
+          rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+        } else if (t.sample_count > 1) {
+          rp.colorAttachments[0].resolveTexture = t.color;
+          rp.colorAttachments[0].storeAction =
+              last_pass ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve;
+        } else {
+          rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
+        if (t1) {
+          const bool clear1 = !t1->used || t1->clear_color;
+          rp.colorAttachments[1].texture = t1->multisample_color;
+          rp.colorAttachments[1].loadAction = clear1 ? MTLLoadActionClear : MTLLoadActionLoad;
+          rp.colorAttachments[1].clearColor = t1->clear_color ? t1->clear_color_value : MTLClearColorMake(0, 0, 0, 0);
+          if (t1->sample_count > 1) {
+            rp.colorAttachments[1].resolveTexture = t1->color;
+            rp.colorAttachments[1].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+          } else {
+            rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+          }
+          t1->clear_color = false;
+          if (!t1->used) order.push_back(tk1);
+          t1->used = true;
+        }
+        rp.depthAttachment.texture = t.multisample_depth;
+        if (depth_audit && clear_depth) ++t.depth_generation;
+        rp.depthAttachment.loadAction = clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.depthAttachment.clearDepth = t.clear_depth ? t.clear_depth_value : 1.0;
+        rp.visibilityResultBuffer = visibility;
+        t.clear_color = t.clear_depth = false;
+        if (t.sample_count > 1) {
+          rp.depthAttachment.resolveTexture = t.depth;
+          rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterMin;
+          rp.depthAttachment.storeAction = !last_pass         ? MTLStoreActionStoreAndMultisampleResolve
+                                           : depth_read_later ? MTLStoreActionMultisampleResolve
+                                                              : MTLStoreActionDontCare;
+        } else {
+          rp.depthAttachment.storeAction = last_pass && !depth_read_later ? MTLStoreActionDontCare : MTLStoreActionStore;
+        }
+        if (depth_audit) {
+          t.depth_audit_defined = rp.depthAttachment.storeAction != MTLStoreActionDontCare &&
+                                  (clear_depth || t.depth_audit_defined);
+        }
+        rp.stencilAttachment.texture = t.multisample_depth;
+        rp.stencilAttachment.loadAction = clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
+        if (last_pass) {
+          rp.stencilAttachment.storeAction = MTLStoreActionDontCare;  // no resolve reads stencil
+        } else if (t.sample_count > 1) {
+          rp.stencilAttachment.resolveTexture = t.depth;
+          rp.stencilAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        } else {
+          rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        stores_discarded += last_pass;
+        if (!t.used) {
+          order.push_back(tk);
+        }
+        t.used = true;
+        if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+          profile_pass(rp, fmt::format("pass {} from draw {} ({}x{})", pass_key, di, t.color.width, t.color.height));
+        if (dump) {
+          // How each pass starts: cleared or loaded, with what (the black cube faces).
+          diagnostics.push_back(fmt::format(
+              "pass start {} at draw {} ({}x{}, depth {}): colour {} ({:.3f} {:.3f} {:.3f} {:.3f}), depth {} {:.6f}",
+              pass_key, di, t.color.width, t.color.height,
+              t.multisample_depth ? int(t.multisample_depth.pixelFormat) : -1,
+              rp.colorAttachments[0].loadAction == MTLLoadActionClear ? "clear" : "load",
+              rp.colorAttachments[0].clearColor.red, rp.colorAttachments[0].clearColor.green,
+              rp.colorAttachments[0].clearColor.blue, rp.colorAttachments[0].clearColor.alpha,
+              rp.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load", rp.depthAttachment.clearDepth));
+        }
+        enc = [cb renderCommandEncoderWithDescriptor:rp];
+        clip_mode_encoder = nil;  // a new encoder starts clipping
+        clip_mode_clamp = false;
+        // Everything the argument heaps point to, resident for this pass: one
+        // call (it was one per texture, for each of the frame's passes).
+        resident.clear();
+        for (NSArray<id<MTLTexture>>* list in @[ textures, resolved_textures, assembled_cubes, volumes, cubes ]) {
+          for (id<MTLTexture> tex in list) resident.push_back(tex);
+        }
+        resident.push_back(dummy_array);
+        resident.push_back(data);
+        [enc useResources:resident.data() count:resident.size()
+                    usage:MTLResourceUsageRead
+                   stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        id<MTLBuffer> heaps[4] = {texture_heap, array_heap, volume_heap, cube_heap};
+        for (int i = 0; i < 4; ++i) {
+          [enc setVertexBuffer:heaps[i] offset:0 atIndex:i];
+          [enc setFragmentBuffer:heaps[i] offset:0 atIndex:i];
+        }
+        [enc setVertexBuffer:sampler_heap offset:0 atIndex:4];
+        [enc setFragmentBuffer:sampler_heap offset:0 atIndex:4];
+        current = pass_key;
+      }
+      pass_indices += d.index_count();
+      if (probe_ps && d.ps_key == probe_ps) continue;  // the cost probe's left-out shader
+      // State of the shaders that cost the most (cost probe, 2x race): every
+      // 600 frames, per pixel shader, the alpha test, blend and depth state
+      // its draws use, and their indices.
+      if (!dump && REXCVAR_GET(nfsmw_native_cost_probe) && number % 600 == 300) {
+        static std::map<std::string, std::pair<size_t, size_t>> states;  // -> (draws, indices)
+        if (d.ps_key == 0x27d82ea0faa380a8ull || d.ps_key == 0xaf393d4c46af230cull ||
+            d.ps_key == 0x684f4711f29b9f77ull || d.ps_key == 0x4fbaecfb8e7c4f40ull) {
+          auto& e = states[fmt::format("ps {:016x} target {} alpha test {} (func {}, ref {:.3f}) blend {:08x} "
+                                       "depth {:03x} mask {:x}",
+                                       d.ps_key, tk, (d.color_control & 8) ? "on" : "off", d.color_control & 7,
+                                       d.alpha_ref, d.blend_control, d.depth_control & 0xFFF, d.color_mask & 0xF)];
+          ++e.first;
+          e.second += d.index_count();
+        }
+        if (di + 1 == frame->draws.size()) {
+          for (const auto& [k, e] : states) REXLOG_INFO("[cost-state] {}: {} draws, {} indices", k, e.first, e.second);
+          states.clear();
+        }
+      }
+
+      // Pipeline.
+      // Alpha to coverage (bit 4) without multisampling: alpha at least 0.5
+      // covers the pixel (an alpha test, threshold set where the constants
+      // are written).
+      const bool alpha_to_coverage = !(d.color_control & 8) && (d.color_control & 0x10);
+      uint32_t alpha_spec = (d.color_control & 8) ? (2u | ((d.color_control & 7) << 8))
+                            : alpha_to_coverage && t.sample_count == 1 ? (2u | (6u << 8))
+                                                                      : 0u;
+      // The shadow caster (ps 4fbaecfb) with its cut-out off (c1.x 0): the
+      // variant without the discard compiled in (bit 12, see
+      // tools/native/rewrite_shadow_caster_alpha.py), so the GPU can drop
+      // hidden caster pixels early. Same shadow map: the branch is not taken.
+      static const bool caster_variant = REXCVAR_GET(nfsmw_native_shadow_caster_variant);
+      if (caster_variant && d.ps_key == 0x4fbaecfb8e7c4f40ull && d.ps_constants) {
+        float cut_out;
+        std::memcpy(&cut_out, &(*d.ps_constants)[4], 4);
+        if (cut_out == 0.0f) {
+          alpha_spec |= 0x1000u;
+          ++caster_variant_draws;
+        }
+      }
+      // Motion: every draw of a motion pass through the motion shaders (the
+      // same positions as each other: depth-equal passes match), written by
+      // the opaque ones that write depth.
+      // (Shaders built before motion entry points: drawn without motion.)
+      static std::unordered_map<uint64_t, bool> has_motion;
+      auto [motion_it, motion_new] = has_motion.try_emplace(d.vs_key ^ d.ps_key * 31, false);
+      if (motion_new) {
+        motion_it->second = !store.internal_keys.count(d.vs_key) && store.MotionVariant(false, d.vs_key, 0) &&
+                            store.MotionVariant(true, d.ps_key, 0);
+      }
+      const bool translated_vs = motion_it->second;
+      const uint32_t motion = !motion_pass ? 0u
+                              : !translated_vs ? 1u
+                              : (d.depth_control & 6) == 6 && (d.blend_control & 0x1FFF1FFF) == 0x00010001 ? 3u
+                                                                                                          : 2u;
+      const PipelineKey pk{d.vs_key, d.ps_key, d.blend_control, t1 ? d.blend_control1 : 0u,
+                           t1 ? (d.color_mask & 0xFF) : (d.color_mask & 0xF), t.format,
+                           t1 ? t1->format + 1 : 0u, alpha_spec, t.sample_count,
+                           alpha_to_coverage && t.sample_count > 1, motion};
+      bool pipeline_failed = false;
+      id<MTLRenderPipelineState> pso = pipeline_cache.Get(device, pk, d.vs, d.ps, async_pipelines, &pipeline_failed,
+                                                       reuse_pipeline_lookup);
+      if (!pso) {
+        pipeline_failures += pipeline_failed;
+        continue;  // failed, or compiling in the background (left out until ready)
+      }
+      state.For(enc);
+      if (state.pso != pso) {
+        [enc setRenderPipelineState:pso];
+        state.pso = pso;
+      }
+      // Depth clamped where the game turns clipping off (as the emulated
+      // renderer does with depthClamp); per encoder, so set on each new one.
+      if (enc != clip_mode_encoder || d.clip_disable != clip_mode_clamp) {
+        [enc setDepthClipMode:d.clip_disable ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+        clip_mode_encoder = enc;
+        clip_mode_clamp = d.clip_disable;
+      }
+      // Polygon offset (a new encoder starts without bias).
+      {
+        const bool on = REXCVAR_GET(nfsmw_native_depth_bias);
+        const float constant = on ? d.depth_bias : 0.0f, slope = on ? d.depth_slope * std::max(t.scale, 1.0f) : 0.0f;
+        if (enc != bias_encoder) {
+          bias_encoder = enc;
+          bias_constant = bias_slope = 0;
+        }
+        if (constant != bias_constant || slope != bias_slope) {
+          [enc setDepthBias:constant slopeScale:slope clamp:0];
+          bias_constant = constant;
+          bias_slope = slope;
+        }
+        if (d.depth_bias != 0 || d.depth_slope != 0) depth_bias_draws.fetch_add(1, std::memory_order_relaxed);
+        if ((d.depth_control & 0x72) == 0x22) depth_equal_draws.fetch_add(1, std::memory_order_relaxed);
+      }
+      // Occlusion query: counted while its draws run (a new encoder starts
+      // with counting off, and with new slots).
+      if (visibility) {
+        if (enc != visibility_encoder) {
+          visibility_encoder = enc;
+          visibility_slot = -1;
+          std::fill(pass_slot.begin(), pass_slot.end(), -1);
+        }
+        int want = -1;
+        if (d.query >= 0) {
+          int& slot = pass_slot[d.query];
+          if (slot < 0 && visibility_slots.size() < kVisibilitySlots) {
+            slot = int(visibility_slots.size());
+            visibility_slots.push_back({d.query, double(t.scale) * t.scale * std::max<uint32_t>(t.sample_count, 1)});
+          }
+          want = slot;
+          if (dump) {
+            QueryNote& qn = query_notes[{d.query, current + fmt::format(" slot {}", slot)}];
+            ++qn.draws;
+            qn.indices += d.index_count();
+            qn.first = std::min(qn.first, di);
+            qn.last = std::max(qn.last, di);
+            if (qn.ps.size() < 4) qn.ps.insert(d.ps_key);
+            qn.depth.insert(d.depth_control);
+            qn.mask.insert(d.color_mask);
+          }
+        }
+        if (want != visibility_slot) {
+          [enc setVisibilityResultMode:want >= 0 ? MTLVisibilityResultModeCounting : MTLVisibilityResultModeDisabled
+                                offset:want >= 0 ? NSUInteger(want) * 8 : 0];
+          visibility_slot = want;
+        }
+      }
+
+      // Depth: RB_DEPTHCONTROL z enable (bit 1), write (2), function (4-6).
+      const uint32_t dc = (REXCVAR_GET(nfsmw_native_test_small_no_depth) &&
+                           (t.color.width == 320 || t.color.width == 240))
+                              ? 0u
+                              : d.depth_control & 0x76;
+      const uint32_t smode = stencil_mode.empty() ? 0u : stencil_mode[di];
+      id<MTLDepthStencilState> ds = depth_states[dc | smode << 8];
+      if (!ds) {
+        MTLDepthStencilDescriptor* dsd = [MTLDepthStencilDescriptor new];
+        if (dc & 2) {
+          static const MTLCompareFunction kFuncs[] = {
+              MTLCompareFunctionNever,   MTLCompareFunctionLess,     MTLCompareFunctionEqual,
+              MTLCompareFunctionLessEqual, MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
+              MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways};
+          dsd.depthCompareFunction = kFuncs[(dc >> 4) & 7];
+          dsd.depthWriteEnabled = (dc & 4) != 0;
+        }
+        if (smode) {  // the sky drawn last (above)
+          MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
+          sd.stencilCompareFunction = smode == 1 ? MTLCompareFunctionAlways : MTLCompareFunctionNotEqual;
+          sd.depthStencilPassOperation = smode == 1 ? MTLStencilOperationReplace : MTLStencilOperationKeep;
+          sd.readMask = 0xFF;
+          sd.writeMask = smode == 1 ? 0xFF : 0;
+          dsd.frontFaceStencil = sd;
+          dsd.backFaceStencil = sd;
+        }
+        ds = depth_states[dc | smode << 8] = [device newDepthStencilStateWithDescriptor:dsd];
+      }
+      if (state.ds != ds) {
+        [enc setDepthStencilState:ds];
+        state.ds = ds;
+      }
+      if (smode && state.stencil_ref != stencil_ref_of[di]) {
+        [enc setStencilReferenceValue:stencil_ref_of[di]];
+        state.stencil_ref = stencil_ref_of[di];
+      }
+      // (Culling is off by default on a new encoder.)
+
+      // Viewport: Xenos window = ndc * scale + offset (each enabled by
+      // PA_CL_VTE_CNTL), plus the window offset.
+      const float sx = ((d.vte & 1) ? d.viewport[0] : 1.0f) * t.scale;
+      const float ox = ((d.vte & 2) ? d.viewport[1] : 0.0f) * t.scale;
+      const float sy = ((d.vte & 4) ? d.viewport[2] : 1.0f) * t.scale;
+      const float oy = ((d.vte & 8) ? d.viewport[3] : 0.0f) * t.scale;
+      const float sz = (d.vte & 16) ? d.viewport[4] : 1.0f, oz = (d.vte & 32) ? d.viewport[5] : 0.0f;
+      // The window offset and window scissor belong to the console's tiled
+      // rendering (BeginTiling/EndTiling set them per tile when the tiles are
+      // replayed, not in the draws' own packets): a whole pass is drawn here
+      // at once, so neither applies.
+      const float wx = 0.0f, wy = 0.0f;
+      // Positions in pixels (VTE x scale off, as D3D's blits): Metal clips
+      // before the viewport, so D3D's own vertex shaders (written here) turn
+      // them into clip space themselves; the viewport is then the target.
+      const bool internal = store.internal_keys.count(d.vs_key) != 0;
+      const bool pixels = !(d.vte & 1);
+      if (internal) {
+        // The positions are guest pixels: the target is t.scale times larger.
+        float xf[4] = {pixels ? 2.0f * t.scale / float(t.pitch) : 1.0f,
+                       pixels ? -2.0f * t.scale / float(t.height) : 1.0f,
+                       pixels ? -1.0f : 0.0f, pixels ? 1.0f : 0.0f};
+        // The movies keep their 16:9 on a wider screen (pillarboxed): the
+        // picture's clip-space x narrowed about the centre.
+        if (d.ps_key == 0x2d2462de73d283deull && REXCVAR_GET(nfsmw_native_movie_16_9) && t.pitch && t.height) {
+          const float aspect = float(t.color.width) / float(t.color.height);
+          if (aspect > 16.0f / 9.0f + 0.01f) {
+            const float f = (16.0f / 9.0f) / aspect;
+            xf[0] *= f;
+            xf[2] *= f;
+          }
+        }
+        [enc setVertexBytes:xf length:sizeof(xf) atIndex:30];
+      }
+      if (pixels && !internal) {
+        ++screen_space_game_draws;
+      }
+      // The rear-view mirror's picture (8436534c: the environment cube seen
+      // backwards, RVMWorldBrightness): its quad has screen positions of its
+      // own, not through the HUD's matrix, which game_scene_size.cpp scales
+      // (title-safe area removed at 4:3, wider than 16:9). Scaled as much,
+      // about the middle of the screen (the viewport's centre), to stay in
+      // its frame.
+      const bool mirror = d.ps_key == 0x8436534cfafcc0ebull;
+      if (mirror) {
+        static bool said = false;
+        if (!said) {
+          said = true;
+          REXLOG_INFO("[native] mirror picture: scaled {:.3f} x {:.3f} ({})", nfsmw_mirror_scale_x,
+                      nfsmw_mirror_scale_y, pixels ? "positions in pixels: not scaled" : "by its viewport");
+        }
+      }
+      MTLViewport vp;
+      if (pixels) {
+        vp = {0, 0, double(t.pitch), double(t.height), (d.vte & 32) ? double(d.viewport[5]) : 0.0, 1.0};
+        if (!state.viewport_set || std::memcmp(&vp, &state.viewport, sizeof(vp)) != 0) {
+          [enc setViewport:vp];
+          state.viewport = vp;
+          state.viewport_set = true;
+        }
+      } else {
+      const float mx = mirror ? nfsmw_mirror_scale_x : 1.0f, my = mirror ? nfsmw_mirror_scale_y : 1.0f;
+      vp.originX = ox - std::fabs(sx) * mx + wx;
+      vp.width = 2 * std::fabs(sx) * mx;
+      vp.originY = oy - std::fabs(sy) * my + wy + (mirror ? nfsmw_mirror_shift_y * std::fabs(sy) : 0.0f);
+      vp.height = 2 * std::fabs(sy) * my;
+      vp.znear = oz;
+      vp.zfar = oz + sz;
+      if (!(vp.width >= 1 && vp.height >= 1)) {
+        continue;
+      }
+      if (!state.viewport_set || std::memcmp(&vp, &state.viewport, sizeof(vp)) != 0) {
+        [enc setViewport:vp];
+        state.viewport = vp;
+        state.viewport_set = true;
+      }
+      }
+      MTLScissorRect sc;
+      if (true) {
+        sc = {0, 0, t.pitch, t.height};
+      } else {
+      sc.x = std::min<NSUInteger>(d.scissor[0], t.pitch - 1);
+      sc.y = std::min<NSUInteger>(d.scissor[1], t.height - 1);
+      sc.width = std::min<NSUInteger>(std::max<int>(int(d.scissor[2]) - int(sc.x), 1), t.pitch - sc.x);
+      sc.height = std::min<NSUInteger>(std::max<int>(int(d.scissor[3]) - int(sc.y), 1), t.height - sc.y);
+      }
+      if (!state.scissor_set || std::memcmp(&sc, &state.scissor, sizeof(sc)) != 0) {
+        [enc setScissorRect:sc];
+        state.scissor = sc;
+        state.scissor_set = true;
+      }
+
+      // Constants and shared constants (texture/sampler indices, booleans).
+      // Uploaded once per distinct set (consecutive draws share them).
+      // The stage's constant address is where register 0 would be: the
+      // upload starts at the range's first register.
+      auto upload = [&](UploadedConstants& u, const ConstantBank& set, std::pair<uint16_t, uint16_t> r) {
+        if (!u.Covers(&set, r)) {
+          u = {&set, r, put(set.data() + size_t(r.first) * 4, size_t(r.second - r.first) * 16, kConstantUpload)};
+        }
+        return data.gpuAddress + u.at - size_t(u.range.first) * 16;
+      };
+      const uint64_t vs_address = upload(uploaded_vs, *d.vs_constants, d.vs_range);
+      const uint64_t ps_address = upload(uploaded_ps, *d.ps_constants, d.ps_range);
+      // Motion: the frame before's constants (this frame's when not matched: no motion).
+      const uint64_t previous_vs_address = motion >= 2 && d.previous_vs_constants
+                                               ? upload(uploaded_previous_vs, *d.previous_vs_constants, d.vs_range)
+                                               : vs_address;
+      uint32_t shared[256] = {};
+      if (motion_pass && (jitter[0] != 0 || jitter[1] != 0) && vp.width >= 1 && vp.height >= 1) {
+        // g_HalfPixelOffset (byte 344): added to the clip-space position (x w).
+        const float offset[2] = {2.0f * jitter[0] / float(vp.width), -2.0f * jitter[1] / float(vp.height)};
+        std::memcpy(&shared[86], offset, sizeof(offset));
+      }
+      for (int s = 0; s < 16; ++s) {
+        int index = d.textures[s] < 0 ? 0 : d.textures[s] + 1;
+        if (d.textures[s] >= 0) {
+          // Resolved earlier in this frame: our texture, not guest memory.
+          const Texture& ft = *frame->textures[d.textures[s]];
+          auto it = resolved.find(ft.address);
+          if (it != resolved.end()) {
+            index = int(it->second);
+            // The console reads the resolve back from memory: in memory X
+            // and Z are swapped if the resolve swapped; then the fetch
+            // swizzle picks channels. A view with both, unless both are the
+            // identity.
+            const bool swap = resolved_swap[ft.address];
+            const uint32_t sw = ft.fetch_swizzle;
+            id<MTLTexture> base = resolved_texture[ft.address];
+            // Sampled at its own size, smaller than the resolve's pitch (a
+            // 960-texel-wide scene in a 1024 pitch): coordinates are
+            // normalized by that size, so a texture of that size over the
+            // same memory (resolve textures are linear, in a buffer). The
+            // fetch size is in guest texels: times the resolve's scale.
+            const auto scale_it = resolved_scale.find(ft.address);
+            const float fs = scale_it != resolved_scale.end() ? scale_it->second : 1.0f;
+            const uint32_t fw = Px(ft.width, fs), fh = Px(ft.height, fs);
+            const bool crop = base.buffer && fw && fh && (fw < base.width || fh < base.height) && fw <= base.width &&
+                              fh <= base.height;
+            if (sw != 0x688 || swap || crop) {
+              const auto view_key = std::make_tuple(uintptr_t((__bridge void*)base), sw | (swap ? 0x1000u : 0u),
+                                                    crop ? fw : 0u, crop ? fh : 0u);
+              auto view = resolved_views.find(view_key);
+              if (view != resolved_views.end()) {
+                index = int(view->second);
+              } else if (next_heap < heap_capacity) {
+                auto channel = [&](uint32_t sel) {
+                  switch (sel & 7) {
+                    case 0: return swap ? MTLTextureSwizzleBlue : MTLTextureSwizzleRed;
+                    case 1: return MTLTextureSwizzleGreen;
+                    case 2: return swap ? MTLTextureSwizzleRed : MTLTextureSwizzleBlue;
+                    case 3: return MTLTextureSwizzleAlpha;
+                    case 4: return MTLTextureSwizzleZero;
+                    default: return MTLTextureSwizzleOne;
+                  }
+                };
+                id<MTLTexture> source = base;
+                if (crop) {
+                  MTLTextureDescriptor* cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:base.pixelFormat
+                                                                                                width:fw
+                                                                                               height:fh
+                                                                                            mipmapped:NO];
+                  cd.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                  cd.storageMode = base.buffer.storageMode;
+                  source = [base.buffer newTextureWithDescriptor:cd
+                                                          offset:base.bufferOffset
+                                                     bytesPerRow:base.bufferBytesPerRow];
+                  [enc useResource:base.buffer usage:MTLResourceUsageRead
+                            stages:MTLRenderStageVertex | MTLRenderStageFragment];
+                }
+                id<MTLTexture> v = [source newTextureViewWithPixelFormat:source.pixelFormat
+                                                           textureType:base.textureType
+                                                                levels:NSMakeRange(0, 1)
+                                                                slices:NSMakeRange(0, 1)
+                                                               swizzle:MTLTextureSwizzleChannelsMake(
+                                                                           channel(sw), channel(sw >> 3),
+                                                                           channel(sw >> 6), channel(sw >> 9))];
+                if (v) {
+                  static_cast<MTLResourceID*>(texture_heap.contents)[next_heap] = v.gpuResourceID;
+                  if (prepare_snapshots) heap_object[next_heap] = v;
+                  [resolved_textures addObject:v];
+                  if (prepare_snapshots) {
+                    resolve_names.push_back("view");
+                    resolve_rects.push_back(CGRectZero);
+                  }
+                  [enc useResource:v usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+                  if (source != base) {  // the crop: named too (the snapshot pairs names and textures by position)
+                    [enc useResource:source usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+                    [resolved_textures addObject:source];
+                    if (prepare_snapshots) {
+                      resolve_names.push_back("crop");
+                      resolve_rects.push_back(CGRectZero);
+                    }
+                  }
+                  resolved_views[view_key] = next_heap;
+                  index = int(next_heap++);
+                }
+              }
+            }
+          }
+        }
+        shared[s] = uint32_t(index);        // Texture2D index
+        shared[64 + s] = uint32_t(index);   // sampler index
+        if (d.textures[s] >= 0) {
+          shared[48 + s] = cube_index[d.textures[s]];    // TextureCube index (byte 192)
+          auto rc = resolved_cube_index.find(frame->textures[d.textures[s]]->address);
+          if (rc != resolved_cube_index.end()) {
+            shared[48 + s] = rc->second;  // a cube resolved earlier in this frame
+            // Sampled as the console does: the faces' red/blue swap in memory,
+            // then the fetch swizzle (as for 2D resolves above).
+            const Texture& ft = *frame->textures[d.textures[s]];
+            const bool swap = resolved_cube_swap[ft.address];
+            const uint32_t sw = ft.fetch_swizzle;
+            id<MTLTexture> base = resolved_cubes[ft.address];
+            if (base && (sw != 0x688 || swap) && REXCVAR_GET(nfsmw_native_cube_swizzle)) {
+              const auto view_key = std::make_pair(uintptr_t((__bridge void*)base), sw | (swap ? 0x1000u : 0u));
+              auto view = cube_views.find(view_key);
+              if (view != cube_views.end()) {
+                shared[48 + s] = view->second;
+              } else if (next_cube < cube_heap.length / sizeof(MTLResourceID)) {
+                auto channel = [&](uint32_t sel) {
+                  switch (sel & 7) {
+                    case 0: return swap ? MTLTextureSwizzleBlue : MTLTextureSwizzleRed;
+                    case 1: return MTLTextureSwizzleGreen;
+                    case 2: return swap ? MTLTextureSwizzleRed : MTLTextureSwizzleBlue;
+                    case 3: return MTLTextureSwizzleAlpha;
+                    case 4: return MTLTextureSwizzleZero;
+                    default: return MTLTextureSwizzleOne;
+                  }
+                };
+                id<MTLTexture> v = [base newTextureViewWithPixelFormat:base.pixelFormat
+                                                           textureType:MTLTextureTypeCube
+                                                                levels:NSMakeRange(0, 1)
+                                                                slices:NSMakeRange(0, 6)
+                                                               swizzle:MTLTextureSwizzleChannelsMake(
+                                                                           channel(sw), channel(sw >> 3),
+                                                                           channel(sw >> 6), channel(sw >> 9))];
+                if (v) {
+                  static_cast<MTLResourceID*>(cube_heap.contents)[next_cube] = v.gpuResourceID;
+                  [assembled_cubes addObject:v];
+                  [enc useResource:v usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+                  cube_views[view_key] = next_cube;
+                  shared[48 + s] = next_cube++;
+                }
+              }
+            }
+          }
+          shared[32 + s] = volume_index[d.textures[s]];  // Texture3D index (byte 128)
+          // Tuning shop colour test: the car paint shaders' textures, logged
+          // once each; the cube or the 3D texture left out on request.
+          if (d.ps_key == 0x2442daf2d3a7097aull || d.ps_key == 0xd1f317fad0f46ac6ull) {
+            const Texture& ft = *frame->textures[d.textures[s]];
+            static std::set<std::tuple<uint64_t, int, uint32_t>> said;
+            // 2D textures: the first 64; cubes and 3D textures: all (few).
+            if ((said.size() < 64 || ft.cube || ft.volume) && said.insert({d.ps_key, s, ft.address}).second) {
+              REXLOG_INFO("[car-paint] ps {:016x} slot {}: {:08x} {}x{}x{} guest format {}{} metal format {} {}{} "
+                          "fetch swizzle {:03x} exp_adjust {} endian {} tiled {}",
+                          d.ps_key, s, ft.address, ft.width, ft.height, ft.depth, ft.guest_format,
+                          ft.guest_signed ? " signed" : "", int(ft.format),
+                          ft.cube ? "cube" : ft.volume ? "3D" : "2D",
+                          resolved_cube_index.count(ft.address) ? " (made from resolves)"
+                          : ft.format == MTLPixelFormatInvalid ? " (a resolve)" : "",
+                          ft.fetch_swizzle, ft.exp_adjust, ft.guest_endian, ft.guest_tiled);
+            }
+            // Snapshots: which cube the paint reads (decoded from memory or
+            // made from resolves), and its six faces saved once per frame.
+            if (dump && ft.cube) {
+              const bool from_resolves = resolved_cubes.count(ft.address) && resolved_cubes[ft.address];
+              id<MTLTexture> bound = from_resolves ? resolved_cubes[ft.address]
+                                     : cube_index[d.textures[s]] < cubes.count ? cubes[cube_index[d.textures[s]]] : nil;
+              const std::string line = fmt::format("group car cube: ps {:016x} slot {} cube {:08x} {}", d.ps_key, s,
+                                                   ft.address, from_resolves ? "made from resolves" : "decoded from memory");
+              static std::set<std::string> seen_this_frame;
+              static uint32_t seen_frame = 0;
+              if (seen_frame != number) {
+                seen_this_frame.clear();
+                seen_frame = number;
+              }
+              if (bound && seen_this_frame.insert(line).second) {
+                diagnostics.push_back(line);
+                for (NSUInteger face = 0; face < 6; ++face) {
+                  id<MTLTexture> v = [bound newTextureViewWithPixelFormat:bound.pixelFormat
+                                                              textureType:MTLTextureType2D
+                                                                   levels:NSMakeRange(0, 1)
+                                                                   slices:NSMakeRange(face, 1)];
+                  if (v) {
+                    watch_saves.push_back({v, fmt::format("car_cube_{:08x}_{}_face{}", ft.address,
+                                                          from_resolves ? "resolved" : "decoded", face)});
+                  }
+                }
+              }
+            }
+            if (ft.cube && REXCVAR_GET(nfsmw_native_test_no_envcube)) shared[48 + s] = 0;
+            if (ft.volume && REXCVAR_GET(nfsmw_native_test_grey_volume)) shared[32 + s] = grey_volume_index;
+          }
+          if (REXCVAR_GET(nfsmw_native_test_no_envcube_world) && frame->textures[d.textures[s]]->cube &&
+              d.ps_key != 0x2442daf2d3a7097aull && d.ps_key != 0xd1f317fad0f46ac6ull &&
+              d.ps_key != 0x8436534cfafcc0ebull) {
+            shared[48 + s] = 0;  // the black placeholder cube
+          }
+        }
+      }
+      // Plus, for the car shaders, every draw whose first texture is 1024
+      // wide or more (the car's skin, with its livery).
+      const bool skin = prepare_snapshots && d.textures[0] >= 0 && frame->textures[d.textures[0]]->width >= 1024 &&
+                        d.ps_key != 0xaf393d4c46af230cull && watched_seen[d.ps_key ^ 1]++ < 4;
+      // Snapshots: the shadow receivers' shadow constants (pixel c0-c8: the
+      // "enabled" switch and bias; vertex c17, c19, c40: the shadow map
+      // matrix's first row, depending on the shader).
+      if (dump && (d.ps_key == 0x684f4711f29b9f77ull || d.ps_key == 0xaf393d4c46af230cull ||
+                   d.ps_key == 0xd1f317fad0f46ac6ull) &&
+          watched_seen[d.ps_key ^ 0x5A5A]++ < 2) {
+        auto c = [](const ConstantBank& k, int r) {
+          float f[4];
+          std::memcpy(f, &k[r * 4], 16);
+          return fmt::format("({:.3g} {:.3g} {:.3g} {:.3g})", f[0], f[1], f[2], f[3]);
+        };
+        std::string ps_c, vs_c;
+        for (int r = 0; r <= 8; ++r) ps_c += fmt::format(" c{}{}", r, c(*d.ps_constants, r));
+        for (int r : {17, 19, 40}) vs_c += fmt::format(" c{}{}", r, c(*d.vs_constants, r));
+        diagnostics.push_back(fmt::format("group consts draw {} ps {:016x} vs {:016x}: PS{} | VS{}", &d - frame->draws.data(),
+                                          d.ps_key, d.vs_key, ps_c, vs_c));
+      }
+      // Snapshots: the hand-written matrix shader's draws (car shadow casters?):
+      // their matrix, first vertex and where it lands in clip space.
+      if (dump && d.vs_key == 0x2f583d7c8ddf572aull && watched_seen[0x2f583d7c]++ < 2) {
+        const auto& k = *d.vs_constants;
+        float m[16];
+        std::memcpy(m, k.data(), 64);
+        float p[4] = {0, 0, 0, 1};
+        for (const Attribute& a : d.attributes) {
+          if (a.location == 0 && a.values && a.values->size() >= 4) {
+            std::memcpy(p, a.values->data(), 12);
+            p[3] = 1.0f;
+          }
+        }
+        float o[4];
+        for (int r = 0; r < 4; ++r) o[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3] * p[3];
+        diagnostics.push_back(fmt::format(
+            "group matrix draw {}: c0 ({:.3g} {:.3g} {:.3g} {:.3g}) c1 ({:.3g} {:.3g} {:.3g} {:.3g}) c2 ({:.3g} {:.3g} {:.3g} {:.3g}) "
+            "c3 ({:.3g} {:.3g} {:.3g} {:.3g}) | vertex 0 ({:.4g} {:.4g} {:.4g}) of {} -> clip ({:.4g} {:.4g} {:.4g} {:.4g}) "
+            "ndc ({:.3g} {:.3g} {:.3g}) | {} attributes, prim {}, {} indices | PS c0 {:.3g} c1 {:.3g} cc {:08x} t0 {}",
+            &d - frame->draws.data(), m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], p[0], p[1], p[2], d.vertex_count, o[0], o[1], o[2], o[3], o[0] / o[3], o[1] / o[3], o[2] / o[3],
+            d.attributes.size(), uint32_t(d.primitive), d.index_count(), [&] { float f; std::memcpy(&f, &(*d.ps_constants)[0], 4); return f; }(),
+            [&] { float f; std::memcpy(&f, &(*d.ps_constants)[4], 4); return f; }(), d.color_control,
+            d.textures[0] < 0 ? std::string("none")
+                              : fmt::format("{:08x} {}x{} format {}", frame->textures[d.textures[0]]->address,
+                                            frame->textures[d.textures[0]]->width, frame->textures[d.textures[0]]->height,
+                                            int(frame->textures[d.textures[0]]->format))));
+      }
+      // Glass and other reflective surfaces in the main picture: draws that
+      // read a cube or one of the renderer's own resolves (the reflection
+      // images), with their blend state and textures (saved as watch_).
+      bool reflective = false;
+      if (dump && (d.surface_info & 0x3FFF) >= 1280) {
+        std::string slots;
+        for (int s = 0; s < 16; ++s) {
+          if (d.textures[s] < 0) continue;
+          const Texture& ft = *frame->textures[d.textures[s]];
+          const bool own = ft.persistent || ft.format == MTLPixelFormatInvalid;
+          reflective |= ft.cube || own;
+          slots += fmt::format(" t{} {:08x} {}x{}{}{}", s, ft.address, ft.width, ft.height, ft.cube ? " cube" : "",
+                               own ? " resolve" : "");
+        }
+        if (reflective && watched_seen[d.ps_key ^ 0x6C61]++ < 3) {
+          diagnostics.push_back(fmt::format(
+              "reflective draw {}: vs {:016x} ps {:016x} blend {:08x} depth {:08x} mask {:x} colorctl {:08x}{}",
+              &d - frame->draws.data(), d.vs_key, d.ps_key, d.blend_control, d.depth_control, d.color_mask,
+              d.color_control, slots));
+        } else {
+          reflective = false;
+        }
+      }
+      if (dump && (watched.count(d.ps_key) || reflective) && (watched_seen[d.ps_key]++ < 3 || skin)) {
+        for (int s = 0; s < (skin ? 1 : 16); ++s) {
+          const uint32_t index = shared[s];
+          if (d.textures[s] < 0 || index >= heap_object.size() || !heap_object[index]) continue;
+          const Texture& ft = *frame->textures[d.textures[s]];
+          // The saved image is the texture's memory as Metal holds it (a
+          // view's swizzle is not applied): the name gives the fetch swizzle
+          // and whether the resolve swapped red and blue.
+          watch_saves.push_back({heap_object[index],
+                                 fmt::format("watch_ps{:016x}_d{}_t{}_{:08x}_{}x{}_sw{:03x}{}{}", d.ps_key,
+                                             &d - frame->draws.data(), s, ft.address, ft.width, ft.height,
+                                             ft.fetch_swizzle, resolved_swap[ft.address] ? "_swap" : "",
+                                             ft.persistent ? "_kept" : ft.format == MTLPixelFormatInvalid ? "_resolved" : "")});
+        }
+      }
+      shared[80] = d.booleans;  // g_Booleans at byte 320
+      {
+        const float threshold = (!(d.color_control & 8) && (d.color_control & 0x10)) ? 0.5f : d.alpha_ref;
+        std::memcpy(&shared[93], &threshold, 4);  // g_AlphaThreshold at byte 372
+      }
+      // The same as the draw before's (most are): its copy again.
+      if (!have_last_shared || std::memcmp(last_shared, shared, sizeof(shared)) != 0) {
+        last_shared_at = put(shared, sizeof(shared), kSharedUpload);
+        std::memcpy(last_shared, shared, sizeof(shared));
+        have_last_shared = true;
+      }
+      const size_t shared_at = last_shared_at;
+      struct {
+        uint64_t vs, ps, shared, previous_vs;
+      } push = {vs_address, ps_address, data.gpuAddress + shared_at, previous_vs_address};
+      if (!state.push_set || std::memcmp(&push, state.push, sizeof(push)) != 0) {
+        [enc setVertexBytes:&push length:sizeof(push) atIndex:8];
+        [enc setFragmentBytes:&push length:sizeof(push) atIndex:8];
+        std::memcpy(state.push, &push, sizeof(push));
+        state.push_set = true;
+      }
+
+      // Vertex attributes: the shader's active inputs, in order, in buffers
+      // 9 onwards; an input the draw did not provide reads zeros.
+      const std::vector<NSUInteger>& active = ActiveAttributes(d.vs);
+      for (size_t k = 0; k < active.size() && 9 + k <= 30; ++k) {
+        const Attribute* found = nullptr;
+        for (const Attribute& a : d.attributes) {
+          if (a.location == active[k]) found = &a;
+        }
+        if (found && found->values && !found->values->empty() && found->fresh) {
+          // Changed this frame: with the frame's data, no buffer of its own.
+          state.VertexBuffer(data, put(found->values->data(), found->values->size() * 4, kVertexUpload), 9 + k);
+        } else if (found && found->values && !found->values->empty()) {
+          size_t vb_offset = 0;
+          id<MTLBuffer> vb = GpuBufferFor(device, found->values, vb_offset);
+          state.VertexBuffer(vb ?: zeros, vb_offset, 9 + k);  // bound: resident without useResource
+        } else {
+          state.VertexBuffer(zeros, 0, 9 + k);
+        }
+      }
+      if (d.index_count()) {
+        // Made this frame: with the frame's data; cached: its own buffer.
+        size_t index_at = 0;
+        id<MTLBuffer> ib = data;
+        if (d.indices_fresh) {
+          index_at = put(d.indices->data(), d.index_count() * 4, kIndexUpload);
+        } else if (!(ib = GpuBufferFor(device, d.indices, index_at))) {
+          continue;
+        }
+        if (depth_audit && (d.depth_control & 4)) ++t.depth_generation;
+        [enc drawIndexedPrimitives:d.primitive
+                        indexCount:d.index_count()
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:ib
+                 indexBufferOffset:index_at];
+        ++drawn;
+      }
+    }
+    // Resolves after the last draw (the frame's last: what is displayed).
+    while (next_resolve < frame->resolves.size()) {
+      if (!frame->draws.empty()) {
+        do_resolve(frame->resolves[next_resolve], frame->draws.back());
+      }
+      ++next_resolve;
+    }
+    [enc endEncoding];
+    finish_motion(frame->draws.size());
+
+    if (depth_audit) {
+      REXLOG_INFO("[native] depth audit: frame {} copied {} snapshots, {} unchanged single-sample candidates "
+                  "(diagnostic only; every copy still executed)", number, depth_audit_copies, depth_audit_candidates);
+    }
+
+    // On screen: the frame's last colour resolve, fitted to the layer.
+    CAMetalLayer* layer = present_layer;
+    id<MTLRenderPipelineState> present_pso = present ? PresentPipeline(device) : nil;
+    if (present && layer && final_texture && present_pso) {
+      const auto drawable_start = std::chrono::steady_clock::now();
+      id<CAMetalDrawable> drawable = [layer nextDrawable];
+      drawable_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drawable_start).count();
+      if (drawable) {
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = drawable.texture;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        // "native" scale: the displayed image as large as it is shown (it fits
+        // the drawable by its height, or by its width when relatively wider).
+        if (final_guest_width >= 320 && final_guest_height >= 240) {
+          const float screen_w = float(screen_pixels_w.load() ?: uint32_t(drawable.texture.width));
+          const float screen_h = float(screen_pixels_h.load() ?: uint32_t(drawable.texture.height));
+          const float want = std::min(screen_w / float(final_guest_width), screen_h / float(final_guest_height));
+          const float rounded = std::round(want * 1000.0f) / 1000.0f;
+          if (std::fabs(native_screen_scale.load() - rounded) > 0.0005f) {
+            native_screen_scale = rounded;
+            if (REXCVAR_GET(nfsmw_native_resolution_scale) == "native") {
+              REXLOG_INFO("[native] native resolution: {}x{} shown in {}x{}: scale {:.3f}", final_guest_width,
+                          final_guest_height, int(screen_w), int(screen_h), rounded);
+            }
+          }
+        }
+        // Motion debug view: the scene's motion instead of the picture.
+        if (motion_debug && motion_ready) {
+          static id<MTLTexture> view;
+          id<MTLRenderPipelineState> show = MotionPipeline(device, true, final_texture.pixelFormat);
+          if (!(view && view.width == motion_texture.width && view.height == motion_texture.height &&
+                view.pixelFormat == final_texture.pixelFormat)) {
+            MTLTextureDescriptor* vd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:final_texture.pixelFormat
+                                                                                          width:motion_texture.width
+                                                                                         height:motion_texture.height
+                                                                                      mipmapped:NO];
+            vd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            vd.storageMode = MTLStorageModePrivate;
+            view = [device newTextureWithDescriptor:vd];
+          }
+          if (show && view) {
+            MTLRenderPassDescriptor* vp = [MTLRenderPassDescriptor renderPassDescriptor];
+            vp.colorAttachments[0].texture = view;
+            vp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            vp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> ve = [cb renderCommandEncoderWithDescriptor:vp];
+            [ve setRenderPipelineState:show];
+            [ve setFragmentTexture:motion_texture atIndex:0];
+            [ve drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [ve endEncoding];
+            final_texture = view;
+          }
+        }
+        const float sw = float(final_rect.size.width), sh = float(final_rect.size.height);
+        const float dw = float(drawable.texture.width), dh = float(drawable.texture.height);
+        const float src = sw / sh, dst = dw / dh;
+        // Within 8% of the screen's shape, the whole screen: no bars a few
+        // pixels wide at the sides (1560x720 on a 2868x1320 iPhone: 0.3%),
+        // and 4:3 fills the 11" iPads (2388x1668, 1.43:1: 7%) with a
+        // stretch hard to notice instead of bars.
+        const bool nearly = std::fabs(src / dst - 1.0f) < 0.08f;
+        const float fit[4] = {src > dst || nearly ? 1.0f : src / dst, src > dst && !nearly ? dst / src : 1.0f, 0, 0};
+        // Compact drawable: the picture's own pixels (with the screen's shape,
+        // bars included), for the next frames' drawables. Not with MetalFX
+        // temporal (its output is the screen's size, or wants it) or a picture
+        // as large as the screen.
+        {
+          const uint32_t full_w = screen_pixels_w.load(), full_h = screen_pixels_h.load();
+          uint32_t want_w = 0, want_h = 0;
+          if (REXCVAR_GET(nfsmw_native_compact_drawable) && !MetalFxTemporal() && full_w && full_h) {
+            const float fdst = float(full_w) / float(full_h);
+            const float k = src > fdst ? sw / float(full_w) : sh / float(full_h);  // picture pixels per screen pixel
+            if (k < 0.95f) {
+              want_w = uint32_t(std::lround(full_w * k));
+              want_h = uint32_t(std::lround(full_h * k));
+            }
+          }
+          if (want_w != drawable_want_w.load() || want_h != drawable_want_h.load()) {
+            drawable_want_w = want_w;
+            drawable_want_h = want_h;
+            REXLOG_INFO("[native] drawable {}", want_w ? fmt::format("{}x{}, stretched to {}x{} by the compositor",
+                                                                     want_w, want_h, full_w, full_h)
+                                                        : std::string("at the screen's pixels"));
+            dispatch_async(dispatch_get_main_queue(), ^{
+              [present_view setNeedsLayout];
+            });
+          }
+        }
+        // The resolve's rectangle within its texture (it starts at 0, 0).
+        float crop[4] = {sw / float(final_texture.width), sh / float(final_texture.height), 0, 0};
+        // MetalFX: the picture upscaled to its size on screen (spatial: the
+        // game has no motion vectors for the temporal scaler), then shown
+        // 1:1 by the pass below. Only when it is drawn smaller than shown.
+        id<MTLTexture> shown_texture = final_texture;
+        // MetalFX temporal: the picture with the scene's depth and motion
+        // (this frame's), to its size on screen, three quarters of it
+        // (lower: the present pass stretches the rest) or its own size
+        // (drawn: anti-aliasing only). No FXAA before it.
+        const NSUInteger shown_w = NSUInteger(std::lround(dw * fit[0]));
+        const NSUInteger shown_h = NSUInteger(std::lround(dh * fit[1]));
+        bool temporal_done = false;
+        bool temporal_shown = false;  // this frame: the last one shown, for the history's reset
+        static bool temporal_last_shown = false;
+        if (temporal && motion_ready && !motion_debug && final_rect.origin.x == 0 && final_rect.origin.y == 0 &&
+            shown_w + 8 >= NSUInteger(sw) && shown_h + 8 >= NSUInteger(sh)) {
+          static id<MTLFXTemporalScaler> scaler;
+          static id<MTLTexture> upscaled;
+          static NSUInteger in_w = 0, in_h = 0;
+          static MTLPixelFormat in_format = MTLPixelFormatInvalid;
+          static NSUInteger asked_w = 0, asked_h = 0;  // the output asked for (made: maybe larger)
+          static bool failed = false;                  // no scaler for what was asked: not asked again
+          static bool said_unsupported = false;
+          const std::string mode = REXCVAR_GET(nfsmw_native_metalfx);
+          const double part = mode == "lower" ? 0.75 : mode == "drawn" ? 0.0 : 1.0;
+          const NSUInteger out_w = std::max(NSUInteger(std::lround(shown_w * part)), NSUInteger(sw));
+          const NSUInteger out_h = std::max(NSUInteger(std::lround(shown_h * part)), NSUInteger(sh));
+          const NSUInteger iw = std::min({final_texture.width, motion_texture.width, motion_depth.width});
+          const NSUInteger ih = std::min({final_texture.height, motion_texture.height, motion_depth.height});
+          bool reset = false;
+          const bool same_ask = in_w == iw && in_h == ih && in_format == final_texture.pixelFormat &&
+                                asked_w == out_w && asked_h == out_h;
+          if (iw >= NSUInteger(sw) && ih >= NSUInteger(sh) && !(same_ask && (scaler || failed))) {
+            scaler = nil;
+            upscaled = nil;
+            reset = true;
+            in_w = iw;
+            in_h = ih;
+            in_format = final_texture.pixelFormat;
+            asked_w = out_w;
+            asked_h = out_h;
+            failed = true;
+            // Anti-aliasing only (1:1): the GPU's smallest scale if 1:1 is
+            // not made (the present pass then shows it at the screen's size).
+            const float min_scale = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:device];
+            const float max_scale = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:device];
+            std::vector<float> scales = {std::max(float(out_w) / sw, float(out_h) / sh)};
+            if (mode == "drawn") scales.insert(scales.end(), {std::max(min_scale, 1.0f), 1.25f, 1.5f});
+            if (![MTLFXTemporalScalerDescriptor supportsDevice:device]) scales.clear();
+            for (float factor : scales) {
+              if (scaler || factor > max_scale + 0.01f || factor < min_scale - 0.01f) continue;
+              const NSUInteger fw = std::max(NSUInteger(std::lround(sw * factor)), out_w);
+              const NSUInteger fh = std::max(NSUInteger(std::lround(sh * factor)), out_h);
+              MTLFXTemporalScalerDescriptor* td = [MTLFXTemporalScalerDescriptor new];
+              td.inputWidth = iw;
+              td.inputHeight = ih;
+              td.outputWidth = factor == scales.front() ? out_w : fw;
+              td.outputHeight = factor == scales.front() ? out_h : fh;
+              td.colorTextureFormat = final_texture.pixelFormat;
+              td.depthTextureFormat = MTLPixelFormatDepth32Float;
+              td.motionTextureFormat = kMotionFormat;
+              td.outputTextureFormat = final_texture.pixelFormat;
+              td.autoExposureEnabled = NO;
+              scaler = [td newTemporalScalerWithDevice:device];
+              if (scaler) {
+                MTLTextureDescriptor* od =
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:final_texture.pixelFormat
+                                                                       width:td.outputWidth
+                                                                      height:td.outputHeight
+                                                                   mipmapped:NO];
+                od.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+                od.storageMode = MTLStorageModePrivate;
+                upscaled = [device newTextureWithDescriptor:od];
+                failed = !upscaled;
+                REXLOG_INFO("[native] MetalFX temporal: {}x{} to {}x{} (scales {:.2f}-{:.2f})", int(sw), int(sh),
+                            td.outputWidth, td.outputHeight, min_scale, max_scale);
+              } else {
+                REXLOG_WARN("[native] MetalFX temporal: no scaler for {}x{} -> {}x{}", int(sw), int(sh),
+                            td.outputWidth, td.outputHeight);
+              }
+            }
+            if (failed && !said_unsupported) {
+              said_unsupported = true;
+              REXLOG_WARN("[native] MetalFX temporal: none for {}x{} -> {}x{} on this GPU (scales {:.2f}-{:.2f}); "
+                          "plain stretch, no jitter", int(sw), int(sh), out_w, out_h, min_scale, max_scale);
+            }
+          }
+          metalfx_failed = failed;
+          if (scaler && upscaled) {
+            // The scene's depth function: GREATER (4) or GEQUAL (6) is reversed depth.
+            const uint32_t depth_function = (frame->draws[last_motion_draw].depth_control >> 4) & 7;
+            const bool reversed = depth_function == 4 || depth_function == 6;
+            // History kept unless the last frame shown was not a temporal one
+            // (a menu without a scene, a movie) or is long gone.
+            static auto last_time = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            reset = reset || !temporal_last_shown || now - last_time > std::chrono::milliseconds(250);
+            last_time = now;
+            temporal_shown = true;
+            const float flip = REXCVAR_GET(nfsmw_native_jitter_flip) ? -1.0f : 1.0f;
+            scaler.colorTexture = final_texture;
+            scaler.depthTexture = motion_depth;
+            scaler.motionTexture = motion_texture;
+            scaler.outputTexture = upscaled;
+            scaler.inputContentWidth = NSUInteger(sw);
+            scaler.inputContentHeight = NSUInteger(sh);
+            // The jitter moved the scene by +jitter pixels (y down): MetalFX
+            // takes that same offset (the opposite one shakes, tested).
+            scaler.jitterOffsetX = jitter[0] * flip;
+            scaler.jitterOffsetY = jitter[1] * flip;
+            scaler.motionVectorScaleX = sw;
+            scaler.motionVectorScaleY = sh;
+            scaler.depthReversed = reversed;
+            scaler.reset = reset;
+            [scaler encodeToCommandBuffer:cb];
+            shown_texture = upscaled;
+            crop[0] = crop[1] = 1.0f;
+            temporal_done = true;
+            // The next frames' textures: mip levels for the shown size.
+            temporal_lod_bias_eighths =
+                std::clamp(int32_t(std::lround(8.0 * std::log2(double(sw) / double(out_w)))), -16, 0);
+          }
+        }
+        temporal_last_shown = temporal_shown;
+        if (!temporal_done) temporal_lod_bias_eighths = 0;
+        // FXAA, without MetalFX.
+        id<MTLTexture> source = final_texture;
+        if (!temporal_done) {
+          const std::string mode = REXCVAR_GET(nfsmw_native_fxaa);
+          const bool high = mode == "high";
+          static id<MTLTexture> smoothed;
+          static std::string said_mode;
+          if ((high || mode == "normal") && sw >= 1 && sh >= 1) {
+            id<MTLRenderPipelineState> fxaa = FxaaPipeline(device, final_texture.pixelFormat);
+            const NSUInteger w = NSUInteger(sw), h = NSUInteger(sh);
+            if (fxaa && !(smoothed && smoothed.width == w && smoothed.height == h &&
+                          smoothed.pixelFormat == final_texture.pixelFormat)) {
+              MTLTextureDescriptor* fd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:final_texture.pixelFormat
+                                                                                            width:w
+                                                                                           height:h
+                                                                                        mipmapped:NO];
+              fd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+              fd.storageMode = MTLStorageModePrivate;
+              smoothed = [device newTextureWithDescriptor:fd];
+            }
+            if (fxaa && smoothed) {
+              MTLRenderPassDescriptor* fp = [MTLRenderPassDescriptor renderPassDescriptor];
+              fp.colorAttachments[0].texture = smoothed;
+              fp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+              fp.colorAttachments[0].storeAction = MTLStoreActionStore;
+              if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+                profile_pass(fp, "post: FXAA");
+              id<MTLRenderCommandEncoder> fe = [cb renderCommandEncoderWithDescriptor:fp];
+              const float tw = float(final_texture.width), th = float(final_texture.height);
+              const float vcrop[4] = {crop[0], crop[1], 0, 0};
+              const float k[8] = {1.0f / tw, 1.0f / th, (sw - 0.5f) / tw, (sh - 0.5f) / th,
+                                  high ? 0.063f : 0.125f, high ? 1.0f : 0.75f, 0, 0};
+              [fe setRenderPipelineState:fxaa];
+              [fe setVertexBytes:vcrop length:sizeof(vcrop) atIndex:0];
+              [fe setFragmentBytes:k length:sizeof(k) atIndex:0];
+              [fe setFragmentTexture:final_texture atIndex:0];
+              [fe drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+              [fe endEncoding];
+              source = smoothed;
+              shown_texture = smoothed;
+              crop[0] = crop[1] = 1.0f;
+              const std::string now = high ? "high" : "normal";
+              if (said_mode != now) {
+                said_mode = now;
+                REXLOG_INFO("[native] FXAA ({}) over the {}x{} picture", now, w, h);
+              }
+            }
+          }
+        }
+        // Repeated pictures (nfsmw_native_repeat_log): a strip across the
+        // middle of the displayed picture, compared when the GPU is done.
+        if (REXCVAR_GET(nfsmw_native_repeat_log) && final_texture && !dump) {
+          NSUInteger bpp = 0;
+          switch (final_texture.pixelFormat) {
+            case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+            case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm:
+            case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
+              bpp = 4;
+              break;
+            case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA16Unorm:
+              bpp = 8;
+              break;
+            default:
+              break;
+          }
+          const NSUInteger sx = NSUInteger(final_rect.origin.x), sw_px = std::min<NSUInteger>(NSUInteger(final_rect.size.width), 1024);
+          const NSUInteger sy = NSUInteger(final_rect.origin.y + final_rect.size.height * 0.5);
+          if (bpp && sw_px > 0 && final_texture.storageMode != MTLStorageModeMemoryless &&
+              sy + 2 <= final_texture.height && sx + sw_px <= final_texture.width) {
+            id<MTLBuffer> strip = [device newBufferWithLength:sw_px * bpp * 2 options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> sb = [cb blitCommandEncoder];
+            [sb copyFromTexture:final_texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx, sy, 0)
+                     sourceSize:MTLSizeMake(sw_px, 2, 1) toBuffer:strip destinationOffset:0
+                destinationBytesPerRow:sw_px * bpp destinationBytesPerImage:sw_px * bpp * 2];
+            [sb endEncoding];
+            const uint32_t r_dest = final_dest, r_index = final_index, r_colors = color_resolves,
+                           r_kept = kept_used, r_drawn = drawn, r_draws = uint32_t(frame->draws.size()),
+                           r_number = number;
+            const NSUInteger r_w = NSUInteger(final_texture.width), r_h = NSUInteger(final_texture.height);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+              static std::mutex m;
+              static std::vector<uint8_t> previous;
+              static uint32_t previous_dest = 0, frames = 0, repeats = 0;
+              static int lines = 200;
+              std::lock_guard<std::mutex> lock(m);
+              const auto* bytes = static_cast<const uint8_t*>(strip.contents);
+              const bool same = previous.size() == strip.length && std::memcmp(previous.data(), bytes, strip.length) == 0;
+              // Gameplay only: menus and pause screens repeat by design.
+              if (same && r_draws > 300) {
+                ++repeats;
+                if (lines-- > 0) {
+                  REXLOG_INFO("[native] repeat: frame {} shows the same picture as the one before: resolve {} of "
+                              "the frame (colour {} of {}) to {:08X}{} ({}x{}), {} of {} draws, {} resolves from "
+                              "earlier frames",
+                              r_number, r_index, r_colors, r_colors, r_dest,
+                              r_dest == previous_dest ? ", the same address as before" : ", another address",
+                              r_w, r_h, r_drawn, r_draws, r_kept);
+                }
+              }
+              if (++frames >= 300) {
+                REXLOG_INFO("[native] repeat: {} of the last 300 pictures repeated the one before", repeats);
+                frames = repeats = 0;
+              }
+              previous.assign(bytes, bytes + strip.length);
+              previous_dest = r_dest;
+            }];
+          }
+        }
+        if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+          profile_pass(rp, "present: main display");
+        id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+        // Only the picture's rectangle: the one triangle covering it reaches
+        // past its right and top edges (to 3x), where the sampler's clamp
+        // smeared the picture's edge over the black bar (the 4:3 picture on an
+        // 11" iPad: black on the left, the edge stretched on the right).
+        {
+          const double pw = std::round(dw * fit[0]), ph = std::round(dh * fit[1]);
+          const NSUInteger px = NSUInteger(std::max(0.0, std::floor((dw - pw) * 0.5)));
+          const NSUInteger py = NSUInteger(std::max(0.0, std::floor((dh - ph) * 0.5)));
+          [e setScissorRect:(MTLScissorRect){px, py,
+                                             std::min<NSUInteger>(NSUInteger(pw), drawable.texture.width - px),
+                                             std::min<NSUInteger>(NSUInteger(ph), drawable.texture.height - py)}];
+        }
+        [e setRenderPipelineState:present_pso];
+        [e setVertexBytes:fit length:sizeof(fit) atIndex:0];
+        [e setFragmentBytes:crop length:sizeof(crop) atIndex:0];
+        [e setFragmentTexture:shown_texture atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        // The touch controls, over the whole drawable (the window's size).
+        {
+          static id<MTLTexture> touch;
+          {
+            std::lock_guard<std::mutex> lock(touch_overlay_mutex);
+            if (touch_overlay_changed) {
+              touch_overlay_changed = false;
+              if (touch_overlay_pixels.empty()) {
+                touch = nil;
+              } else {
+                if (!touch || touch.width != NSUInteger(touch_overlay_w) ||
+                    touch.height != NSUInteger(touch_overlay_h)) {
+                  MTLTextureDescriptor* td =
+                      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                         width:NSUInteger(touch_overlay_w)
+                                                                        height:NSUInteger(touch_overlay_h)
+                                                                     mipmapped:NO];
+                  td.usage = MTLTextureUsageShaderRead;
+                  td.storageMode = MTLStorageModeShared;
+                  touch = [device newTextureWithDescriptor:td];
+                  touch_overlay_dirty[0] = touch_overlay_dirty[1] = 0;
+                  touch_overlay_dirty[2] = touch_overlay_w;
+                  touch_overlay_dirty[3] = touch_overlay_h;
+                }
+                const int* d = touch_overlay_dirty;
+                if (touch && d[2] > d[0] && d[3] > d[1]) {
+                  // Written while an earlier frame may still read it: at
+                  // worst a knob half-moved for one frame.
+                  [touch replaceRegion:MTLRegionMake2D(NSUInteger(d[0]), NSUInteger(d[1]), NSUInteger(d[2] - d[0]),
+                                                       NSUInteger(d[3] - d[1]))
+                           mipmapLevel:0
+                             withBytes:touch_overlay_pixels.data() + (size_t(d[1]) * size_t(touch_overlay_w) + size_t(d[0])) * 4
+                           bytesPerRow:NSUInteger(touch_overlay_w) * 4];
+                }
+                touch_overlay_dirty[0] = touch_overlay_dirty[1] = touch_overlay_dirty[2] = touch_overlay_dirty[3] = 0;
+              }
+            }
+          }
+          if (touch) {
+            if (id<MTLRenderPipelineState> overlay_pso = OverlayPipeline(device)) {
+              [e setViewport:(MTLViewport){0, 0, double(dw), double(dh), 0.0, 1.0}];
+              [e setScissorRect:(MTLScissorRect){0, 0, NSUInteger(dw), NSUInteger(dh)}];
+              [e setRenderPipelineState:overlay_pso];
+              [e setFragmentTexture:touch atIndex:0];
+              [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+              [e setRenderPipelineState:present_pso];
+            }
+          }
+        }
+        // The FPS counter, over the picture, in its own small viewport.
+        shown_drawable_width.store(int(drawable.texture.width), std::memory_order_relaxed);
+        {
+          static id<MTLTexture> counter;
+          static float rect[4];
+          {
+            std::lock_guard<std::mutex> lock(fps_overlay_mutex);
+            if (fps_overlay_changed) {
+              fps_overlay_changed = false;
+              counter = nil;
+              if (!fps_overlay_pixels.empty()) {
+                MTLTextureDescriptor* td =
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                       width:NSUInteger(fps_overlay_w)
+                                                                      height:NSUInteger(fps_overlay_h)
+                                                                   mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModeShared;
+                counter = [device newTextureWithDescriptor:td];
+                [counter replaceRegion:MTLRegionMake2D(0, 0, NSUInteger(fps_overlay_w), NSUInteger(fps_overlay_h))
+                           mipmapLevel:0
+                             withBytes:fps_overlay_pixels.data()
+                           bytesPerRow:NSUInteger(fps_overlay_w) * 4];
+                std::copy(fps_overlay_rect, fps_overlay_rect + 4, rect);
+              }
+            }
+          }
+          if (counter) {
+            const double tw = double(dw), th = double(dh);
+            const double x = std::floor(double(rect[0]) * tw), y = std::floor(double(rect[1]) * th);
+            const double w = std::min(std::round(double(rect[2]) * tw), tw - x);
+            const double h = std::min(std::round(double(rect[3]) * th), th - y);
+            if (w >= 1 && h >= 1) {
+              const float one[4] = {1.0f, 1.0f, 0, 0};
+              [e setViewport:(MTLViewport){x, y, w, h, 0.0, 1.0}];
+              [e setScissorRect:(MTLScissorRect){NSUInteger(x), NSUInteger(y), NSUInteger(w), NSUInteger(h)}];
+              [e setVertexBytes:one length:sizeof(one) atIndex:0];
+              [e setFragmentBytes:one length:sizeof(one) atIndex:0];
+              [e setFragmentTexture:counter atIndex:0];
+              [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            }
+          }
+        }
+        [e endEncoding];
+        // The same picture on the external display, fitted to its shape.
+        // Skipped while two of its frames are still waiting to be shown (a
+        // 60 Hz TV behind a 120 Hz phone must not hold the game back).
+        if (CAMetalLayer* ext = external_layer; ext && external_in_flight.load() < 2) {
+          if (id<CAMetalDrawable> xd = [ext nextDrawable]) {
+            const float xw = float(xd.texture.width), xh = float(xd.texture.height), xdst = xw / xh;
+            const float xfit[4] = {src > xdst ? 1.0f : src / xdst, src > xdst ? xdst / src : 1.0f, 0, 0};
+            MTLRenderPassDescriptor* xrp = [MTLRenderPassDescriptor renderPassDescriptor];
+            xrp.colorAttachments[0].texture = xd.texture;
+            xrp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            xrp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            xrp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            if (!lazy_diagnostics || (profile && profile_labels->size() < 255))
+              profile_pass(xrp, "present: external display");
+            id<MTLRenderCommandEncoder> xe = [cb renderCommandEncoderWithDescriptor:xrp];
+            const double pw = std::round(xw * xfit[0]), ph = std::round(xh * xfit[1]);
+            const NSUInteger px = NSUInteger(std::max(0.0, std::floor((xw - pw) * 0.5)));
+            const NSUInteger py = NSUInteger(std::max(0.0, std::floor((xh - ph) * 0.5)));
+            [xe setScissorRect:(MTLScissorRect){px, py, std::min<NSUInteger>(NSUInteger(pw), xd.texture.width - px),
+                                                std::min<NSUInteger>(NSUInteger(ph), xd.texture.height - py)}];
+            [xe setRenderPipelineState:present_pso];
+            [xe setVertexBytes:xfit length:sizeof(xfit) atIndex:0];
+            [xe setFragmentBytes:crop length:sizeof(crop) atIndex:0];
+            [xe setFragmentTexture:shown_texture atIndex:0];
+            [xe drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [xe endEncoding];
+            ++external_in_flight;
+            [xd addPresentedHandler:^(id<MTLDrawable>) {
+              --external_in_flight;
+            }];
+            [cb presentDrawable:xd];
+          }
+        }
+        // What the screen shows: a gap between two frames on it (a stutter
+        // the player sees, whatever its cause), logged with the frame's number.
+        // Frame pacing: below the display's rate (the 30, 40 and 60 caps on a
+        // 120 Hz screen, 30 on 60 Hz) each frame is presented at a target time
+        // one cap interval after the one before it: shown as soon as ready, a
+        // frame a hair late stayed one refresh more and the next one less
+        // (microstutter at 30). The grid is in step with the screen's own
+        // refreshes: it starts from the last time a frame was really shown
+        // (a grid of our own fell between refreshes and the screen rounded
+        // either way), and each target is 2 ms early so that it rounds to its
+        // refresh. (presentDrawable:afterMinimumDuration: added a refresh to
+        // every frame: 30 became 26.7.)
+        const int32_t cap = rex::cvar::Query<int32_t>("ios_fps_cap");
+        const double interval = cap > 0 ? 1.0 / double(cap) : 0.0;
+        const double display_hz = double(UIScreen.mainScreen.maximumFramesPerSecond);
+        static std::atomic<double> shown_at{0};  // the last frame really shown (presentedTime)
+        // Watchdog (as SpeedBreaker v0.1.4's presenter.cpp,
+        // github.com/SpeedBreakerProject/speedbreaker, GPL-3.0): if the screen
+        // does not honour the target times (paced frames shown well before
+        // their time, or never shown), pacing is off for the session.
+        static std::atomic<bool> pacing_broken{false};
+        // Not at the 40 cap (0.4.2): there iOS showed two frames in three a
+        // refresh after the time asked, whatever the time (frame traces
+        // IPA127-131: shown 33 / 25 / 17 ms apart in turn); shown when ready,
+        // the frames (finished every 25 +- 2 ms) came out an even 25 ms apart
+        // with a few 29 / 21 pairs (Oct 28, log nfsmw_ipa131_no_present_at_time).
+        const bool paced = REXCVAR_GET(nfsmw_native_present_at_time) && !pacing_broken.load() && interval > 0 &&
+                           shown_at.load() > 0 && double(cap) < display_hz - 1.0 && cap != 40;
+        __block double frame_target = 0;  // set below when paced
+        [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+          static std::atomic<double> last_shown{0};
+          static std::atomic<int> gap_lines{200};
+          const double at = shown.presentedTime;
+          if (frame_target > 0) {
+            static std::atomic<uint32_t> paced_count{0}, bad{0};
+            if (at <= 0 || at < frame_target - 0.004) ++bad;
+            if (++paced_count % 300 == 0) {
+              const uint32_t n = bad.exchange(0);
+              if (n > 60 && !pacing_broken.exchange(true)) {
+                REXLOG_WARN("[native] pacing off for this session: {} of 300 paced frames shown early "
+                            "or never",
+                            n);
+              }
+            }
+          }
+          TraceFrame(number, 3, at);
+          if (at <= 0) return;  // dropped, not shown
+          const double before = last_shown.exchange(at);
+          shown_at = at;
+          const double gap_ms = (at - before) * 1000.0;
+          if (before > 0 && gap_ms > 50.0 && gap_lines.fetch_sub(1) > 0) {
+            REXLOG_INFO("[native] screen gap: {:.0f} ms before frame {} was shown", gap_ms, number);
+          }
+          // Pacing: frames shown off the cap's grid (more than 4 ms from one
+          // interval after the one before), every 300 shown frames.
+          static std::atomic<uint32_t> shown_count{0}, off_grid{0};
+          static std::atomic<double> worst_ms{0};
+          // The gaps in 120 Hz refreshes (1-6, 7: longer): odd counts at the
+          // 30 or 60 cap mean the screen ran at 120 Hz.
+          static std::atomic<uint32_t> gaps[8];
+          if (before > 0 && gap_ms < 200.0) {
+            ++gaps[std::clamp(int(std::lround(gap_ms * 0.12)), 1, 7)];
+          }
+          static std::atomic<double> prev_gap_ms{0};
+          static std::atomic<int> off_lines{120};
+          const double prev_gap = prev_gap_ms.exchange(gap_ms);
+          if (before > 0 && interval > 0 && gap_ms < 200.0) {
+            const double off = std::fabs(gap_ms - interval * 1000.0);
+            if (off > 4.0) ++off_grid;
+            // Each off-grid frame (first 120): a stutter pair shows as a long
+            // gap next to a short one (IPA86, 60 cap vblank lock).
+            if (off > 4.0 && gap_ms <= 50.0 && off_lines.fetch_sub(1) > 0) {
+              REXLOG_INFO("[native] off grid: frame {} shown {:.1f} ms after the one before "
+                          "(the one before: {:.1f} ms)",
+                          number, gap_ms, prev_gap);
+            }
+            double w = worst_ms.load();
+            while (off > w && !worst_ms.compare_exchange_weak(w, off)) {}
+          }
+          if (++shown_count % 300 == 0) {
+            std::string refreshes;
+            for (int i = 1; i < 8; ++i) {
+              const uint32_t n = gaps[i].exchange(0);
+              if (n) refreshes += fmt::format(" {}{}:{}", i, i == 7 ? "+" : "", n);
+            }
+            REXLOG_INFO("[native] pacing: {} of 300 frames off the {:.1f} ms grid (worst {:.1f} ms off){} | gaps "
+                        "in 120 Hz refreshes:{}",
+                        off_grid.exchange(0), interval * 1000.0, worst_ms.exchange(0.0),
+                        paced ? ", paced" : "", refreshes);
+          }
+        }];
+        static double last_target = 0;
+        TraceFrame(number, 1, CACurrentMediaTime());
+        if (paced) {
+          // A fixed grid (0.4.2): each frame takes the first slot after the
+          // previous frame's that it can make, i.e. at least its GPU time
+          // (recent average) plus 4 ms from now. The grid used to restart from
+          // the last frame actually shown, and frames finishing around that
+          // time were shown 16.7 / 25 / 33 ms apart at the 40 cap (Oct 28 logs:
+          // ~200 of 300 off the grid); a frame that cannot make its slot now
+          // shifts the grid by whole slots and keeps it.
+          const double now = CACurrentMediaTime(), base = shown_at.load();
+          const double ready = now + recent_gpu_seconds.load(std::memory_order_relaxed) + 0.004;
+          double target;
+          if (last_target > 0 && last_target > now - 4.0 * interval && last_target < now + 4.0 * interval) {
+            target = last_target + interval;
+            while (target < ready) target += interval;
+          } else {
+            target = base + std::ceil((ready - base) / interval) * interval;  // (re)start from the screen
+          }
+          last_target = target;
+          TraceFrame(number, 4, target);
+          frame_target = target - 0.002;
+          [cb presentDrawable:drawable atTime:target - 0.002];
+        } else {
+          [cb presentDrawable:drawable];
+        }
+        ++presented;
+      }
+    }
+    // Without PNGs nothing waits for the GPU: the next frame is encoded while
+    // this one runs (in_flight counts them; the game thread records the next
+    // frame meanwhile).
+    if (!dump) {
+      // The frame's textures stay alive until the GPU is done with them:
+      // the argument buffers do not retain them, and the cache may release
+      // a texture (with its Metal copy) while the frame is still running.
+      NSArray* in_use = @[ textures, cubes, volumes ];
+      const uint32_t uploads = frame_uploads, new_buffers = frame_new_buffers;
+      const size_t probe_frame_draws = frame->draws.size();
+      const size_t drawn_count = drawn;
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)in_use;
+        TraceFrame(number, 2, done.GPUEndTime);
+        if (done.error) {
+          REXLOG_WARN("[native] GPU error: {}", done.error.localizedDescription.UTF8String);
+        } else {
+          ApplyWriteBacks(*writebacks);
+          // With early commits: from the first command buffer's start (a span).
+          const double early_start = early_gpu_start->load(std::memory_order_relaxed);
+          const double gpu_start = early_start > 0 ? std::min(early_start, done.GPUStartTime) : done.GPUStartTime;
+          const double gpu_ms = std::max(0.0, done.GPUEndTime - gpu_start) * 1000.0;
+          gpu_us += uint64_t(gpu_ms * 1000.0);
+          {  // the cost probe: this frame against the average of the 8 before
+            static std::mutex m;
+            static double recent[8] = {};
+            static int count = 0;
+            std::lock_guard<std::mutex> lock(m);
+            if (probe_ps && count >= 8) {
+              double avg = 0;
+              for (double v : recent) avg += v;
+              avg /= 8;
+              REXLOG_INFO("[cost-probe] without ps {:016x} ({} of {} draws): GPU {:.2f} ms, the 8 frames before {:.2f} ms: "
+                          "{:+.2f} ms",
+                          probe_ps, probe_draws, probe_frame_draws, gpu_ms, avg, gpu_ms - avg);
+            } else if (!probe_ps) {
+              recent[count++ % 8] = gpu_ms;
+            }
+          }
+          if (gpu_ms > 45.0) ++gpu_slow_frames;
+          {  // the recent GPU time, for the paced frames' slots
+            const double was = recent_gpu_seconds.load(std::memory_order_relaxed);
+            const double now_s = std::min(gpu_ms, 50.0) / 1000.0;
+            recent_gpu_seconds.store(was > 0 ? was + (now_s - was) * 0.1 : now_s, std::memory_order_relaxed);
+          }
+          const bool slow = gpu_ms > 45.0 && hitch_lines_left.fetch_sub(1) > 0;
+          if (slow) {
+            REXLOG_INFO("[native] hitch: frame {} took {:.1f} ms on the GPU ({} draws, {} texture uploads, "
+                        "{} new vertex buffers; thermal state {})",
+                        number, gpu_ms, drawn_count, uploads, new_buffers, nfsmw::memory::ThermalState());
+          }
+          if (profile && (profile_report || slow) && !profile_labels->empty()) {
+            const NSUInteger n = profile_labels->size();
+            NSData* raw = [profile_buffer resolveCounterRange:NSMakeRange(0, 2 * n)];
+            const auto* ts = static_cast<const MTLCounterResultTimestamp*>(raw.bytes);
+            MTLTimestamp cpu1 = 0, gpu1 = 0;
+            [done.device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+            const double ns_per_tick = gpu1 > profile_gpu0 ? double(cpu1 - profile_cpu0) / double(gpu1 - profile_gpu0) : 1.0;
+            // Each pass's incremental cost: how much later the frame's work
+            // ends because of it (passes overlap on the GPU: a pass's own
+            // span includes waiting for the one before, e.g. the depth copy
+            // after the scene). In order of submission, the end beyond the
+            // latest end so far. Grouped by label without " from draw N".
+            std::vector<std::pair<double, size_t>> cost;
+            std::map<std::string, std::pair<double, int>> groups;
+            double sum = 0, latest = 0, first = -1;
+            for (NSUInteger i = 0; ts && i < n; ++i) {
+              const uint64_t a = ts[2 * i].timestamp, b = ts[2 * i + 1].timestamp;
+              if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) continue;
+              const double start = double(a) * ns_per_tick / 1e6, end = double(b) * ns_per_tick / 1e6;
+              if (first < 0) first = latest = start;
+              const double ms = std::max(0.0, end - std::max(latest, start));
+              latest = std::max(latest, end);
+              cost.push_back({ms, i});
+              sum += ms;
+              std::string label = (*profile_labels)[i];
+              if (const size_t at = label.find(" from draw "); at != std::string::npos) {
+                const size_t paren = label.find(" (", at);
+                label = label.substr(0, at) + (paren != std::string::npos ? label.substr(paren) : "");
+              }
+              auto& g = groups[label];
+              g.first += ms;
+              ++g.second;
+            }
+            std::sort(cost.rbegin(), cost.rend());
+            std::vector<std::pair<double, std::string>> grouped;
+            for (const auto& [label, g] : groups) {
+              grouped.push_back({g.first, g.second > 1 ? fmt::format("{} ({} of them)", label, g.second) : label});
+            }
+            std::sort(grouped.rbegin(), grouped.rend());
+            REXLOG_INFO("[native] GPU profile{}: {} passes and blits, {:.2f} ms of incremental cost (first start to "
+                        "last end {:.2f} ms), frame {:.2f} ms on the GPU, unattributed {:.2f} ms "
+                        "(includes uninstrumented work and gaps; not a MetalFX measurement)",
+                        slow ? " of the slow frame" : "", n, sum, latest - std::max(first, 0.0),
+                        (done.GPUEndTime - done.GPUStartTime) * 1000.0,
+                        std::max(0.0, (done.GPUEndTime - done.GPUStartTime) * 1000.0 - sum));
+            for (size_t i = 0; i < grouped.size() && i < (slow ? 8 : 14); ++i) {
+              REXLOG_INFO("[native]   {:6.2f} ms  {}", grouped[i].first, grouped[i].second);
+            }
+            if (!slow) {
+              for (size_t i = 0; i < cost.size() && i < 5; ++i) {
+                REXLOG_INFO("[native]   single: {:6.2f} ms  {}", cost[i].first, (*profile_labels)[cost[i].second]);
+              }
+            }
+          }
+        }
+        FrameDoneOnGpu(number);
+        FrameLeft();
+      }];
+    }
+    if (visibility && !visibility_slots.empty()) {
+      // The counts, once the GPU is done: per query, the sum of its slots at
+      // the guest's resolution. A query whose draws were all left out keeps
+      // its last count.
+      const std::vector<uint32_t> queries = frame->query_ends;
+      const std::vector<VisibilitySlot> slots = visibility_slots;
+      id<MTLBuffer> results = visibility;
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.error) return;
+        const uint64_t* r = static_cast<const uint64_t*>(results.contents);
+        std::vector<double> sums(queries.size(), -1.0);
+        for (size_t i = 0; i < slots.size(); ++i) {
+          double& sum = sums[slots[i].query];
+          sum = std::max(sum, 0.0) + double(r[i]) / slots[i].divisor;
+        }
+        std::lock_guard<std::mutex> lock(occlusion_mutex);
+        for (size_t q = 0; q < queries.size(); ++q) {
+          if (sums[q] >= 0 && queries[q]) occlusion_counts[queries[q]] = uint64_t(std::llround(sums[q]));
+        }
+      }];
+    }
+    [cb commit];
+    capture.Finish();
+    {
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - render_start).count();
+      if (!dump && ms > 30.0 && hitch_lines_left.fetch_sub(1) > 0) {
+        REXLOG_INFO("[native] hitch: frame {} took {:.1f} ms to encode: {} texture uploads ({} KiB, {:.1f} ms), "
+                    "waiting for a drawable {:.1f} ms",
+                    number, ms, frame_uploads, frame_upload_bytes >> 10, frame_upload_us / 1000.0, drawable_wait_ms);
+      }
+    }
+    if (!final_texture) {
+      ++frames_without_output;
+    } else {
+      frames_without_output = 0;
+    }
+    if (!dump) {  // The frame's notes (texture formats not decoded...), each new one once.
+      static std::set<std::string> said;
+      for (const auto& [draw, note] : frame->notes) {
+        if (said.size() < 60 && said.insert(note).second) {
+          REXLOG_INFO("[native] frame {} draw {}: {}", number, draw, note);
+        }
+      }
+    }
+    if (!dump) {
+      static uint64_t upload_window[kUploadKinds] = {}, upload_window_frames = 0;
+      static uint64_t upload_window_padding = 0, upload_window_span = 0, upload_window_capacity = 0;
+      ++upload_window_frames;
+      for (size_t kind = 0; kind < kUploadKinds; ++kind) upload_window[kind] += upload_bytes[kind];
+      upload_window_padding += upload_padding;
+      upload_window_span += used;
+      upload_window_capacity += data.length;
+      // Counts cover the same reporting window, independent of GPU timestamps.
+      static uint64_t cube_stats_frames = 0, cube_stats_bindings = 0, cube_stats_removed = 0, cube_stats_copies = 0;
+      ++cube_stats_frames;
+      cube_stats_bindings += cube_binding_count;
+      cube_stats_removed += cube_duplicates_removed;
+      cube_stats_copies += cube_assembly_copies;
+      if (number % 300 == 1) {
+        // Settings that cannot change while running: in the first summary only.
+        static bool settings_logged = false;
+        const bool log_settings = !settings_logged;
+        settings_logged = true;
+        if (log_settings) REXLOG_INFO("[native] upload sizing: {} (restart required)",
+                    fused_upload_sizing ? "fused single traversal" : "legacy two traversals");
+        if (log_settings) REXLOG_INFO("[native] GPU buffer selector: {}; {} direct-mapped slots (restart required)",
+                    GpuBufferLookupHashEnabled() ? "higher-bit mix" : "legacy low bits", GpuBufferSlotMask() + 1);
+        if (GpuBufferLookupStatsEnabled()) {
+          // Scanning 4,096 slots once per summary avoids an occupancy update
+          // on every lookup. No resource owns or depends on these counters.
+          size_t occupied = 0;
+          for (const GpuBufferSlot& slot : gpu_buffer_slots) occupied += slot.key != nullptr;
+          const auto& lookup = gpu_buffer_lookup_stats;
+          REXLOG_INFO("[native] GPU buffer lookup: stats on; over {} frames ({} snapshot), "
+                      "{} hits, {} empty-slot misses, {} occupied-slot collisions; "
+                      "map fallbacks {} existing / {} new entries; {} of {} slots occupied, {} map entries "
+                      "(vertex and index lookups; new entries are not Metal allocation counts)",
+                      lookup.frames, lookup.snapshot_frames, lookup.hits, lookup.empty_misses,
+                      lookup.collisions, lookup.existing_entries, lookup.new_entries, occupied, GpuBufferSlotMask() + 1,
+                      gpu_buffers.size());
+          gpu_buffer_lookup_stats = {};
+        } else if (log_settings) {
+          REXLOG_INFO("[native] GPU buffer lookup: stats off (nfsmw_native_gpu_lookup_stats, restart required)");
+        }
+        if (log_settings) REXLOG_INFO("[native] lazy diagnostics: {}; snapshot-only preparation {} on ordinary frames",
+                    lazy_diagnostics ? "on" : "off", prepare_snapshots ? "active" : "skipped");
+        REXLOG_INFO("[native] render scheduling: utility requested {}; frame-entry QoS samples "
+                    "utility {}, default {}, user-initiated {}, user-interactive {}, background {}, other {} "
+                    "(not core placement)",
+                    NativeRenderUtility() ? "on" : "off", render_qos_entries[0], render_qos_entries[1],
+                    render_qos_entries[2], render_qos_entries[3], render_qos_entries[4], render_qos_entries[5]);
+        for (auto& count : render_qos_entries) count = 0;
+        REXLOG_INFO("[native] cube assembly: deduplication {}; over {} frames, {:.2f} bindings/frame, "
+                    "{:.2f} duplicate destinations removed/frame, {:.2f} copies/frame",
+                    deduplicate_cubes ? "on" : "off", cube_stats_frames,
+                    double(cube_stats_bindings) / cube_stats_frames, double(cube_stats_removed) / cube_stats_frames,
+                    double(cube_stats_copies) / cube_stats_frames);
+        cube_stats_frames = cube_stats_bindings = cube_stats_removed = cube_stats_copies = 0;
+        uint64_t target_bytes = 0;
+        for (const auto& [key, t] : targets) {
+          (void)key;
+          if (t.color) target_bytes += t.color.allocatedSize;
+          if (t.depth) target_bytes += t.depth.allocatedSize;
+          if (t.multisample_color && t.multisample_color != t.color) target_bytes += t.multisample_color.allocatedSize;
+          if (t.multisample_depth && t.multisample_depth != t.depth) target_bytes += t.multisample_depth.allocatedSize;
+        }
+        uint64_t resolve_bytes = 0;
+        for (const auto& [address, kept] : kept_resolves) {
+          (void)address;
+          if (kept.texture) resolve_bytes += kept.texture.allocatedSize;
+        }
+        const int64_t texture_bytes = gpu_texture_bytes.load();
+        uint64_t buffer_bytes = 0;
+        buffer_bytes = buffer_arena.Bytes();
+        nfsmw::memory::Report("native renderer");
+        constexpr double kMiB = 1024.0 * 1024.0;
+        const double upload_divisor = kMiB * double(upload_window_frames);
+        REXLOG_INFO("[native] CPU buffer copies: over {} frames, fresh vertices {:.3f}, fresh indices {:.3f}, "
+                    "constants {:.3f}, shared data {:.3f} MiB/frame | per-frame buffer span {:.3f}, "
+                    "alignment gaps {:.3f}, capacity {:.3f} MiB/frame (logical sizes, not DRAM traffic)",
+                    upload_window_frames, upload_window[kVertexUpload] / upload_divisor,
+                    upload_window[kIndexUpload] / upload_divisor, upload_window[kConstantUpload] / upload_divisor,
+                    upload_window[kSharedUpload] / upload_divisor, upload_window_span / upload_divisor,
+                    upload_window_padding / upload_divisor, upload_window_capacity / upload_divisor);
+        for (auto& bytes : upload_window) bytes = 0;
+        upload_window_frames = upload_window_padding = upload_window_span = upload_window_capacity = 0;
+        REXLOG_INFO("[native] memory: process {:.0f} MiB; retained targets {} / {:.0f} MiB, resolves {} / {:.0f} MiB, "
+                    "textures {} / {:.0f} MiB (GPU), vertex buffers {} / {:.0f} MiB | frame buffers and resolves: "
+                    "{} made, {} reused since the last line",
+                    ProcessPhysicalFootprint() / kMiB, targets.size(), target_bytes / kMiB, kept_resolves.size(),
+                    resolve_bytes / kMiB, gpu_texture_count.load(), texture_bytes / kMiB,
+                    gpu_buffers.size(), buffer_bytes / kMiB, gpu_pool.made, gpu_pool.reused);
+        gpu_pool.made = gpu_pool.reused = 0;
+        if (REXCVAR_GET(nfsmw_native_occlusion)) {
+          // The sun glare's queries: samples given to the game (guest pixels;
+          // 921600 = a full 1280x720 target, given before the first count).
+          std::string answers;
+          {
+            std::lock_guard<std::mutex> lock(occlusion_mutex);
+            for (const auto& [address, a] : occlusion_answers) {
+              answers += fmt::format(" | {:08X}: {} answers, {} of them 0, largest {}, last {}", address, a.answers,
+                                     a.zero, a.largest, a.last);
+            }
+            occlusion_answers.clear();
+          }
+          REXLOG_INFO("[native] occlusion queries since the last line ({} ends without the marker):{}",
+                      unmarked_query_ends.exchange(0), answers.empty() ? " none" : answers);
+        }
+        REXLOG_INFO("[native] depth: {} draws with a polygon offset ({}), {} with an equal depth test, since the "
+                    "last line",
+                    depth_bias_draws.exchange(0), REXCVAR_GET(nfsmw_native_depth_bias) ? "applied" : "ignored",
+                    depth_equal_draws.exchange(0));
+        const int64_t now = NowMs();
+        const double seconds = stats_since_ms ? (now - stats_since_ms) / 1000.0 : 0;
+        const uint64_t frames = number > 1 ? 300 : 1;
+        REXLOG_INFO("[native] frame {}: {} of {} draws ({} without a shader library), {} resolves, {} textures ({} cached on the GPU), "
+                    "{} vertex buffers cached, {} pipelines, {} resolves from earlier frames, {} passes split, {} last passes storing only what is read, sky drawn last {} times after {} solid draws | {:.1f} frames/s on screen, recording "
+                    "{:.2f} ms/frame (game thread: vertices {:.2f}, constants and textures {:.2f}; with the command stream "
+                    "decoding {:.2f}), rendering {:.2f} ms/frame, "
+                    "GPU {:.2f} ms/frame ({} over 45 ms) | vertex cache watch/fingerprint/miss {}/{}/{}, decoded {} attribute elements, "
+                    "expanded indices {} -> {}, index cache hits/misses {}/{}, fingerprints {} calls / {} samples ({:.2f} us/sample), {} from this frame's memo | "
+                    "textures decoded {} ({} MiB)",
+                    number, drawn, frame->draws.size(), frame->skipped_shader, resolves_done, frame->textures.size(),
+                    gpu_texture_count.load(), gpu_buffers.size(), pipeline_cache.size(), kept_used, pass_splits, stores_discarded, sky_deferred, sky_covered_draws,
+                    seconds > 0 ? presented.exchange(0) / seconds : 0.0,
+                    record_ns.exchange(0) / 1e6 / frames, record_vertex_ns.exchange(0) / 1e6 / frames,
+                    record_texture_ns.exchange(0) / 1e6 / frames, nfsmw_capture_ns.exchange(0) / 1e6 / frames,
+                    render_us.exchange(0) / 1000.0 / frames,
+                    gpu_us.exchange(0) / 1000.0 / frames, gpu_slow_frames.exchange(0),
+                    vertex_diagnostics.watched_cache_hits, vertex_diagnostics.fingerprint_cache_hits,
+                    vertex_diagnostics.cache_misses, vertex_diagnostics.decoded_vertex_elements,
+                    vertex_diagnostics.expanded_input_indices, vertex_diagnostics.expanded_output_indices,
+                    vertex_diagnostics.index_cache_hits, vertex_diagnostics.index_cache_misses,
+                    vertex_diagnostics.fingerprint_calls, vertex_diagnostics.fingerprint_sample_count,
+                    vertex_diagnostics.fingerprint_sample_count
+                        ? double(vertex_diagnostics.fingerprint_sample_ns) /
+                              double(vertex_diagnostics.fingerprint_sample_count) / 1000.0
+                        : 0.0,
+                    vertex_diagnostics.fingerprint_memo,
+                    textures_decoded_total.exchange(0), texture_decode_bytes_total.exchange(0) >> 20);
+        REXLOG_INFO("[native] early commit {}: {} early command buffers over {} frames; fingerprint memo {}; "
+                    "shadow caster variant {}: {} draws; CP fast runs {}",
+                    REXCVAR_GET(nfsmw_native_early_commit) ? "on" : "off", early_commit_total.exchange(0), frames,
+                    REXCVAR_GET(nfsmw_native_fingerprint_memo) ? "on" : "off",
+                    REXCVAR_GET(nfsmw_native_shadow_caster_variant) ? "on" : "off", caster_variant_draws,
+                    rex::cvar::Query<bool>("ios_cp_fast_runs") ? "on" : "off");
+        caster_variant_draws = 0;
+        static uint64_t* census_packets = static_cast<uint64_t*>(dlsym(RTLD_DEFAULT, "nfsmw_cp_census_packets"));
+        static uint64_t* census_words = static_cast<uint64_t*>(dlsym(RTLD_DEFAULT, "nfsmw_cp_census_words"));
+        if (census_packets && census_words && rex::cvar::Query<bool>("ios_packet_census")) {
+          uint64_t* nfsmw_cp_census_packets = census_packets;
+          uint64_t* nfsmw_cp_census_words = census_words;
+          std::vector<int> keys(130);
+          for (int i = 0; i < 130; ++i) keys[i] = i;
+          std::sort(keys.begin(), keys.end(),
+                    [&](int x, int y) { return nfsmw_cp_census_words[x] + nfsmw_cp_census_packets[x] >
+                                              nfsmw_cp_census_words[y] + nfsmw_cp_census_packets[y]; });
+          std::string census;
+          for (int k = 0; k < 10 && nfsmw_cp_census_packets[keys[k]]; ++k) {
+            const int i = keys[k];
+            census += fmt::format(" | {}: {:.1f} packets, {:.1f} words", i < 128 ? fmt::format("op {:02x}", i)
+                                                                            : i == 128 ? std::string("type 0")
+                                                                                       : std::string("type 1/2"),
+                                  double(nfsmw_cp_census_packets[i]) / frames, double(nfsmw_cp_census_words[i]) / frames);
+          }
+          REXLOG_INFO("[pm4-census] per frame over {} frames{}", frames, census);
+          std::fill(nfsmw_cp_census_packets, nfsmw_cp_census_packets + 130, 0);
+          std::fill(nfsmw_cp_census_words, nfsmw_cp_census_words + 130, 0);
+        }
+        REXLOG_INFO("[native] energy baseline: scale {:.3f}, MetalFX {}, FXAA {}, forced MSAA {}, cap {} | "
+                    "geometry decoded {:.2f} MiB/frame ({:.2f} classified dynamic), persistent arena uploads {:.2f} MiB/frame "
+                    "({:.1f} arrays/frame); arena {:.0f} MiB live / {:.0f} MiB reserved | "
+                    "recording estimated from 1/8 draws; encoding includes drawable waits; "
+                    "MetalFX GPU work not individually timed",
+                    resolution_scale, REXCVAR_GET(nfsmw_native_metalfx), REXCVAR_GET(nfsmw_native_fxaa),
+                    REXCVAR_GET(nfsmw_native_force_msaa), rex::cvar::Query<int32_t>("ios_fps_cap"),
+                    vertex_diagnostics.decoded_bytes / kMiB / frames,
+                    vertex_diagnostics.dynamic_decoded_bytes / kMiB / frames,
+                    geometry_upload_bytes / kMiB / frames, double(geometry_upload_arrays) / frames,
+                    buffer_arena.LiveBytes() / kMiB, buffer_arena.Bytes() / kMiB);
+        REXLOG_INFO("[native] fetch layouts: cache {}; {} hits, {} misses, {} bypasses since last summary",
+                    REXCVAR_GET(nfsmw_native_vfetch_cache) ? "on" : "off",
+                    vertex_diagnostics.fetch_layout_hits, vertex_diagnostics.fetch_layout_misses,
+                    vertex_diagnostics.fetch_layout_bypasses);
+        REXLOG_INFO("[native] attribute lookup: cache {}; {} hits, {} misses, {} bypasses since last summary "
+                    "(content validation unchanged)",
+                    AttributeLookupEnabled() ? "on" : "off", vertex_diagnostics.attribute_lookup_hits,
+                    vertex_diagnostics.attribute_lookup_misses, vertex_diagnostics.attribute_lookup_bypasses);
+        if (log_settings) REXLOG_INFO("[native] attribute key comparison: {}; front cache {}, {} sets (exact identity, restart required)",
+                    AttributeBulkCompareEnabled() ? "base + bulk 32 bytes" : "scalar fields",
+                    AttributeLookupEnabled() ? "on" : "off", AttributeLookupSetMask() + 1);
+        if (log_settings) REXLOG_INFO("[native] target lookup: {} (exact key, live target, restart required)",
+                    reuse_target_lookup ? "frame-local last target" : "original map");
+        if (log_settings) REXLOG_INFO("[native] pipeline lookup: {} (exact key, ready results only, restart required)",
+                    reuse_pipeline_lookup ? "last ready entry" : "original map");
+        REXLOG_INFO("[native] texture slots: pruning requested {}; skipped {} of {} slots; "
+                    "{} unknown-shader draws retained all slots (diagnostics also retain all)",
+                    REXCVAR_GET(nfsmw_native_texture_masks) ? "on" : "off",
+                    vertex_diagnostics.texture_slots_skipped, vertex_diagnostics.texture_slots_considered,
+                    vertex_diagnostics.texture_mask_unknown_draws);
+        const double arena_frames = double(std::max<uint64_t>(vertex_diagnostics.draw_arena_frames, 1));
+        REXLOG_INFO("[native] CPU draw arena: pooling {}; {:.1f} attribute lists/frame, "
+                    "{:.2f} upstream heap allocations/frame, {:.3f} MiB requested/frame; "
+                    "peak attribute storage {:.3f} MiB in this window",
+                    frame->attribute_arena.Enabled() ? "on" : "off",
+                    double(vertex_diagnostics.draw_attribute_lists) / arena_frames,
+                    double(vertex_diagnostics.draw_attribute_heap_calls) / arena_frames,
+                    double(vertex_diagnostics.draw_attribute_heap_bytes) / kMiB / arena_frames,
+                    double(vertex_diagnostics.draw_attribute_peak_bytes) / kMiB);
+        if (log_settings) REXLOG_INFO("[native] resolve compression eligibility: {} (buffer-backed textures remain ineligible)",
+                    compressible_resolves ? "enabled" : "legacy view usage");
+        REXLOG_INFO("[native] geometry arena: range reuse {}; {} empty chunks released since launch",
+                    buffer_arena.reuse_ranges ? "on" : "off", buffer_arena.chunks_released);
+        geometry_upload_bytes = geometry_upload_arrays = 0;
+        vertex_diagnostics = {};
+        stats_since_ms = now;
+        pipeline_cache.Report();
+      }
+      return;
+    }
+    [cb waitUntilCompleted];
+    ApplyWriteBacks(*writebacks);
+    FrameDoneOnGpu(number);
+    FrameLeft();
+
+    // Every target as a PNG, in order of first use.
+    NSString* docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString* root = [docs stringByAppendingPathComponent:@"native"];
+    static bool cleared = false;
+    if (!cleared) {
+      cleared = true;
+      [[NSFileManager defaultManager] removeItemAtPath:root error:nil];
+    }
+    // One folder per snapshot (menu and race both kept).
+    NSString* dir = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"frame_%05llu",
+                                                                     (unsigned long long)number]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    CIContext* ci = [CIContext contextWithMTLDevice:device];
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    int n = 0;
+    for (const std::string& key : order) {
+      const Target& t = targets[key];
+      CIImage* image = [CIImage imageWithMTLTexture:t.color options:@{kCIImageColorSpace : (__bridge id)space}];
+      // Opaque: targets often keep alpha 0, which saved as plain white.
+      image = [image imageBySettingAlphaOneInExtent:image.extent];
+      image = [image imageByApplyingTransform:CGAffineTransformMake(1, 0, 0, -1, 0, t.height)];
+      NSString* file = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"pass_%02d_%ux%u_fmt%u_%udraws.png", n++,
+                                                                                      t.pitch, t.height, t.format, t.draws]];
+      [ci writePNGRepresentationOfImage:image
+                                  toURL:[NSURL fileURLWithPath:file]
+                                 format:kCIFormatRGBA8
+                             colorSpace:space
+                                options:@{}
+                                  error:nil];
+    }
+    // What each resolve copied out, cropped to its rectangle: the passes'
+    // real outputs (a target can be cleared by its resolve), the last one
+    // the finished frame.
+    for (NSUInteger i = 0; i < resolved_textures.count && i < resolve_rects.size(); ++i) {
+      id<MTLTexture> tex = resolved_textures[i];
+      if (tex.textureType != MTLTextureType2D || resolve_rects[i].size.width == 0) {
+        continue;  // cubes (environment map faces) and swizzled views: not saved
+      }
+      CIImage* image = [CIImage imageWithMTLTexture:tex options:@{kCIImageColorSpace : (__bridge id)space}];
+      // Opaque: targets often keep alpha 0, which saved as plain white.
+      image = [image imageBySettingAlphaOneInExtent:image.extent];
+      if (tex.pixelFormat == MTLPixelFormatR32Float) {
+        // Depth (one channel): grey, stretched over 0.9-1.0 where it lives.
+        CIFilter* matrix = [CIFilter filterWithName:@"CIColorMatrix"];
+        [matrix setValue:image forKey:kCIInputImageKey];
+        const CGFloat k = 10.0;
+        [matrix setValue:[CIVector vectorWithX:k Y:0 Z:0 W:0] forKey:@"inputRVector"];
+        [matrix setValue:[CIVector vectorWithX:k Y:0 Z:0 W:0] forKey:@"inputGVector"];
+        [matrix setValue:[CIVector vectorWithX:k Y:0 Z:0 W:0] forKey:@"inputBVector"];
+        [matrix setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:0] forKey:@"inputAVector"];
+        [matrix setValue:[CIVector vectorWithX:-9 Y:-9 Z:-9 W:1] forKey:@"inputBiasVector"];
+        image = matrix.outputImage;
+      }
+      image = [image imageByApplyingTransform:CGAffineTransformMake(1, 0, 0, -1, 0, tex.height)];
+      image = [image imageByCroppingToRect:resolve_rects[i]];
+      image = [image imageByApplyingTransform:CGAffineTransformMakeTranslation(-resolve_rects[i].origin.x,
+                                                                               -resolve_rects[i].origin.y)];
+      NSString* file = [dir stringByAppendingPathComponent:
+                                [NSString stringWithFormat:@"%s.png", resolve_names[i].c_str()]];
+      [ci writePNGRepresentationOfImage:image
+                                  toURL:[NSURL fileURLWithPath:file]
+                                 format:kCIFormatRGBA8
+                             colorSpace:space
+                                options:@{}
+                                  error:nil];
+    }
+    for (const WatchSave& w : watch_saves) {
+      if (w.texture.textureType != MTLTextureType2D) continue;
+      CIImage* image = [CIImage imageWithMTLTexture:w.texture options:@{kCIImageColorSpace : (__bridge id)space}];
+      // Opaque: targets often keep alpha 0, which saved as plain white.
+      image = [image imageBySettingAlphaOneInExtent:image.extent];
+      image = [image imageByApplyingTransform:CGAffineTransformMake(1, 0, 0, -1, 0, w.texture.height)];
+      NSString* file = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.png", w.name.c_str()]];
+      [ci writePNGRepresentationOfImage:image toURL:[NSURL fileURLWithPath:file] format:kCIFormatRGBA8
+                             colorSpace:space options:@{} error:nil];
+    }
+    CGColorSpaceRelease(space);
+    REXLOG_INFO("[native] frame {}: {} of {} recorded draws drawn, {} targets saved to Documents/native; "
+                "skipped: {} inline, {} without a shader library, {} other; {} textures; {} pipeline "
+                "failures; resolves: {} done, {} skipped of {}; {} game-shader draws in pixel coordinates; "
+                "{} from their arguments",
+                number, drawn, frame->draws.size(), order.size(), frame->skipped_inline,
+                frame->skipped_shader, frame->skipped_other, frame->textures.size(), pipeline_failures,
+                resolves_done, resolves_skipped, frame->resolves.size(), screen_space_game_draws,
+                frame->from_arguments);
+    {  // snapshot frames only (every 10 s): the resolves and pass changes
+      for (const std::string& line : diagnostics) {
+        if (line.rfind("resolve", 0) != 0 && line.rfind("post draw", 0) != 0 && line.rfind("group", 0) != 0 &&
+            line.rfind("reflective", 0) != 0 && line.rfind("pass start", 0) != 0)
+          continue;
+        REXLOG_INFO("[native]   {}", line);
+      }
+    }
+    // The occlusion queries' draws and what the GPU counted (the command
+    // buffer is done: its targets were just read back).
+    if (visibility) {
+      const uint64_t* counts = static_cast<const uint64_t*>(visibility.contents);
+      for (size_t q = 0; q < frame->queries.size(); ++q) {
+        REXLOG_INFO("[native]   query {} at {:08x}, ended at {:08x}", q, frame->queries[q], frame->query_ends[q]);
+      }
+      for (const auto& [key, qn] : query_notes) {
+        const int slot = std::atoi(key.second.substr(key.second.rfind(' ') + 1).c_str());
+        std::string ps, depth, mask;
+        for (uint64_t k : qn.ps) ps += fmt::format(" {:016x}", k);
+        for (uint32_t v : qn.depth) depth += fmt::format(" {:08x}", v);
+        for (uint32_t v : qn.mask) mask += fmt::format(" {:x}", v);
+        REXLOG_INFO("[native]   query {} in {}: {} draws ({}-{}), {} indices, counted {} samples (/{:.0f} = {:.0f} "
+                    "guest pixels); ps{}; depth{}; mask{}",
+                    key.first, key.second, qn.draws, qn.first, qn.last, qn.indices, counts[slot],
+                    visibility_slots[slot].divisor, double(counts[slot]) / visibility_slots[slot].divisor, ps, depth,
+                    mask);
+      }
+    }
+    for (const auto& [draw, note] : frame->notes) {
+      REXLOG_INFO("[native]   at draw {}: {}", draw, note);
+    }
+  }
+}
+
+}  // namespace
+
+namespace {
+
+bool recording_dumps = false;  // the frame being recorded also saves PNGs
+
+// The layer, once, on the main thread.
+// On the main thread: the external display's window and layer, or none.
+void AttachExternalScreen(id<MTLDevice> device, UIScreen* screen) {
+  if (external_window) {
+    external_layer = nil;
+    external_window.hidden = YES;
+    external_window = nil;
+    if (present_view) present_view.alpha = 1.0;  // the picture back on the phone
+  }
+  if (!screen || !REXCVAR_GET(nfsmw_native_external_display)) {
+    return;
+  }
+  // An external display's own scene when iOS gives the app one (the way
+  // since iOS 13); else the older way, the window put on that screen.
+  UIWindowScene* external_scene = nil;
+  for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+    if ([scene isKindOfClass:UIWindowScene.class] && ((UIWindowScene*)scene).screen == screen) {
+      external_scene = (UIWindowScene*)scene;
+    }
+  }
+  UIWindow* window = external_scene ? [[UIWindow alloc] initWithWindowScene:external_scene]
+                                    : [[UIWindow alloc] initWithFrame:screen.bounds];
+  if (!external_scene) window.screen = screen;
+  window.frame = screen.bounds;
+  UIViewController* controller = [UIViewController new];
+  NFSExternalView* view = [[NFSExternalView alloc] initWithFrame:screen.bounds];
+  view.target = screen;
+  view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+  view.backgroundColor = UIColor.blackColor;
+  CAMetalLayer* layer = (CAMetalLayer*)view.layer;
+  layer.device = device;
+  layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+  layer.framebufferOnly = YES;
+  controller.view = view;
+  window.rootViewController = controller;
+  window.hidden = NO;
+  [view setNeedsLayout];
+  [view layoutIfNeeded];
+  external_in_flight = 0;
+  external_window = window;
+  external_layer = layer;
+  // The phone as the controller: only the touch controls, over black.
+  if (present_view && REXCVAR_GET(nfsmw_native_external_controls_only)) present_view.alpha = 0.0;
+  REXLOG_INFO("[native] external display: {}x{} pixels, the picture shown there by itself",
+              int(layer.drawableSize.width), int(layer.drawableSize.height));
+}
+
+// The first external screen, now and whenever one connects or goes.
+void WatchExternalScreens(id<MTLDevice> device) {
+  auto pick = [device] {
+    // An external display: a screen besides the phone's, or the screen of
+    // an external display's scene (AirPlay mirroring lists it only there).
+    UIScreen* external = nil;
+    for (UIScreen* screen in UIScreen.screens) {
+      if (screen != UIScreen.mainScreen) {
+        external = screen;
+        break;
+      }
+    }
+    for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+      if (!external && [scene isKindOfClass:UIWindowScene.class] &&
+          ((UIWindowScene*)scene).screen != UIScreen.mainScreen) {
+        external = ((UIWindowScene*)scene).screen;
+      }
+    }
+    if (external && external_window && ((NFSExternalView*)external_window.rootViewController.view).target == external) {
+      return;  // already there
+    }
+    if (external || external_window) {
+      if (!external) REXLOG_INFO("[native] external display gone");
+      AttachExternalScreen(device, external);
+    }
+  };
+  pick();
+  NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
+  [center addObserverForName:UIScreenDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
+                  usingBlock:^(NSNotification*) { pick(); }];
+  [center addObserverForName:UIScreenDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
+                  usingBlock:^(NSNotification*) { pick(); }];
+  [center addObserverForName:UISceneDidActivateNotification object:nil queue:NSOperationQueue.mainQueue
+                  usingBlock:^(NSNotification* note) {
+                    UIScene* scene = note.object;
+                    if ([scene isKindOfClass:UIWindowScene.class] && ((UIWindowScene*)scene).screen != UIScreen.mainScreen) pick();
+                  }];
+}
+
+void EnsurePresentLayer() {
+  static std::atomic<bool> requested{false};
+  if (requested.exchange(true)) {
+    return;
+  }
+  id<MTLDevice> device = store.device;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIWindow* window = nil;
+    for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+      // The phone's own scene: an external display's (AirPlay, HDMI) has its
+      // own window, made below.
+      if ([scene isKindOfClass:UIWindowScene.class] &&
+          ((UIWindowScene*)scene).screen == UIScreen.mainScreen) {
+        for (UIWindow* w in ((UIWindowScene*)scene).windows) {
+          if (w.isKeyWindow || !window) window = w;
+        }
+      }
+    }
+    // Every scene and window, for external display reports (AirPlay, HDMI).
+    for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+      if (![scene isKindOfClass:UIWindowScene.class]) continue;
+      UIWindowScene* ws = (UIWindowScene*)scene;
+      REXLOG_INFO("[native] scene {:x} ({}, state {}, {}): {} windows", uintptr_t((__bridge void*)ws),
+                  ws.session.role.UTF8String, int(ws.activationState),
+                  ws.screen == UIScreen.mainScreen ? "the phone's screen" : "another screen", size_t(ws.windows.count));
+      for (UIWindow* w in ws.windows) {
+        REXLOG_INFO("[native]   window {:x}{}{} level {} root {}", uintptr_t((__bridge void*)w), w.isKeyWindow ? " key" : "",
+                    w.hidden ? " hidden" : "", double(w.windowLevel),
+                    w.rootViewController ? NSStringFromClass(w.rootViewController.class).UTF8String : "none");
+      }
+    }
+    if (!window) {
+      REXLOG_WARN("[native] no window for the native renderer's layer");
+      return;
+    }
+    NFSNativeView* view = [[NFSNativeView alloc] initWithFrame:window.bounds];
+    view.userInteractionEnabled = NO;
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    CAMetalLayer* layer = (CAMetalLayer*)view.layer;
+    layer.device = device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = YES;
+    // Apple's Metal Performance HUD on this layer (the one showing the game),
+    // not on the emulated renderer's, which now hardly presents (the HUD
+    // shrank to a frame counter there).
+    if (REXCVAR_GET(nfsmw_native_metal_hud)) {
+      if (@available(iOS 16.0, *)) {
+        layer.developerHUDProperties = @{@"mode" : @"default", @"logging" : @"default"};
+      }
+    }
+    UIView* game = window.rootViewController.view;
+    if (game && game.superview == window) {
+      [window insertSubview:view aboveSubview:game];
+    } else if (game) {
+      [game addSubview:view];
+    } else {
+      [window addSubview:view];
+    }
+    [view setNeedsLayout];
+    [view layoutIfNeeded];
+    present_layer = layer;
+    present_view = view;
+    WatchExternalScreens(device);
+    REXLOG_INFO("[native] on screen ({} x {} points)", int(view.bounds.size.width),
+                int(view.bounds.size.height));
+  });
+}
+
+}  // namespace
+
+namespace nfsmw::adaptive_qos {
+void OnSwap(double interval_ms);  // adaptive_qos.cpp
+qos_class_t WorkersRaised();
+}
+
+namespace {
+bool NativeSwap();
+void NativeDraw(const NfsmwNativeDraw* draw);
+void NativeResolve(const uint32_t* regs);
+}  // namespace
+
+// The draw capture (native_draw_census.cpp, on the game thread) hands frames
+// over here unless the command processor does (nfsmw_native_cp).
+extern "C" bool nfsmw_native_cp_mode() { return REXCVAR_GET(nfsmw_native_cp); }
+extern "C" bool nfsmw_native_swap() { return REXCVAR_GET(nfsmw_native_cp) ? false : NativeSwap(); }
+extern "C" void nfsmw_native_draw(const NfsmwNativeDraw* draw) {
+  if (!REXCVAR_GET(nfsmw_native_cp)) NativeDraw(draw);
+}
+extern "C" void nfsmw_native_resolve(const uint32_t* regs) {
+  if (!REXCVAR_GET(nfsmw_native_cp)) NativeResolve(regs);
+}
+
+// From the command processor (tools/ios/patch_ios_native_only.py), on its
+// thread: the draws as it handles them, with its register file and shaders.
+namespace {
+// The renderer's keys for a shader: vertex shaders hashed with their vertex
+// fetches zeroed, pixel shaders whole (FNV-1a over the big-endian bytes, as
+// tools/native/nfsmw_shader_containers.py and the draw capture compute them).
+uint64_t ShaderKey(const uint32_t* ucode, uint32_t n, bool vertex) {
+  std::vector<uint32_t> w(ucode, ucode + n);
+  if (vertex) {
+    for (uint32_t i = 0; i + 2 < n; i += 3) {
+      const uint64_t cfs[2] = {w[i] | (uint64_t(w[i + 1] & 0xFFFF) << 32),
+                               (w[i + 1] >> 16) | (uint64_t(w[i + 2]) << 16)};
+      bool stop = false;
+      for (uint64_t cf : cfs) {
+        const uint32_t opcode = (cf >> 44) & 0xF;
+        if (opcode == 1 || opcode == 2 || (opcode >= 3 && opcode <= 6) || opcode == 13 || opcode == 14) {
+          const uint32_t address = cf & 0xFFF, count = (cf >> 12) & 7, sequence = (cf >> 16) & 0xFFF;
+          for (uint32_t k = 0; k < count; ++k) {
+            const uint32_t at = (address + k) * 3;
+            if (((sequence >> (2 * k)) & 1) && at + 2 < n && (w[at] & 0x1F) == 0) {
+              w[at] = w[at + 1] = w[at + 2] = 0;
+            }
+          }
+          stop |= opcode == 2 || opcode == 4 || opcode == 6 || opcode == 14;
+        }
+      }
+      if (stop) break;
+    }
+  }
+  uint64_t h = 0xCBF29CE484222325ull;
+  for (uint32_t v : w) {
+    for (int b = 3; b >= 0; --b) h = (h ^ ((v >> (8 * b)) & 0xFF)) * 0x100000001B3ull;
+  }
+  return h;
+}
+
+// From the very first draw, the emulated renderer draws nothing while the
+// native one is on (nfsmw_native_from_boot): its boot frames (the EA logo's
+// loading) uploaded guest memory into Vulkan's 512 MB shared-memory buffer,
+// which then stayed resident (~650 MiB of graphics memory before the native
+// renderer's first frame), for nothing.
+void ArmNativeOnlyFromBoot() {
+  static bool armed = false;
+  if (armed) return;
+  armed = true;
+  if (REXCVAR_GET(nfsmw_native_cp) && REXCVAR_GET(nfsmw_native_present) && REXCVAR_GET(nfsmw_native_exclusive) &&
+      REXCVAR_GET(nfsmw_native_from_boot)) {
+    rex_native_draws_only.store(true, std::memory_order_relaxed);
+    REXLOG_INFO("[native] the emulated renderer draws nothing from the first draw on");
+  }
+}
+
+void CpDraw(const RexNativeDraw* in) {
+  ArmNativeOnlyFromBoot();
+  if (!REXCVAR_GET(nfsmw_native_cp) || !recording || !in->vs_ucode || !in->ps_ucode) {
+    return;
+  }
+  static std::unordered_map<uint64_t, uint64_t> vs_keys, ps_keys;  // SDK hash -> key
+  auto key = [](std::unordered_map<uint64_t, uint64_t>& keys, uint64_t hash, const uint32_t* ucode, uint32_t n,
+                bool vertex) {
+    auto it = keys.find(hash);
+    if (it == keys.end()) it = keys.emplace(hash, ShaderKey(ucode, n, vertex)).first;
+    return it->second;
+  };
+  NfsmwNativeDraw d = {};
+  d.regs = in->regs;
+  d.vs_microcode = in->vs_ucode;
+  d.vs_dwords = in->vs_dwords;
+  d.vs_microcode_hash = in->vs_hash;
+  d.vs_key = key(vs_keys, in->vs_hash, in->vs_ucode, in->vs_dwords, true);
+  d.ps_key = key(ps_keys, in->ps_hash, in->ps_ucode, in->ps_dwords, false);
+  d.initiator = in->regs[0x21FC];  // VGT_DRAW_INITIATOR
+  d.index_base = in->index_base;
+  d.index_size = (in->index_endian & 3) << 30;
+  NativeDraw(&d);
+}
+
+void CpResolve(const uint32_t* regs) {
+  ArmNativeOnlyFromBoot();
+  if (REXCVAR_GET(nfsmw_native_cp)) NativeResolve(regs);
+}
+
+void CpSwap() {
+  if (REXCVAR_GET(nfsmw_native_cp)) NativeSwap();
+}
+
+// A query's begin: the draws that follow are counted. Its end: the last count
+// the GPU gave for it (a frame or two late), or "fully visible" (a 1280x720
+// target) before the first, as the emulated renderer's async queries do.
+bool CpOcclusion(uint32_t address, bool end, uint64_t* samples) {
+  if (!REXCVAR_GET(nfsmw_native_cp) || !REXCVAR_GET(nfsmw_native_occlusion)) {
+    return false;
+  }
+  // The game's end goes to the begin's address minus 0x20; when its
+  // "finished" marker was not seen there (IPA62: the query then stayed open
+  // and counted the rest of the frame), that address still ends the query.
+  const bool unmarked_end = !end && recording && recording->open_query >= 0 &&
+                            address + 0x20 == recording->queries[recording->open_query];
+  if (!end && !unmarked_end) {
+    if (recording && recording->queries.size() < kVisibilitySlots) {
+      recording->open_query = int(recording->queries.size());
+      recording->queries.push_back(address);
+      recording->query_ends.push_back(0);
+    }
+    return true;
+  }
+  if (recording && recording->open_query >= 0) {
+    recording->query_ends[recording->open_query] = address;
+    recording->open_query = -1;
+  }
+  if (unmarked_end) {
+    ++unmarked_query_ends;
+    return true;  // not an end to the SDK: it writes no answer
+  }
+  std::lock_guard<std::mutex> lock(occlusion_mutex);
+  auto it = occlusion_counts.find(address);
+  *samples = it != occlusion_counts.end() ? it->second : 1280u * 720u;
+  OcclusionAnswers& a = occlusion_answers[address];
+  a.answers += 1;
+  a.zero += *samples == 0;
+  a.largest = std::max(a.largest, *samples);
+  a.last = *samples;
+  return true;
+}
+
+// Installed when the app loads; each checks nfsmw_native_cp when called.
+__attribute__((constructor)) void InstallCommandProcessorHooks() {
+  rex_native_draw_hook.store(&CpDraw);
+  rex_native_resolve_hook.store(&CpResolve);
+  rex_native_swap_hook.store(&CpSwap);
+  rex_native_occlusion_hook.store(&CpOcclusion);
+}
+
+// The IPA90/92 frame-timing diagnostics (swap periods, repeated pictures),
+// off by default since IPA93.
+REXCVAR_DEFINE_BOOL(nfsmw_native_frame_timing_log, false, "GPU",
+                    "Native renderer: log swap-period spread and repeated pictures every 300 frames");
+uint64_t content_sum = 0;  // repeated pictures (IPA92), see NativeDraw
+uint32_t content_draws = 0;
+
+// Camera motion (Oct 28 diagnostic, D-005): every frame new and on time, yet
+// the motion feels uneven, also at 30 fps and only in parts of a donut. The
+// frame's most common c0-c3 among its draws is taken as the camera's
+// view-projection (static world draws share it); its "w" row (or column) is
+// the camera's forward axis. Per frame: the angle it turned. Every 60 frames
+// of 3D scene: the mean, the spread, frames off their neighbours by over 25%,
+// and the 60 values. Cvar nfsmw_native_camera_log.
+REXCVAR_DEFINE_BOOL(nfsmw_native_frame_trace, false, "GPU",
+                    "Native renderer: log each frame's swap, hand-over, GPU end and shown times (diagnostic)");
+void TraceFrame(uint32_t number, int stage, double t) {
+  if (!REXCVAR_GET(nfsmw_native_frame_trace)) return;
+  std::lock_guard<std::mutex> lock(frame_trace.m);
+  static bool said = false;
+  if (!said) {
+    said = true;
+    REXLOG_INFO("[frame-trace] on: per-frame swap / hand-over / GPU end / shown times");
+  }
+  auto& times = frame_trace.times;
+  times[number][size_t(stage)] = t;
+  if (stage != 3) return;
+  // Shown (or dropped, t <= 0): complete. Every 60 complete frames, the gaps.
+  static std::vector<std::array<double, 5>> done;
+  done.push_back(times[number]);
+  times.erase(times.begin(), times.upper_bound(number));
+  if (done.size() < 61) return;
+  static int lines = 400;
+  if (lines > 0) {
+    static const char* names[4] = {"swap", "handed", "gpu end", "shown"};
+    for (int k = 0; k < 4; ++k) {
+      std::string text;
+      for (size_t i = 1; i < done.size(); ++i) {
+        const double a = done[i - 1][size_t(k)], b = done[i][size_t(k)];
+        text += a > 0 && b > 0 ? fmt::format(" {:.1f}", (b - a) * 1000.0) : std::string(" -");
+      }
+      REXLOG_INFO("[frame-trace] {} gaps (ms):{}", names[k], text);
+      --lines;
+    }
+    std::string latency;
+    for (size_t i = 1; i < done.size(); ++i) {
+      const auto& f = done[i];
+      latency += f[0] > 0 && f[3] > 0 ? fmt::format(" {:.1f}/{:.1f}/{:.1f}", (f[1] - f[0]) * 1000.0,
+                                                    (f[2] - f[1]) * 1000.0, (f[3] - f[2]) * 1000.0)
+                                      : std::string(" -");
+    }
+    REXLOG_INFO("[frame-trace] per frame swap->handed / ->gpu end / ->shown (ms):{}", latency);
+    std::string vs_target;
+    for (size_t i = 1; i < done.size(); ++i) {
+      const auto& f = done[i];
+      vs_target += f[4] > 0 && f[3] > 0 ? fmt::format(" {:+.1f}/{:.1f}", (f[3] - f[4]) * 1000.0,
+                                                      (f[4] - f[1]) * 1000.0)
+                                        : std::string(" -");
+    }
+    REXLOG_INFO("[frame-trace] per frame shown minus target / target minus handed (ms):{}", vs_target);
+    --lines;
+  }
+  done.erase(done.begin(), done.end() - 1);
+}
+REXCVAR_DEFINE_BOOL(nfsmw_native_camera_log, false, "GPU",
+                    "Native renderer: log how much the game's camera turns each frame (diagnostic)");
+struct CameraVote {
+  uint32_t count = 0;
+  float m[16] = {};
+};
+std::unordered_map<uint64_t, CameraVote> camera_votes;
+uint32_t camera_draws = 0;
+void CameraOnSwap() {
+  static bool have = false, use_row = true;
+  static float prev[3] = {};
+  static std::vector<float> turns;
+  static int lines = 600;
+  const uint32_t draws = camera_draws;
+  camera_draws = 0;
+  if (camera_votes.empty() || draws < 300) {
+    camera_votes.clear();
+    have = false;
+    turns.clear();
+    return;
+  }
+  const CameraVote* best = nullptr;
+  for (const auto& [k, v] : camera_votes) {
+    if (!best || v.count > best->count) best = &v;
+  }
+  const float* m = best->m;
+  // The forward axis: row 3 (c3.xyz) or column 3 (c0.w, c1.w, c2.w); the one
+  // of length ~1 (a rotation's row) when only one is.
+  float row[3] = {m[12], m[13], m[14]}, col[3] = {m[3], m[7], m[11]};
+  auto len = [](const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+  const float lr = len(row), lc = len(col);
+  const bool row_ok = lr > 0.8f && lr < 1.2f, col_ok = lc > 0.8f && lc < 1.2f;
+  if (row_ok != col_ok) use_row = row_ok;
+  float f[3];
+  const float* src = use_row ? row : col;
+  const float l = use_row ? lr : lc;
+  camera_votes.clear();
+  if (!(l > 1e-6f)) return;
+  for (int i = 0; i < 3; ++i) f[i] = src[i] / l;
+  if (have) {
+    const float dot = std::clamp(f[0] * prev[0] + f[1] * prev[1] + f[2] * prev[2], -1.0f, 1.0f);
+    turns.push_back(std::acos(dot) * 57.29578f);
+  }
+  std::copy(f, f + 3, prev);
+  have = true;
+  if (turns.size() < 60) return;
+  double sum = 0, sq = 0;
+  for (float t : turns) sum += t, sq += double(t) * t;
+  const double mean = sum / turns.size(), sd = std::sqrt(std::max(0.0, sq / turns.size() - mean * mean));
+  int off = 0;
+  std::string values;
+  for (size_t i = 0; i < turns.size(); ++i) {
+    if (i > 0 && i + 1 < turns.size()) {
+      const double around = (turns[i - 1] + turns[i + 1]) * 0.5;
+      if (around > 0.05 && std::fabs(turns[i] - around) > 0.25 * around) ++off;
+    }
+    values += fmt::format(" {:.2f}", turns[i]);
+  }
+  if (mean > 0.05 && lines-- > 0) {
+    REXLOG_INFO("[camera] 60 frames: turn {:.2f} deg/frame, spread {:.0f}%, {} off their neighbours by over 25% "
+                "({} axis, {} draws) |{}",
+                mean, mean > 0 ? 100.0 * sd / mean : 0.0, off, use_row ? "row" : "column", draws,
+                values);
+  }
+  turns.clear();
+}
+bool NativeSwap() {
+  // Resolves the renderer wrote back to guest memory: its copies stay valid.
+  {
+    std::vector<uint32_t> addresses;
+    {
+      std::lock_guard<std::mutex> lock(written_back_mutex);
+      addresses.swap(written_back);
+    }
+    for (uint32_t a : addresses) {
+      auto pr = persistent_resolves.find(a);
+      if (pr != persistent_resolves.end()) pr->second.fingerprint = Fingerprint(Physical(a), pr->second.span);
+    }
+  }
+  // Hitch log: the time since the last swap on this (the command processor's)
+  // thread, and what the frame's recording spent it on.
+  static auto last_swap = std::chrono::steady_clock::now();
+  static size_t previous_draws = 0, previous_attribute_bytes = 0;
+  const auto swap_start = std::chrono::steady_clock::now();
+  const double swap_interval_ms = std::chrono::duration<double, std::milli>(swap_start - last_swap).count();
+  ::nfsmw::adaptive_qos::OnSwap(swap_interval_ms);
+  if (REXCVAR_GET(nfsmw_native_camera_log)) CameraOnSwap();
+  if (REXCVAR_GET(nfsmw_native_frame_timing_log)) {
+    static uint64_t previous_sum = 0;
+    static uint32_t frames = 0, repeats = 0, runs = 0, longest = 0, run = 0;
+    if (content_draws > 100) {  // a 3D scene, not a menu
+      const bool same = content_sum == previous_sum;
+      repeats += same;
+      run = same ? run + 1 : 0;
+      runs += same && run == 1;
+      longest = std::max(longest, run);
+      previous_sum = content_sum;
+      if (++frames == 300) {
+        REXLOG_INFO("[native] content: {} of 300 frames repeat the previous frame's picture ({} times, "
+                    "longest {} in a row)",
+                    repeats, runs, longest);
+        frames = repeats = runs = longest = 0;
+      }
+    }
+    content_sum = 0;
+    content_draws = 0;
+  }
+  // How evenly the game reaches its swaps (IPA90): the game times its frames
+  // with the real clock (mftb), so uneven swap-to-swap periods are uneven
+  // motion even when the screen shows every frame 16.7 ms apart. Every 300
+  // swaps: the periods' spread and how many fall in each band.
+  if (REXCVAR_GET(nfsmw_native_frame_timing_log)) {
+    static std::chrono::steady_clock::time_point previous_start;
+    static double sum = 0, sum_sq = 0, low = 1e9, high = 0;
+    static uint32_t count = 0, bands[8] = {};
+    if (previous_start.time_since_epoch().count()) {
+      const double period = std::chrono::duration<double, std::milli>(swap_start - previous_start).count();
+      if (period < 200.0) {
+        sum += period;
+        sum_sq += period * period;
+        low = std::min(low, period);
+        high = std::max(high, period);
+        static const double edges[7] = {12.0, 15.0, 16.2, 17.2, 18.5, 22.0, 30.0};
+        int b = 0;
+        while (b < 7 && period >= edges[b]) ++b;
+        ++bands[b];
+        if (++count == 300) {
+          const double mean = sum / count;
+          REXLOG_INFO("[native] swap periods: mean {:.2f} ms, spread (sd) {:.2f} ms, {:.1f}-{:.1f} | <12:{} "
+                      "12-15:{} 15-16.2:{} 16.2-17.2:{} 17.2-18.5:{} 18.5-22:{} 22-30:{} 30+:{}",
+                      mean, std::sqrt(std::max(0.0, sum_sq / count - mean * mean)), low, high, bands[0], bands[1],
+                      bands[2], bands[3], bands[4], bands[5], bands[6], bands[7]);
+          sum = sum_sq = 0;
+          low = 1e9;
+          high = 0;
+          count = 0;
+          std::fill(std::begin(bands), std::end(bands), 0u);
+        }
+      }
+    }
+    previous_start = swap_start;
+  }
+  struct {
+    bool valid = false;
+    size_t draws = 0;
+    uint64_t record_ns = 0, vertex_misses = 0, vertex_elements = 0;
+    uint32_t textures_decoded = 0;
+    uint64_t texture_bytes = 0, texture_us = 0;
+  } hitch;
+  if (recording) {
+    previous_draws = recording->draws.size();
+    previous_attribute_bytes = recording->attribute_hint_bytes;
+    const auto allocations = recording->attribute_arena.Stats();
+    auto& diagnostics = recording->vertex_diagnostics;
+    diagnostics.draw_arena_frames = 1;
+    diagnostics.draw_attribute_lists = recording->attribute_lists;
+    diagnostics.draw_attribute_heap_calls = allocations.allocations;
+    diagnostics.draw_attribute_heap_bytes = allocations.allocated_bytes;
+    diagnostics.draw_attribute_peak_bytes = allocations.peak_bytes;
+    hitch = {true, recording->draws.size(), recording->record_ns, recording->vertex_diagnostics.cache_misses,
+             recording->vertex_diagnostics.decoded_vertex_elements, recording->textures_decoded,
+             recording->texture_decode_bytes, recording->texture_decode_us};
+  }
+  ++frame_counter;
+  SweepTextureCache();
+  SweepAttributeCache();
+  Sweep(index_cache);
+  const bool present = REXCVAR_GET(nfsmw_native_present);
+  if (recording) {
+    std::unique_ptr<Frame> frame = std::move(recording);
+    previous_motion_constants.swap(frame->motion_constants);
+    frame->motion_constants.clear();
+    if (frame->movie_draws) {
+      // A movie frame: not drawn here. After three, the emulated renderer
+      // draws again and its image shows (below); the first native frame
+      // without the movie takes over again.
+      static bool said = false;
+      if (!said) {
+        said = true;
+        REXLOG_INFO("[native] a movie is playing: its frames go to the emulated renderer");
+      }
+      ++frames_without_output;
+    } else if (frame->draws.empty()) {
+      if (recording_dumps) next_dump_ms = 0;  // nothing drawn: try the next frame
+    } else {
+      ++in_flight;
+      const uint32_t number = ++dump_number;
+      TraceFrame(number, 0, CACurrentMediaTime());
+      const bool dump = recording_dumps;
+      static dispatch_queue_t queue = [] {
+        const bool utility = NativeRenderUtility();
+        // An explicit queue QoS takes precedence over the normal submitting
+        // thread's inherited QoS for dispatch_async. Keep the legacy attributes
+        // exactly when the experiment is off; no thread priorities are changed.
+        dispatch_queue_attr_t attributes = utility
+            ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)
+            : DISPATCH_QUEUE_SERIAL;
+        dispatch_queue_t created = dispatch_queue_create("nfsmw.native", attributes);
+        REXLOG_INFO("[native] render queue: {} QoS; serial frame ordering unchanged (restart to change)",
+                    utility ? "utility" : "legacy unspecified");
+        return created;
+      }();
+      __block Frame* raw = frame.release();
+      dispatch_block_t render = ^{
+        RenderFrame(std::unique_ptr<Frame>(raw), number, present, dump);
+      };
+      // Adaptive QoS boosted: above the queue's Utility for this frame.
+      if (const qos_class_t boost = ::nfsmw::adaptive_qos::WorkersRaised(); boost != QOS_CLASS_UNSPECIFIED) {
+        render = dispatch_block_create_with_qos_class(DISPATCH_BLOCK_ENFORCE_QOS_CLASS, boost, 0, render);
+      }
+      dispatch_async(queue, render);
+    }
+  }
+  // Two frames already in flight (one encoding, one on the GPU). Paced: the
+  // game waits for one to finish (up to 50 ms), so every frame it makes is
+  // shown, evenly, instead of the renderer dropping every other one at
+  // irregular times. Not paced: this frame is skipped.
+  if (in_flight >= 2 && REXCVAR_GET(nfsmw_native_present) && REXCVAR_GET(nfsmw_native_pace)) {
+    // Asleep until a frame is done (FrameLeft wakes it), not polling.
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    for (;;) {
+      const uint32_t before = frames_left.load(std::memory_order_acquire);
+      const auto left = give_up - std::chrono::steady_clock::now();
+      if (in_flight < 2 || left <= std::chrono::nanoseconds(0)) break;
+      os_sync_wait_on_address_with_timeout(
+          &frames_left, before, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(left).count()));
+    }
+  }
+  last_swap = std::chrono::steady_clock::now();
+  if (hitch.valid && swap_interval_ms > 40.0 && hitch_lines_left.fetch_sub(1) > 0) {
+    const double record_ms = hitch.record_ns / 1e6;
+    REXLOG_INFO("[native] hitch: frame {} took {:.1f} ms between swaps ({} draws): recording {:.1f} ms "
+                "({} textures decoded, {} KiB, {:.1f} ms; {} vertex cache misses, {} elements), "
+                "outside the recording {:.1f} ms, then waiting for the renderer {:.1f} ms",
+                dump_number, swap_interval_ms, hitch.draws, record_ms, hitch.textures_decoded,
+                hitch.texture_bytes >> 10, hitch.texture_us / 1000.0, hitch.vertex_misses, hitch.vertex_elements,
+                swap_interval_ms - record_ms,
+                std::chrono::duration<double, std::milli>(last_swap - swap_start).count());
+  }
+  if (in_flight >= 2) {
+    return false;
+  }
+  // No native output for a while (FMVs): the emulated renderer shows through.
+  UpdateLayerVisibility(present && frames_without_output < 3);
+  // No native frames for a while (FMVs): the emulated renderer draws again.
+  rex_native_draws_only.store(present && REXCVAR_GET(nfsmw_native_exclusive) && frames_without_output < 3,
+                              std::memory_order_relaxed);
+  const bool dump_due =
+      (REXCVAR_GET(nfsmw_native_dump) && !REXCVAR_GET(nfsmw_native_dump_manual) && NowMs() >= next_dump_ms) ||
+      (REXCVAR_GET(nfsmw_native_dump_manual) && native_dump_requested.exchange(false, std::memory_order_relaxed));
+  if (!present && !dump_due) {
+    return false;
+  }
+  store.Load();
+  if (store.functions.empty()) {
+    return false;
+  }
+  if (present) {
+    EnsurePresentLayer();
+  }
+  if (dump_due) {
+    next_dump_ms = NowMs() + std::max(500, REXCVAR_GET(nfsmw_native_dump_interval_ms));
+  }
+  recording_dumps = dump_due;
+  recording = std::make_unique<Frame>(REXCVAR_GET(nfsmw_native_draw_arena), previous_attribute_bytes, previous_draws);
+  return true;
+}
+
+// Repeated pictures (IPA92): a sum over the frame's draws of a hash of each
+// draw's first 16 vertex constants (c0-c15: its matrices). A frame whose
+// sum equals the one before drew everything where it was: the game did not
+// move its world on that frame (with every frame shown 16.7 ms apart, a
+// "skipped frame" Stefan sees).
+void NativeDraw(const NfsmwNativeDraw* draw) {
+  if (!recording) {
+    return;
+  }
+  if (REXCVAR_GET(nfsmw_native_frame_timing_log)) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 64; ++i) h = (h ^ draw->regs[kAluBase + i]) * 1099511628211ull;
+    content_sum += h;
+    ++content_draws;
+  }
+  if (REXCVAR_GET(nfsmw_native_camera_log)) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 16; ++i) h = (h ^ draw->regs[kAluBase + i]) * 1099511628211ull;
+    CameraVote& v = camera_votes[h];
+    if (v.count++ == 0) std::memcpy(v.m, draw->regs + kAluBase, sizeof(v.m));
+    ++camera_draws;
+  }
+  // Timed: one draw in eight (counted eight times). Reading the clock five
+  // times for every draw cost ~1 ms per frame on its own.
+  static uint32_t draw_tick = 0;
+  timed_draw = (++draw_tick & 7) == 0;
+  struct Timer {
+    FastClock::time_point t0;
+    bool on;
+    ~Timer() {
+      if (!on) return;
+      const uint64_t ns = 8 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           FastClock::now() - t0).count());
+      record_ns += ns;
+      if (recording) recording->record_ns += ns;
+    }
+  } timer{timed_draw ? FastClock::now() : FastClock::time_point{}, timed_draw};
+  // Without the native renderer on screen, PNG frames are menu frames only
+  // (~330 draws): a race frame (2,000-3,000) is dropped instead of decoded.
+  const size_t limit = REXCVAR_GET(nfsmw_native_present) ? 20000 : 700;
+  if (recording->draws.size() + recording->skipped_shader + recording->skipped_other > limit) {
+    recording.reset();
+    return;
+  }
+  const size_t before = recording->draws.size();
+  Record(*recording, *draw);
+  if (recording && recording->open_query >= 0 && recording->draws.size() > before) {
+    recording->draws.back().query = recording->open_query;
+  }
+}
+
+void NativeResolve(const uint32_t* regs) {
+  if (!recording) {
+    return;
+  }
+  ResolveEvent ev = {};
+  ev.after_draws = recording->draws.size();
+  const uint32_t control = regs[0x2318];  // RB_COPY_CONTROL
+  ev.control = control;
+  ev.depth = (control & 7) >= 4;
+  ev.clear_color = (control >> 8) & 1;
+  ev.clear_depth = (control >> 9) & 1;
+  ev.clear_color_value = regs[0x231E];
+  ev.clear_depth_value = regs[0x231D];
+  ev.surface_info = regs[kRbSurfaceInfo];
+  // RB_COLOR_INFO of the selected render target (0: 0x2001, 1-3: 0x2003-5).
+  const uint32_t rt = control & 3;
+  ev.color_info = regs[rt == 0 ? kRbColorInfo : 0x2002 + rt];
+  ev.depth_info = regs[kRbDepthInfo];
+  ev.dest_base = regs[0x2319] & ~0xFFFu;
+  resolve_destinations[ev.dest_base] = frame_counter;
+  const uint32_t dest_info = regs[0x231B];  // RB_COPY_DEST_INFO
+  ev.array = (dest_info >> 3) & 1;
+  ev.slice = (dest_info >> 4) & 7;
+  ev.swap = (dest_info >> 24) & 1;
+  ev.exp_bias = int32_t(dest_info << 10) >> 26;  // 6 bits at 16, signed
+  ev.dest_endian = dest_info & 7;
+  ev.dest_format = (dest_info >> 7) & 0x3F;
+  ev.dest_pitch = regs[0x231A] & 0x3FFF;
+  ev.dest_height = (regs[0x231A] >> 16) & 0x3FFF;
+  // The rectangle: three vertices (x, y) at vertex fetch 0, plus the D3D
+  // half-pixel offset and the window offset; aligned to 8 pixels.
+  const uint32_t f0 = regs[kFetchBase], f1 = regs[kFetchBase + 1];
+  if ((f0 & 3) != 3 || ((f1 >> 2) & 0xFFFFFF) != 6) {
+    Note(*recording, "resolve without its rectangle");
+    return;
+  }
+  const uint8_t* p = Physical(f0 & ~3u);
+  const auto endian = xenos::Endian(f1 & 3);
+  const float half = (regs[0x2302] & 1) ? 0.0f : 0.5f;  // PA_SU_VTX_CNTL pix_center
+  float v[6];
+  for (int i = 0; i < 6; ++i) v[i] = AsFloat(xenos::GpuSwap(LoadLE32(p + 4 * i), endian)) + half;
+  int32_t x0 = int32_t(std::lround(std::min({v[0], v[2], v[4]})));
+  int32_t y0 = int32_t(std::lround(std::min({v[1], v[3], v[5]})));
+  int32_t x1 = int32_t(std::lround(std::max({v[0], v[2], v[4]})));
+  int32_t y1 = int32_t(std::lround(std::max({v[1], v[3], v[5]})));
+  // No window offset: tiling's (see the draws); the rectangle in target
+  // coordinates, clamped.
+  x0 = std::max(x0, 0);
+  y0 = std::max(y0, 0);
+  ev.x0 = x0 & ~7;
+  ev.y0 = y0 & ~7;
+  ev.x1 = (x1 + 7) & ~7;
+  ev.y1 = (y1 + 7) & ~7;
+  recording->resolves.push_back(ev);
+  recording->resolved_so_far.insert(ev.dest_base);
+  std::fill(std::begin(recording->slot_valid), std::end(recording->slot_valid), false);
+  {
+    const uint32_t span = std::max<uint32_t>(ev.dest_pitch, 32) * std::max<uint32_t>(ev.dest_height, 32) * 4;
+    persistent_resolves[ev.dest_base] = {Fingerprint(Physical(ev.dest_base), span), span, frame_counter};
+  }
+}
+
+}  // namespace
+
+extern "C" bool nfsmw_native_overlay_active() {
+  return present_layer != nil && layer_visible.load();
+}
+
+extern "C" void nfsmw_native_set_fps_overlay(const uint8_t* bgra, int w, int h, float x, float y, float fw,
+                                              float fh) {
+  std::lock_guard<std::mutex> lock(fps_overlay_mutex);
+  if (bgra && w > 0 && h > 0) {
+    fps_overlay_pixels.assign(bgra, bgra + size_t(w) * size_t(h) * 4);
+    fps_overlay_w = w;
+    fps_overlay_h = h;
+    fps_overlay_rect[0] = x;
+    fps_overlay_rect[1] = y;
+    fps_overlay_rect[2] = fw;
+    fps_overlay_rect[3] = fh;
+  } else {
+    fps_overlay_pixels.clear();
+  }
+  fps_overlay_changed = true;
+}
+
+extern "C" void nfsmw_native_set_touch_overlay(const uint8_t* bgra, int w, int h, int x, int y, int dw, int dh) {
+  std::lock_guard<std::mutex> lock(touch_overlay_mutex);
+  touch_overlay_changed = true;
+  if (!bgra || w <= 0 || h <= 0) {
+    touch_overlay_pixels.clear();
+    touch_overlay_w = touch_overlay_h = 0;
+    return;
+  }
+  if (w != touch_overlay_w || h != touch_overlay_h) {
+    touch_overlay_pixels.assign(size_t(w) * size_t(h) * 4, 0);
+    touch_overlay_w = w;
+    touch_overlay_h = h;
+    x = 0, y = 0, dw = w, dh = h;
+  }
+  const int x0 = std::clamp(x, 0, w), y0 = std::clamp(y, 0, h);
+  const int x1 = std::clamp(x + dw, 0, w), y1 = std::clamp(y + dh, 0, h);
+  if (x1 <= x0 || y1 <= y0) return;
+  for (int row = y0; row < y1; ++row) {
+    const size_t at = (size_t(row) * size_t(w) + size_t(x0)) * 4;
+    std::memcpy(touch_overlay_pixels.data() + at, bgra + at, size_t(x1 - x0) * 4);
+  }
+  int* d = touch_overlay_dirty;
+  if (d[2] <= d[0] || d[3] <= d[1]) {
+    d[0] = x0, d[1] = y0, d[2] = x1, d[3] = y1;
+  } else {
+    d[0] = std::min(d[0], x0), d[1] = std::min(d[1], y0), d[2] = std::max(d[2], x1), d[3] = std::max(d[3], y1);
+  }
+}
+
+extern "C" int nfsmw_native_drawable_width() {
+  return shown_drawable_width.load(std::memory_order_relaxed);
+}
