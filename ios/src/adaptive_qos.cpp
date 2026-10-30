@@ -43,7 +43,13 @@
 
 #include <rex/cvar.h>
 
+#if __has_include("nfscarbon_pch.h")
+#include "nfscarbon_pch.h"
+#elif __has_include("nfsc_pch.h")
+#include "nfsc_pch.h"
+#elif __has_include("nfsmw_pch.h")
 #include "nfsmw_pch.h"
+#endif
 
 REXCVAR_DEFINE_BOOL(ios_adaptive_qos, false, "Kernel",
                     "Experiment: main and GPU command threads at Utility QoS while frames are on time "

@@ -52,6 +52,42 @@
 #include "memory_report.h"
 #include "probe.h"
 
+#ifndef NFSCARBON_WITH_GAME
+#ifdef NFSMW_WITH_GAME
+#define NFSCARBON_WITH_GAME NFSMW_WITH_GAME
+#else
+#define NFSCARBON_WITH_GAME 0
+#endif
+#endif
+
+#ifndef NFSMW_WITH_GAME
+#define NFSMW_WITH_GAME NFSCARBON_WITH_GAME
+#endif
+
+#ifndef NFSCARBON_GAME_LANGUAGE
+#ifdef NFSMW_GAME_LANGUAGE
+#define NFSCARBON_GAME_LANGUAGE NFSMW_GAME_LANGUAGE
+#else
+#define NFSCARBON_GAME_LANGUAGE "1"
+#endif
+#endif
+
+#ifndef NFSMW_GAME_LANGUAGE
+#define NFSMW_GAME_LANGUAGE NFSCARBON_GAME_LANGUAGE
+#endif
+
+#ifndef NFSCARBON_GAME_COUNTRY
+#ifdef NFSMW_GAME_COUNTRY
+#define NFSCARBON_GAME_COUNTRY NFSMW_GAME_COUNTRY
+#else
+#define NFSCARBON_GAME_COUNTRY "103"
+#endif
+#endif
+
+#ifndef NFSMW_GAME_COUNTRY
+#define NFSMW_GAME_COUNTRY NFSCARBON_GAME_COUNTRY
+#endif
+
 #if NFSMW_WITH_GAME
 #include <map>
 #include <memory>
@@ -127,8 +163,8 @@ std::vector<std::string> GameArguments(const fs::path& docs, const fs::path& iso
       "--nfsmw_render_sin_mosaico=true",
       "--audio_maxqframes=64",
       // The Xbox 360 language and country of the game's edition (USA).
-      "--user_language=" NFSMW_GAME_LANGUAGE,
-      "--user_country=" NFSMW_GAME_COUNTRY,
+      std::string("--user_language=") + NFSCARBON_GAME_LANGUAGE,
+      std::string("--user_country=") + NFSCARBON_GAME_COUNTRY,
       "--user_data_root=" + (docs / "data").string(),
       "--log_file=" + (docs / "logs" / "nfsmw.log").string(),
       // info, not debug: at debug, parche_anillo's XMA trace alone writes
@@ -409,7 +445,7 @@ int main(int argc, char* argv[]) {
   const auto isos = nfsmw::launcher::FindIsos(docs);
   const fs::path iso = isos.empty() ? fs::path() : isos.front();
 #endif
-  const bool play = NFSMW_WITH_GAME && !iso.empty();
+  const bool play = (NFSCARBON_WITH_GAME || NFSMW_WITH_GAME) && !iso.empty();
   if (iso.empty()) {
     boot::Trace("ISO: none in Documents/");
   } else {
@@ -419,7 +455,7 @@ int main(int argc, char* argv[]) {
                 (ok ? std::to_string(st.st_size) + " bytes" : "stat FAILED"));
   }
   boot::Trace(std::string("mode: ") + (play ? "game" : "probe") +
-              (NFSMW_WITH_GAME ? "" : " (this build has no game code)"));
+              ((NFSCARBON_WITH_GAME || NFSMW_WITH_GAME) ? "" : " (this build has no game code)"));
 
   std::vector<std::string> texts{argc > 0 ? argv[0] : "nfsmw"};
   if (play) {
@@ -453,7 +489,7 @@ int main(int argc, char* argv[]) {
       // On iOS, returning from main leaves SDL's window up: without this, a
       // failed start is a black screen forever and looks like a hang.
       boot::Trace("game: failed to start");
-      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "NFSMW",
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "NFS Carbon",
                                "The game failed to start.\n\nThe reason is in the app's "
                                "Documents/logs folder (boot.txt and nfsmw.log).",
                                nullptr);
