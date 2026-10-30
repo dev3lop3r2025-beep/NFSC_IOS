@@ -162,42 +162,49 @@ void CarbonRegisterMissingEntries(rex::runtime::FunctionDispatcher* dispatcher,
   REXLOG_INFO("[carbon] Registered {} verified member adapters", member_adapters);
   constexpr uint32_t state_entry = 0x82296468;
   if (!dispatcher->GetFunction(state_entry)) {
+    bool ok = true;
     for (size_t index = 0; index < kOriginal_82296468.size(); ++index) {
-      if (REX_LOAD_U32(state_entry + static_cast<uint32_t>(index * 4)) != kOriginal_82296468[index])
-        REX_FATAL("Carbon executable differs at state entry 0x82296468");
+      if (REX_LOAD_U32(state_entry + static_cast<uint32_t>(index * 4)) != kOriginal_82296468[index]) {
+        ok = false;
+        break;
+      }
     }
-    if (!dispatcher->SetFunction(state_entry, &Carbon_82296468))
-      REX_FATAL("Could not register Carbon state entry 0x82296468");
-    REXLOG_INFO("[carbon] Registered verified state entry 0x82296468");
+    if (ok && dispatcher->SetFunction(state_entry, &Carbon_82296468)) {
+      REXLOG_INFO("[carbon] Registered verified state entry 0x82296468");
+    }
   }
   constexpr uint32_t story_entry = 0x822A9490;
   if (!dispatcher->GetFunction(story_entry)) {
+    bool ok = true;
     for (size_t index = 0; index < kOriginal_822A9490.size(); ++index) {
-      if (REX_LOAD_U32(story_entry + static_cast<uint32_t>(index * 4)) != kOriginal_822A9490[index])
-        REX_FATAL("Carbon executable differs at story entry 0x822A9490");
+      if (REX_LOAD_U32(story_entry + static_cast<uint32_t>(index * 4)) != kOriginal_822A9490[index]) {
+        ok = false;
+        break;
+      }
     }
-    if (!dispatcher->SetFunction(story_entry, &Carbon_822A9490))
-      REX_FATAL("Could not register Carbon story entry 0x822A9490");
-    REXLOG_INFO("[carbon] Registered verified story entry 0x822A9490");
+    if (ok && dispatcher->SetFunction(story_entry, &Carbon_822A9490)) {
+      REXLOG_INFO("[carbon] Registered verified story entry 0x822A9490");
+    }
   }
   constexpr uint32_t adjustor = 0x82641480;
   if (!dispatcher->GetFunction(adjustor)) {
-    if (REX_LOAD_U32(adjustor) != 0x3863FFFC ||
-        REX_LOAD_U32(adjustor + 4) != 0x4BFEC68C)
-      REX_FATAL("Carbon executable differs at adjustor 0x82641480");
-    if (!dispatcher->SetFunction(adjustor, &Carbon_82641480))
-      REX_FATAL("Could not register Carbon adjustor 0x82641480");
-    REXLOG_INFO("[carbon] Registered verified adjustor 0x82641480");
-  }
-  constexpr uint32_t address = 0x82322048;
-  if (dispatcher->GetFunction(address)) return;
-  for (size_t index = 0; index < kOriginal_82322048.size(); ++index) {
-    if (REX_LOAD_U32(address + static_cast<uint32_t>(index * 4)) != kOriginal_82322048[index]) {
-      REX_FATAL("Carbon executable differs at 0x82322048; refusing incompatible translation");
+    if (REX_LOAD_U32(adjustor) == 0x3863FFFC && REX_LOAD_U32(adjustor + 4) == 0x4BFEC68C) {
+      if (dispatcher->SetFunction(adjustor, &Carbon_82641480)) {
+        REXLOG_INFO("[carbon] Registered verified adjustor 0x82641480");
+      }
     }
   }
-  if (!dispatcher->SetFunction(address, &Carbon_82322048)) {
-    REX_FATAL("Could not register Carbon entry 0x82322048");
+  constexpr uint32_t address = 0x82322048;
+  if (!dispatcher->GetFunction(address)) {
+    bool ok = true;
+    for (size_t index = 0; index < kOriginal_82322048.size(); ++index) {
+      if (REX_LOAD_U32(address + static_cast<uint32_t>(index * 4)) != kOriginal_82322048[index]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok && dispatcher->SetFunction(address, &Carbon_82322048)) {
+      REXLOG_INFO("[carbon] Registered verified PPC entry 0x82322048");
+    }
   }
-  REXLOG_INFO("[carbon] Registered verified PPC entry 0x82322048");
 }

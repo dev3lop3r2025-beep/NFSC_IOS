@@ -19,6 +19,7 @@
 #endif
 
 #include <rex/image_info.h>
+#include "carbon_missing_entries.h"
 
 extern const rex::PPCImageInfo PPCImageConfig;
 
@@ -51,7 +52,9 @@ class NfsCarbonApp : public rex::ReXApp {
       };
       for (const auto& candidate : candidates) {
         std::error_code ec;
-        if (!candidate.empty() && std::filesystem::is_directory(candidate / "NFS", ec)) {
+        if (!candidate.empty() && (std::filesystem::exists(candidate / "default.xex", ec) ||
+                                   std::filesystem::is_directory(candidate / "GLOBAL", ec) ||
+                                   std::filesystem::is_directory(candidate / "NFS", ec))) {
           paths.game_data_root = candidate;
           break;
         }
@@ -69,7 +72,9 @@ class NfsCarbonApp : public rex::ReXApp {
     };
     for (const auto& candidate : candidates) {
       std::error_code ec;
-      if (std::filesystem::is_directory(candidate / "NFS", ec)) {
+      if (!candidate.empty() && (std::filesystem::exists(candidate / "default.xex", ec) ||
+                                 std::filesystem::is_directory(candidate / "GLOBAL", ec) ||
+                                 std::filesystem::is_directory(candidate / "NFS", ec))) {
         paths.game_data_root = candidate;
         return;
       }
@@ -135,6 +140,14 @@ class NfsCarbonApp : public rex::ReXApp {
 
   void OnPostSetup() override {
     rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
+  }
+
+  void OnPreLaunchModule() override {
+    REXLOG_INFO("[carbon] OnPreLaunchModule: registering missing entries and diagnostic hooks");
+    CarbonRegisterMissingEntries(runtime()->function_dispatcher(),
+                                 runtime()->virtual_membase());
+    CarbonInstallDiagnosticHooks(runtime()->function_dispatcher(),
+                                 runtime()->virtual_membase());
   }
 
  private:

@@ -121,19 +121,42 @@ REXCVAR_DEFINE_BOOL(ios_async_submits, true, "GPU",
 REXCVAR_DEFINE_BOOL(ios_mvk_performance, false, "GPU",
                     "iOS: MoltenVK performance tracking, summarised in the log every 300 frames");
 
+#include <csignal>
+#include <spdlog/spdlog.h>
+
+#ifndef NFSC_GAME_LANGUAGE
+#define NFSC_GAME_LANGUAGE "en"
+#endif
+#ifndef NFSC_GAME_COUNTRY
+#define NFSC_GAME_COUNTRY "US"
+#endif
+
 // A CAPTURE button in the game that saves a Metal GPU frame capture to
 // Documents/captures/ (gpu_capture.mm). Needs Metal capture enabled before the
 // device exists, so it is decided here, at startup.
 REXCVAR_DEFINE_BOOL(ios_gpu_capture, false, "GPU",
                     "iOS: a CAPTURE button that saves a Metal GPU frame capture to "
                     "Documents/captures (open it in Xcode)");
-REXCVAR_DEFINE_BOOL(nfsmw_battery_optimizations, true, "GPU",
-                    "Combined battery experiment: force all five optimizations on or off (restart required)");
-REXCVAR_DEFINE_BOOL(nfsmw_native_constant_copies, true, "CPU",
-                    "Native float-constant copy loops in the USA game graphics front end (restart required)");
 
-REXCVAR_DEFINE_BOOL(nfsmw_native_transform_copies, true, "CPU",
-                    "Avoid float mode round-trips in two USA transform transfers (restart required)");
+static void CrashSignalHandler(int sig) {
+  const char* sig_name = "UNKNOWN";
+  switch (sig) {
+    case SIGSEGV: sig_name = "SIGSEGV"; break;
+    case SIGBUS: sig_name = "SIGBUS"; break;
+    case SIGABRT: sig_name = "SIGABRT"; break;
+    case SIGILL: sig_name = "SIGILL"; break;
+    case SIGFPE: sig_name = "SIGFPE"; break;
+  }
+  std::fprintf(stderr, "\n[FATAL CRASH] Caught signal %d (%s)!\n", sig, sig_name);
+  REXLOG_ERROR("[FATAL CRASH] Caught signal {} ({})", sig, sig_name);
+  rex::FlushLogging();
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush();
+  }
+  std::fflush(nullptr);
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
 
 namespace {
 
@@ -143,9 +166,6 @@ fs::path DocumentsFolder() {
   return fs::path(paths.firstObject.UTF8String);
 }
 
-// The Android app's fixed arguments (Ajustes.argumentos) with their default
-// values, minus the ones that do not exist on iOS (android_*,
-// thread_affinity). The command line wins over nfsmw.toml.
 std::vector<std::string> GameArguments(const fs::path& docs, const fs::path& iso) {
   return {
       "--gpu_plugin=xenos",
@@ -160,21 +180,19 @@ std::vector<std::string> GameArguments(const fs::path& docs, const fs::path& iso
       "--resolution_scale=1",
       "--readback_resolve=fast",
       "--gpu_sin_msaa=true",
-      "--nfsmw_render_sin_mosaico=true",
+      "--carbon_single_pass=true",
       "--audio_maxqframes=64",
       // The Xbox 360 language and country of the game's edition (USA).
       std::string("--user_language=") + NFSCARBON_GAME_LANGUAGE,
       std::string("--user_country=") + NFSCARBON_GAME_COUNTRY,
       "--user_data_root=" + (docs / "data").string(),
-      "--log_file=" + (docs / "logs" / "nfsmw.log").string(),
-      // info, not debug: at debug, parche_anillo's XMA trace alone writes
-      // ~4,700 lines a second (5 MB of log every ~10 s on an iPad M4), which
-      // costs frames and rotates the startup lines out of the log.
+      "--log_file=" + (docs / "logs" / "nfscarbon.log").string(),
       "--log_level=info",
-      "--log_flush_interval=2",
+      "--log_flush_interval=1",
       "--game_data_root=" + iso.string(),
   };
 }
+
 
 // "--name=value" or "--name" -> "--name".
 std::string OptionName(const std::string& arg) {
@@ -191,34 +209,7 @@ void SetArgument(std::vector<std::string>& args, const std::string& arg) {
   args.push_back(arg);
 }
 
-// Expand before parsing so late-loaded GPU plugin flags receive the same
-// command-line overrides. The group wins over stale individual overrides.
-void ApplyBatteryExperiment(std::vector<std::string>& args) {
-  bool enabled = true;
-  bool low_cap = false;
-  for (const auto& arg : args) {
-    const std::string name = OptionName(arg);
-    const size_t equals = arg.find('=');
-    const std::string value = equals == std::string::npos ? "true" : arg.substr(equals + 1);
-    if (name == "--nfsmw_battery_optimizations") {
-      enabled = value != "false" && value != "0" && value != "off" && value != "no";
-    }
-    if (name == "--ios_fps_cap") low_cap = value == "30" || value == "40";
-  }
-  const std::string value = enabled ? "true" : "false";
-  for (const char* flag : {"nfsmw_native_deduplicate_cubes", "ios_native_bulk_constants",
-                           "nfsmw_native_reclaim_geometry", "nfsmw_native_vfetch_cache",
-                           "nfsmw_native_compressible_resolves"}) {
-    SetArgument(args, std::string("--") + flag + "=" + value);
-  }
-  SetArgument(args, std::string("--ios_battery_baseline_qos=") + (!enabled && !low_cap ? "true" : "false"));
-}
-
-// Utility QoS for the game threads (tools/ios/patch_ios_utility_qos.py) runs
-// them on the efficiency cores: about a quarter less drain on an iPad Pro M4
-// (6 E cores) at 1.5x / 60, but an iPhone 17 Pro (4 E cores) fell to 45-55 fps
-// (docs/TECHNICAL.md, October 21). Default on only with 6 or more efficiency
-// cores; an explicit --ios_utility_qos / --ios_utility_qos_guest wins.
+// Utility QoS for the game threads runs them on the efficiency cores:
 int utility_qos_efficiency_cores = -1;
 const char* utility_qos_source = "default";
 
@@ -228,13 +219,6 @@ void ApplyUtilityQosDefault(std::vector<std::string>& args) {
   if (sysctlbyname("hw.perflevel1.physicalcpu", &cores, &size, nullptr, 0) != 0) cores = 0;
   utility_qos_efficiency_cores = cores;
   const bool on = cores >= 6;
-  // Above 60 fps (the 120 cap) the main and GPU command threads need the
-  // performance cores' headroom: adaptive there (adaptive_qos.cpp), so the cap
-  // is still reached while frames have time to spare. With fewer efficiency
-  // cores (iPhones, M1 iPads) adaptive at every cap: at 30/40 fps or in light
-  // scenes they run on the efficiency cores, and switch back when frames are late.
-  // The other guest threads at Utility on every device (since October 22: the
-  // iPhone 17 Pro held 60 with it in every run from October 21).
   int cap = 60;
   for (const auto& arg : args) {
     if (OptionName(arg) == "--ios_fps_cap" && arg.find('=') != std::string::npos) cap = std::atoi(arg.c_str() + arg.find('=') + 1);
@@ -256,9 +240,7 @@ void ApplyUtilityQosDefault(std::vector<std::string>& args) {
 
 // Documents/extra_args.txt: one argument per line; blank lines and lines
 // starting with '#' are ignored. Each replaces any argument with the same
-// option name already in `args`. UTF-8, or UTF-16 with its byte-order mark
-// (a file passed through the Mac's clipboard/TextEdit came as UTF-16 LE and
-// every argument was ignored, Oct 28).
+// option name already in `args`. UTF-8, or UTF-16 with its byte-order mark.
 void ApplyExtraArguments(const fs::path& file, std::vector<std::string>& args) {
   NSData* data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:file.c_str()]];
   if (!data) {
@@ -267,7 +249,7 @@ void ApplyExtraArguments(const fs::path& file, std::vector<std::string>& args) {
   NSString* text = nil;
   const auto* bytes = static_cast<const uint8_t*>(data.bytes);
   if (data.length >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF))) {
-    text = [[NSString alloc] initWithData:data encoding:NSUTF16StringEncoding];  // the mark picks the order
+    text = [[NSString alloc] initWithData:data encoding:NSUTF16StringEncoding];
     nfsmw::boot::Trace("extra_args.txt: UTF-16, converted");
   }
   if (!text) {
@@ -278,7 +260,7 @@ void ApplyExtraArguments(const fs::path& file, std::vector<std::string>& args) {
     return;
   }
   if ([text hasPrefix:@"\uFEFF"]) {
-    text = [text substringFromIndex:1];  // a UTF-8 byte-order mark
+    text = [text substringFromIndex:1];
   }
   std::istringstream in(text.UTF8String);
   std::string line;
@@ -289,9 +271,6 @@ void ApplyExtraArguments(const fs::path& file, std::vector<std::string>& args) {
       continue;
     }
     line = line.substr(a, b - a + 1);
-    // iOS' Smart Punctuation turns a typed "--" into an em dash (and sometimes
-    // an en dash): "—resolution=..." reached the parser as a plain word and
-    // was ignored. Both, as a prefix, mean "--".
     for (const char* dash : {"\u2014", "\u2013"}) {
       const std::string d(dash);
       if (line.compare(0, d.size(), d) == 0) {
@@ -299,14 +278,11 @@ void ApplyExtraArguments(const fs::path& file, std::vector<std::string>& args) {
         break;
       }
     }
-    // And a curly quote, should one get in, is a straight one.
     for (const char* quote : {"\u201C", "\u201D"}) {
       for (size_t at; (at = line.find(quote)) != std::string::npos;) {
         line.replace(at, std::string(quote).size(), "\"");
       }
     }
-    // Option names are C++ identifiers (cvars): "--ios-retina" can only mean
-    // "--ios_retina". Only the name, before '=', is touched.
     if (line.compare(0, 2, "--") == 0) {
       const size_t name_end = std::min(line.find('='), line.size());
       std::replace(line.begin() + 2, line.begin() + name_end, '-', '_');
@@ -317,17 +293,11 @@ void ApplyExtraArguments(const fs::path& file, std::vector<std::string>& args) {
 }
 
 #if NFSMW_WITH_GAME
-// The same as EjecutarJuego in android_main.cpp. On iOS the SDK is not in
-// "several apps in one library" mode (that is Android only), so the app comes
-// from GetWindowedAppCreator(), as on desktop.
 int RunGame(int argc, char* argv[], const fs::path& docs) {
   namespace boot = nfsmw::boot;
-  // The audio session, activated off the game's threads while the rest starts
-  // (coreaudio_driver.mm: setActive can block).
   rex::audio::ios::PrepareAudioSession();
   boot::Trace("game: parsing the arguments");
   std::vector<std::string> experiment_args(argv, argv + argc);
-  ApplyBatteryExperiment(experiment_args);
   ApplyUtilityQosDefault(experiment_args);
   std::vector<char*> experiment_argv;
   for (auto& arg : experiment_args) experiment_argv.push_back(arg.data());
@@ -335,45 +305,31 @@ int RunGame(int argc, char* argv[], const fs::path& docs) {
   auto leftovers = rex::cvar::Init(int(experiment_args.size()), experiment_argv.data());
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
-  // Before OnInitialize, which loads MoltenVK: it reads its settings from the
-  // environment when it starts.
+
   setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", REXCVAR_GET(ios_async_submits) ? "0" : "1", 1);
-  // Metal's capture layer only for the capture button: it wraps every Metal
-  // call (several times the renderer's encoding cost).
   setenv("MTL_CAPTURE_ENABLED", REXCVAR_GET(ios_gpu_capture) ? "1" : "0", 1);
   if (REXCVAR_GET(ios_mvk_performance)) {
     setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "1", 1);
     setenv("MVK_CONFIG_PERFORMANCE_LOGGING_FRAME_COUNT", "300", 1);
   }
-  // The log file now, not only when the app sets it up in SetupEnvironment:
-  // that call only changes levels, and anything the SDK says before it lands
-  // in the file too.
-  rex::InitLogging((docs / "logs" / "nfsmw.log").c_str(),
+
+  rex::InitLogging((docs / "logs" / "nfscarbon.log").c_str(),
                    REXCVAR_GET(log_level) == "off" ? spdlog::level::off : spdlog::level::info);
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush_on(spdlog::level::info);
+  }
+  spdlog::flush_every(std::chrono::seconds(1));
+
   REXLOG_INFO("[ios] game: starting, build " __DATE__ " " __TIME__
               " (MoltenVK submissions {}, MoltenVK profiling {})",
               REXCVAR_GET(ios_async_submits) ? "asynchronous" : "synchronous",
               REXCVAR_GET(ios_mvk_performance) ? "on" : "off");
   nfsmw::memory::Report("log open");
-  REXLOG_INFO("[battery-group] all five experiments {}; individual overrides replaced; baseline QoS {}",
-              REXCVAR_GET(nfsmw_battery_optimizations) ? "on" : "off",
-              rex::cvar::Query<bool>("ios_battery_baseline_qos") ? "on" : "off");
   REXLOG_INFO("[utility-qos] {} efficiency cores; main/GPU threads {}, other guest threads {}, adaptive {} ({})",
               utility_qos_efficiency_cores, rex::cvar::Query<bool>("ios_utility_qos") ? "on" : "off",
               rex::cvar::Query<bool>("ios_utility_qos_guest") ? "on" : "off",
               rex::cvar::Query<bool>("ios_adaptive_qos") ? "on" : "off", utility_qos_source);
-  REXLOG_INFO("[gpr-helpers] native register save/restore helpers {}",
-              rex::cvar::Query<bool>("nfsmw_native_gpr_helpers") ? "on" : "off");
-  REXLOG_INFO("[constant-copies] native float copies {}; separate from the five-option battery group",
-              REXCVAR_GET(nfsmw_native_constant_copies) ? "on" : "off");
-  REXLOG_INFO("[transform-copies] native scalar transfers {}; separate from the five-option battery group",
-              REXCVAR_GET(nfsmw_native_transform_copies) ? "on" : "off");
-  if (REXCVAR_GET(ios_gpu_capture)) {
-    setenv("NFSMW_SIGNAL_REPORT", (docs / "logs" / "native_fault.txt").c_str(), 1);
-    REXLOG_INFO("[gpu-capture] unhandled fault report: logs/native_fault.txt");
-  } else {
-    unsetenv("NFSMW_SIGNAL_REPORT");
-  }
+
   boot::Trace("game: initializing the SDL context");
 
   rex::ui::SDLWindowedAppContext context;
@@ -401,10 +357,26 @@ int RunGame(int argc, char* argv[], const fs::path& docs) {
   nfsmw::memory::StartPeriodicReports(10);
   nfsmw::battery::Start();
   boot::Trace(initialized ? "game: OnInitialize done, entering the main loop"
-                          : "game: OnInitialize FAILED (reason in nfsmw.log)");
+                          : "game: OnInitialize FAILED (reason in nfscarbon.log)");
+  REXLOG_INFO("[ios] entering main message loop...");
   rex::FlushLogging();
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush();
+  }
+
   const int result = initialized ? context.RunMainMessageLoop() : EXIT_FAILURE;
-  boot::Trace("game: main loop ended");
+
+  REXLOG_INFO("[ios] main message loop returned with exit code {}", result);
+  if (auto* kernel = rex::system::kernel_state()) {
+    REXLOG_INFO("[ios] kernel title terminated: {}", kernel->is_title_terminated());
+  }
+  rex::FlushLogging();
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush();
+  }
+  std::fflush(nullptr);
+
+  boot::Trace("game: main loop ended (exit code " + std::to_string(result) + ")");
   app->InvokeOnDestroy();
   return result;
 }
@@ -414,16 +386,22 @@ int RunProbe(int argc, char* argv[], const fs::path& docs) {
   rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
-  // There is no app to open the log file in the probe: open it here.
-  rex::InitLogging((docs / "logs" / "nfsmw.log").c_str());
+  rex::InitLogging((docs / "logs" / "nfscarbon.log").c_str());
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush_on(spdlog::level::info);
+  }
   return NfsmwVulkanProbe((docs / "vulkan_probe.txt").string());
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  // The game is landscape only; the launcher before it also allows portrait
-  // (Info.plist lists both). SDL's own view controller follows this hint.
+  std::signal(SIGSEGV, CrashSignalHandler);
+  std::signal(SIGBUS, CrashSignalHandler);
+  std::signal(SIGABRT, CrashSignalHandler);
+  std::signal(SIGILL, CrashSignalHandler);
+  std::signal(SIGFPE, CrashSignalHandler);
+
   setenv("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight", 1);
   SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
   const fs::path docs = DocumentsFolder();
@@ -437,7 +415,6 @@ int main(int argc, char* argv[]) {
   boot::Trace("Documents: " + docs.string());
 
 #if NFSMW_WITH_GAME
-  // The pre-launch screen: settings, the ISO, Play (launcher.mm).
   boot::Trace("launcher: on screen");
   const fs::path iso = nfsmw::launcher::Run(docs);
   boot::Trace("launcher: Play");
@@ -457,7 +434,7 @@ int main(int argc, char* argv[]) {
   boot::Trace(std::string("mode: ") + (play ? "game" : "probe") +
               ((NFSCARBON_WITH_GAME || NFSMW_WITH_GAME) ? "" : " (this build has no game code)"));
 
-  std::vector<std::string> texts{argc > 0 ? argv[0] : "nfsmw"};
+  std::vector<std::string> texts{argc > 0 ? argv[0] : "nfscarbon"};
   if (play) {
     const auto game = GameArguments(docs, iso);
     texts.insert(texts.end(), game.begin(), game.end());
@@ -466,13 +443,12 @@ int main(int argc, char* argv[]) {
       boot::Trace("setting: " + a);
     }
     ApplyExtraArguments(docs / "extra_args.txt", texts);
-    // The Logging switch off: no more boot trace either.
     if (std::find(texts.begin(), texts.end(), std::string("--log_level=off")) != texts.end()) {
       boot::Trace("logging off");
       boot::SetEnabled(false);
     }
   } else {
-    texts.push_back("--log_file=" + (docs / "logs" / "nfsmw.log").string());
+    texts.push_back("--log_file=" + (docs / "logs" / "nfscarbon.log").string());
     texts.push_back("--log_level=info");
   }
   std::vector<char*> args;
@@ -486,12 +462,10 @@ int main(int argc, char* argv[]) {
   if (play) {
     const int result = RunGame(n, args.data(), docs);
     if (result != EXIT_SUCCESS) {
-      // On iOS, returning from main leaves SDL's window up: without this, a
-      // failed start is a black screen forever and looks like a hang.
       boot::Trace("game: failed to start");
       SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "NFS Carbon",
                                "The game failed to start.\n\nThe reason is in the app's "
-                               "Documents/logs folder (boot.txt and nfsmw.log).",
+                               "Documents/logs folder (boot.txt and nfscarbon.log).",
                                nullptr);
     }
     return result;
@@ -499,3 +473,4 @@ int main(int argc, char* argv[]) {
 #endif
   return RunProbe(n, args.data(), docs);
 }
+

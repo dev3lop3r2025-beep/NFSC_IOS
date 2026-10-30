@@ -306,80 +306,24 @@ const std::vector<Section>& Sections() {
             @"in an iCloud Drive folder, kept in sync between your devices.",
             @""},
        }, kTabGame},
-      {@"Career", @"Features of the PC mod Extra Options (nfsmods.xyz/mod/43), ported to the Xbox 360 "
-       @"game.",
+      {@"Options", nil,
        {
-           {@"marker_count", Type::kChoice, @"Markers after beating a rival",
-            @"How many of the six markers you pick after beating a Blacklist rival. The game's "
-            @"is 2.",
-            @"2",
-            {{@"1", @"1"}, {@"2", @"2"}, {@"3", @"3"}, {@"4", @"4"}, {@"5", @"5"}, {@"6", @"6"}}},
-           {@"car_limit", Type::kChoice, @"Cars you can buy",
-            @"How many cars you can buy at the car lot. Blacklist and bonus cars do not count. "
-            @"The game's is 10.",
-            @"10",
-            {{@"10", @"10"}, {@"12", @"12"}, {@"15", @"15"}, {@"18", @"18"}, {@"20", @"20"},
-             {@"25", @"25"}}},
            {@"skip_movies", Type::kSwitch, @"Skip movies",
-            @"Skips the game's movies, as Extra Options' SkipMovies: the EA logo and intro go "
-            @"straight to \"press start\". The story movies of the career are skipped too.",
+            @"Skips intro movies and goes straight to press start.",
             @"false"},
-           {@"old_bridge", Type::kSwitch, @"Open the road to the Old Bridge",
-            @"Removes the barrier that closes the road to the Old Bridge.",
-            @"false"},
-       }, kTabExtras},
-      {@"Quick Race", nil,
-       {
-           {@"laps_max", Type::kChoice, @"Most laps",
-            @"The most laps you can pick for a circuit, lap knockout or tollbooth race. The game's "
-            @"is 8.",
-            @"8",
-            {{@"8 (game)", @"8"}, {@"10", @"10"}, {@"15", @"15"}, {@"20", @"20"}, {@"30", @"30"},
-             {@"50", @"50"}, {@"99", @"99"}}},
-           {@"opponents_max", Type::kChoice, @"Most opponents (experimental)",
-            @"The most opponents you can pick. The game's is 3. On PC the 4th and later can get "
-            @"odd cars; more cars on the road also cost speed and memory.",
-            @"3",
-            {{@"3 (game)", @"3"}, {@"4", @"4"}, {@"5", @"5"}, {@"6", @"6"}}},
-           {@"traffic_low", Type::kChoice, @"Traffic at Low", @"How much traffic the Low setting means.",
-            @"10", Percent(@"10")},
-           {@"traffic_medium", Type::kChoice, @"Traffic at Medium",
-            @"How much traffic the Medium setting means.", @"30", Percent(@"30")},
-           {@"traffic_high", Type::kChoice, @"Traffic at High",
-            @"How much traffic the High setting means. 100 is bumper to bumper.", @"50", Percent(@"50")},
-       }, kTabExtras},
-      {@"Weather", nil,
-       {
-           {@"always_rain", Type::kSwitch, @"Always rain",
-            @"Rain everywhere, all the time (the game rains only in a few places).",
-            @"false"},
-           {@"rain_amount", Type::kChoice, @"Rain amount", @"How much rain falls.", @"1",
-            {{@"0.5x", @"0.5"}, {@"1x (game)", @"1"}, {@"1.5x", @"1.5"}, {@"2x", @"2"}, {@"3x", @"3"}}},
-           {@"rain_intensity", Type::kChoice, @"Rain intensity", @"How heavy the rain looks.", @"0.45",
-            {{@"Light", @"0.25"}, {@"Game", @"0.45"}, {@"Heavy", @"0.7"}, {@"Storm", @"1"}}},
-           {@"rain_drop_size", Type::kChoice, @"Drop size", @"The size of the falling drops.", @"0.01",
-            {{@"Small", @"0.005"}, {@"Game", @"0.01"}, {@"Large", @"0.02"}}},
-           {@"road_reflection", Type::kChoice, @"Wet road reflection",
-            @"How much the road reflects in the rain.", @"1",
-            {{@"Off", @"0"}, {@"0.5x", @"0.5"}, {@"1x (game)", @"1"}, {@"1.5x", @"1.5"}, {@"2x", @"2"}}},
        }, kTabExtras},
       {@"Renderer", nil,
        {
            {@"native_renderer", Type::kSwitch, @"Native Metal renderer",
             @"Draws the game with its own shaders translated to Metal, instead of emulating the "
-            @"Xbox 360's GPU: much faster, sharper settings possible (Render resolution). Movies "
-            @"included. Off: the emulated renderer for everything. "
-            @"Needs the native shaders in this build (without them the emulated one is used).",
-            @"true"},
+            @"Xbox 360's GPU. Off (recommended): Vulkan/MoltenVK emulated renderer for Carbon.",
+            @"false"},
            {@"no_vulkan", Type::kSwitch, @"No emulated renderer (no Vulkan)",
-            @"With the native Metal renderer on: Vulkan and MoltenVK are not started at all "
-            @"(less memory, faster start). The native renderer draws everything, movies "
-            @"included. Off: Vulkan runs alongside, as before.",
-            @"true"},
+            @"With the native Metal renderer on: Vulkan and MoltenVK are not started at all. "
+            @"Leave off for Carbon.",
+            @"false"},
            {@"async_pipelines", Type::kSwitch, @"Compile pipelines in the background",
-            @"Native renderer: the first time a new kind of draw appears, it is compiled in the "
-            @"background and that object is missing for a few frames, instead of a hitch of up to "
-            @"~70 ms. Pipelines from earlier sessions are compiled at startup either way.",
+            @"Compile pipelines asynchronously to reduce stutter.",
             @"true"},
        }, kTabGraphics},
       {@"Display", nil,
@@ -774,68 +718,37 @@ std::vector<std::string> Arguments(NSDictionary<NSString*, NSString*>* s) {
   auto b = [](bool v) { return std::string(v ? "true" : "false"); };
   auto str = [&](NSString* key) { return std::string(Value(s, key).UTF8String); };
   std::vector<std::string> a;
-  // Black Edition content is always on: there is no switch for it any more.
-  a.push_back("--black_edition=true");
-  a.push_back("--nfsmw_marker_count=" + str(@"marker_count"));
-  a.push_back("--nfsmw_purchased_car_limit=" + str(@"car_limit"));
-  a.push_back("--nfsmw_remove_old_bridge_barrier=" + b(On(s, @"old_bridge")));
-  a.push_back("--nfsmw_laps_max=" + str(@"laps_max"));
-  a.push_back("--nfsmw_opponents_max=" + str(@"opponents_max"));
-  a.push_back("--nfsmw_traffic_low=" + str(@"traffic_low"));
-  a.push_back("--nfsmw_traffic_medium=" + str(@"traffic_medium"));
-  a.push_back("--nfsmw_traffic_high=" + str(@"traffic_high"));
-  a.push_back("--nfsmw_always_rain=" + b(On(s, @"always_rain")));
-  a.push_back("--nfsmw_rain_amount=" + str(@"rain_amount"));
-  a.push_back("--nfsmw_rain_intensity=" + str(@"rain_intensity"));
-  a.push_back("--nfsmw_rain_drop_size=" + str(@"rain_drop_size"));
-  a.push_back("--nfsmw_road_reflection=" + str(@"road_reflection"));
-  // 120 Hz simulation at the 40 cap too (0.4.2): a 25 ms frame is 1.5 of the
-  // game's 1/60 s world steps, so frames alternated 1 and 2 steps (camera log,
-  // Oct 28); at 120 Hz each frame is exactly 3.
-  NSString* cap = Value(s, @"fps_cap");
-  const bool sim_120 = On(s, @"sim_120_hz") || [cap isEqualToString:@"120"] || [cap isEqualToString:@"40"];
-  a.push_back(std::string("--nfsmw_sim_rate=") + (sim_120 ? "120" : "60"));
-  // The render scale: the native renderer's own (fractions, or the screen's
-  // "native"); the emulated renderer only has whole steps (1x or 2x).
-  NSString* scale = Value(s, @"scale");
-  const double scale_value = [scale isEqualToString:@"native"] ? ScreenPixels().height / 720.0 : scale.doubleValue;
-  // Whole steps for the emulated renderer: 1.5x and below are 1x.
-  const int whole_scale = std::clamp(int(scale_value + 0.25), 1, 2);
-  // The final image: every screen pixel once the game is drawn above 1x; else
-  // the old automatic choice (points on large screens). Not shown any more;
-  // ios_retina still works from extra_args.txt.
-  a.push_back(std::string("--ios_retina=") + (scale_value > 1.0 ? "true" : "auto"));
-  a.push_back("--ios_fps_cap=" + str(@"fps_cap"));
-  a.push_back("--nfsmw_battery_auto_cap=" + b(On(s, @"auto_cap")));
-  a.push_back("--nfsmw_menu_cap=" + b(On(s, @"menu_cap")));
+
+  // Screen and aspect ratio
   NSString* const aspect = ResolvedAspect(s);
-  // 4:3: the game's HD 4:3 mode, its scene drawn at 960x720 (not 640x480).
+  const bool wide = [aspect isEqualToString:@"wide"];
   if ([aspect isEqualToString:@"4:3"]) {
     a.push_back("--resolution=1024x768");
-    a.push_back("--nfsmw_sd_scene_720=true");
-  }
-  // Wider than 16:9: the scene is one wide strip, which needs the single pass.
-  const bool wide = [aspect isEqualToString:@"wide"];
-  if (wide) {
+  } else if (wide) {
     a.push_back("--resolution=1560x720");
-    a.push_back("--nfsmw_wide_scene_width=1560");
   }
+
+  // Render scale for emulated renderer
+  NSString* scale = Value(s, @"scale");
+  const double scale_value = [scale isEqualToString:@"native"] ? ScreenPixels().height / 720.0 : scale.doubleValue;
+  const int whole_scale = std::clamp(int(scale_value + 0.25), 1, 2);
+  a.push_back(std::string("--ios_retina=") + (scale_value > 1.0 ? "true" : "auto"));
+  a.push_back("--resolution_scale=" + std::to_string(whole_scale));
+
+  // FPS cap and display
+  a.push_back("--ios_fps_cap=" + str(@"fps_cap"));
   a.push_back("--ios_show_fps=" + b(On(s, @"show_fps")));
-  a.push_back("--nfsmw_hud_scale=" + str(@"hud_scale"));
-  a.push_back("--nfsmw_hud_safe_zone=" + str(@"hud_safe_zone"));
-  a.push_back("--nfsmw_hud_left_x=" + str(@"hud_left_x"));
-  a.push_back("--nfsmw_hud_left_y=" + str(@"hud_left_y"));
-  a.push_back("--nfsmw_hud_right_x=" + str(@"hud_right_x"));
-  a.push_back("--nfsmw_hud_right_y=" + str(@"hud_right_y"));
-  a.push_back("--nfsmw_hud_race_x=" + str(@"hud_race_x"));
-  a.push_back("--nfsmw_hud_race_y=" + str(@"hud_race_y"));
   a.push_back("--ios_gpu_capture=" + b(On(s, @"gpu_capture")));
+
+  // Controls
   a.push_back("--ios_touch_controls=" + b(On(s, @"touch_controls")));
   a.push_back("--ios_touch_auto_layout=" + b(On(s, @"touch_auto_layout")));
   a.push_back("--mnk_mode=" + b(On(s, @"keyboard")));
   for (const KeyBind& kb : KeyBinds()) {
     a.push_back(std::string("--") + kb.setting.UTF8String + "=" + KeyBindValue(s, kb).UTF8String);
   }
+
+  // Anti-aliasing and post-processing
   NSString* aa = Value(s, @"antialiasing");
   const bool msaa = Msaa(s);
   a.push_back("--gpu_sin_msaa=" + b(!msaa));
@@ -845,57 +758,38 @@ std::vector<std::string> Arguments(NSDictionary<NSString*, NSString*>* s) {
                : [aa isEqualToString:@"fxaa_high"] ? "fxaa_extreme"
                                                    : "none"));
   a.push_back("--present_effect=" + str(@"scaling"));
-  a.push_back("--nfsmw_sin_posprocesado=" + b(!On(s, @"postprocessing")));
-  a.push_back("--nfsmw_motion_blur=" + b(On(s, @"motion_blur")));
   a.push_back("--anisotropic_override=" + str(@"anisotropic"));
-  // With the native renderer the scale is its own: the emulated renderer only
-  // draws what the native one does not (videos) and stays at 1x. Scaled, it
-  // allocates its scaled resolve buffer whole (512 MB x scale^2: MoltenVK has
-  // no sparse buffers), 2 GB at 2x that nothing used.
-  if (On(s, @"native_renderer")) {
-    a.push_back("--resolution_scale=1");
-    a.push_back("--nfsmw_native_resolution_scale=" + str(@"scale"));
-    a.push_back("--nfsmw_native_half_rate_reflections=" + b([Value(s, @"reflection_rate") isEqualToString:@"half"]));
-    a.push_back("--nfsmw_native_shadow_scale=" + str(@"shadow_scale"));
-    a.push_back("--nfsmw_native_scale_reflections=" + b([Value(s, @"reflection_size") isEqualToString:@"scaled"]));
-    a.push_back("--nfsmw_native_metalfx=" + str(@"metalfx_mode"));
-    a.push_back("--nfsmw_native_motion_debug=" + b(On(s, @"motion_debug")));
-    a.push_back("--nfsmw_native_cost_probe=" + b(On(s, @"cost_probe")));
-    a.push_back("--nfsmw_heat_scale=" + b(On(s, @"heat_scale")));
-    a.push_back("--nfsmw_heat_scale_test=" + b(On(s, @"heat_scale_test")));
-    // FXAA in the native renderer (the emulated one's is swap_post_effect).
-    NSString* aa_mode = Value(s, @"antialiasing");
-    a.push_back(std::string("--nfsmw_native_fxaa=") +
-                ([aa_mode isEqualToString:@"fxaa"]        ? "normal"
-                 : [aa_mode isEqualToString:@"fxaa_high"] ? "high"
-                                                          : "off"));
-    // MSAA in the native renderer also where the game draws without (19.5:9).
-    a.push_back(std::string("--nfsmw_native_force_msaa=") +
-                ([aa_mode isEqualToString:@"msaa4"] ? "4" : [aa_mode isEqualToString:@"msaa2"] ? "2" : "0"));
+
+  // Carbon scene and single-pass
+  const bool single_pass = wide || (On(s, @"one_pass") && !msaa);
+  a.push_back("--carbon_single_pass=" + b(single_pass));
+  if (wide) {
+    a.push_back("--carbon_scene_resolution=1560x720");
+  } else if ([aspect isEqualToString:@"4:3"]) {
+    a.push_back("--carbon_scene_resolution=1024x768");
   } else {
-    a.push_back("--resolution_scale=" + std::to_string(whole_scale));
+    a.push_back("--carbon_scene_resolution=1280x720");
   }
-  a.push_back("--ios_thread_qos=false");  // accepted for older argument files; promotion is retired
+
+  // GPU & Vulkan Settings
   a.push_back("--ios_async_submits=" + b(On(s, @"async_submits")));
-  // The single pass is the game's mode without anti-aliasing: not with MSAA.
-  a.push_back("--nfsmw_render_sin_mosaico=" + b(wide || (On(s, @"one_pass") && !msaa)));
   a.push_back(std::string("--render_target_path_vulkan=") + (On(s, @"edram_fsi") ? "fsi" : "fbo"));
   a.push_back("--occlusion_query_enable=" + b(On(s, @"occlusion")));
   a.push_back("--ios_invalidation_widen_kb=" + str(@"widen_kb"));
-  a.push_back("--nfsmw_shadow_map_size=" + str(@"shadow_size"));
   a.push_back(std::string("--readback_resolve=") + (On(s, @"exposure") ? "fast" : "none"));
   a.push_back("--readback_memexport=" + b(On(s, @"memexport")));
   a.push_back("--clear_memory_page_state=" + b(On(s, @"pages")));
   a.push_back("--ios_iso_stream=" + b(On(s, @"iso_stream")));
   a.push_back("--ios_xma_starve_reset=" + b(On(s, @"audio_starve_reset")));
-  a.push_back("--nfsmw_native_present=" + b(On(s, @"native_renderer")));
-  // No Vulkan at all when the native renderer draws everything
-  // (tools/ios/patch_ios_native_backend.py).
+
+  // Backend selection: Only use native if explicitly requested AND no_vulkan is on
   if (On(s, @"native_renderer") && On(s, @"no_vulkan")) {
     a.push_back("--gpu_backend=native");
+  } else {
+    a.push_back("--gpu_backend=vulkan");
   }
-  a.push_back("--nfsmw_skip_movies=" + b(On(s, @"skip_movies")));
-  a.push_back("--nfsmw_native_async_pipelines=" + b(On(s, @"async_pipelines")));
+
+  // Logging and performance
   a.push_back(std::string("--log_level=") +
               (!On(s, @"logging") ? "off" : On(s, @"detailed_log") ? "debug" : "info"));
   a.push_back("--ios_mvk_performance=" + b(On(s, @"mvk_profiling")));

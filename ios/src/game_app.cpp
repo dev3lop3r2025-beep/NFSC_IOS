@@ -107,6 +107,11 @@ class IosNfsCarbonApp : public NfsCarbonApp {
     }
   }
 
+  void OnPreLaunchModule() override {
+    nfsmw::boot::Trace("game: OnPreLaunchModule (missing entries & diagnostic hooks)");
+    NfsCarbonApp::OnPreLaunchModule();
+  }
+
   void OnShutdown() override { NfsCarbonApp::OnShutdown(); }
 };
 

@@ -5,8 +5,8 @@
 //  Darwin os_sync_wait_on_address / thread wait, preventing CPU core saturation
 //  and thermal throttling.
 //
-//  Carbon Watchdog: sub_826E0250
-//  Return Addresses: 0x826DBE14 (sub_826DBD78), 0x826DBBF8 (sub_826DBB80)
+//  USA Carbon Watchdog: sub_826E0088
+//  Return Addresses: 0x826DBC4C (sub_826DBBB0), 0x826DBA30 (sub_826DB9B8)
 //  Device Read Pointer Offset: 10768
 // =============================================================================
 
@@ -34,12 +34,12 @@
 REXCVAR_DEFINE_INT32(ios_carbon_ring_wait_ms, 0, "GPU",
                      "Fixed cap (ms) for ring-space waits (0: automatic based on FPS cap)");
 
-extern "C" void __imp__sub_826E0250(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_826E0088(PPCContext& __restrict ctx, uint8_t* base);
 
 namespace {
 
-constexpr uint32_t kRingWaitReturn1 = 0x826DBE14;  // sub_826DBD78
-constexpr uint32_t kRingWaitReturn2 = 0x826DBBF8;  // sub_826DBB80
+constexpr uint32_t kRingWaitReturn1 = 0x826DBC4C;  // sub_826DBBB0
+constexpr uint32_t kRingWaitReturn2 = 0x826DBA30;  // sub_826DB9B8
 constexpr uint32_t kDeviceRptrPointer = 10768;
 
 std::atomic<uint32_t>* RptrSequence() {
@@ -63,7 +63,7 @@ std::atomic<uint32_t>* RptrSequence() {
 
 }  // namespace
 
-extern "C" REX_FUNC(sub_826E0250) {
+extern "C" REX_FUNC(sub_826E0088) {
   const uint32_t ret = uint32_t(ctx.lr);
   if (ret == kRingWaitReturn1 || ret == kRingWaitReturn2) {
     if (std::atomic<uint32_t>* sequence = RptrSequence()) {
@@ -92,5 +92,6 @@ extern "C" REX_FUNC(sub_826E0250) {
       }
     }
   }
-  __imp__sub_826E0250(ctx, base);
+  __imp__sub_826E0088(ctx, base);
 }
+

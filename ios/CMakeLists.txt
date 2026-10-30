@@ -213,10 +213,8 @@ set(NFSCARBON_APP_SOURCES
     src/achievements_export.cpp
     src/adaptive_qos.cpp
     src/frame_clock.cpp
-    src/render_probe.cpp
     src/native_metal_probe.mm
     src/native_renderer.mm
-    src/native_draw_census.cpp
     # Carbon Core Systems
     ${NFSCARBON_REPO}/src/carbon_missing_entries.cpp
     ${NFSCARBON_REPO}/src/carbon_nativo_enlaces.cpp

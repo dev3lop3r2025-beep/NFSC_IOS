@@ -5,3 +5,5 @@
 namespace rex::runtime { class FunctionDispatcher; }
 void CarbonRegisterMissingEntries(rex::runtime::FunctionDispatcher* dispatcher,
                                   uint8_t* base);
+void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher,
+                                  uint8_t* base);

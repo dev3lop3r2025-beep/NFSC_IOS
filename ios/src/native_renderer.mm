@@ -154,7 +154,7 @@ REXCVAR_DEFINE_BOOL(nfsmw_native_dump, false, "GPU",
 // While the native renderer shows the game, the emulated renderer's draws and
 // resolves are skipped (tools/ios/patch_ios_native_only.py): it does every
 // other GPU packet still. Off: both draw, as before.
-REXCVAR_DEFINE_BOOL(nfsmw_native_exclusive, true, "GPU",
+REXCVAR_DEFINE_BOOL(nfsmw_native_exclusive, false, "GPU",
                     "Native renderer: skip the emulated renderer's draws while it shows the game");
 // The game waits for the native renderer instead of it dropping frames.
 // The sun glare's occlusion query counted by the native renderer.
@@ -194,7 +194,7 @@ REXCVAR_DEFINE_BOOL(nfsmw_native_movies, true, "GPU",
                     "Native renderer: draw the movies itself (off: the emulated renderer draws them)");
 REXCVAR_DEFINE_BOOL(nfsmw_native_movie_16_9, true, "GPU",
                     "Native renderer: movies keep 16:9 on wider screens (black bars at the sides)");
-REXCVAR_DEFINE_BOOL(nfsmw_native_from_boot, true, "GPU",
+REXCVAR_DEFINE_BOOL(nfsmw_native_from_boot, false, "GPU",
                     "Native renderer: the emulated renderer draws nothing from the first frame on "
                     "(its memory is never filled)");
 REXCVAR_DEFINE_BOOL(nfsmw_native_metal_hud, false, "GPU",
@@ -208,7 +208,7 @@ REXCVAR_DEFINE_BOOL(nfsmw_native_pace, true, "GPU",
                     "Native renderer: the game waits for it rather than frames being dropped");
 // The draws from the emulated command processor (its own thread) instead of
 // the draw capture's decoding of D3D's command buffers on the game's thread.
-REXCVAR_DEFINE_BOOL(nfsmw_native_cp, true, "GPU",
+REXCVAR_DEFINE_BOOL(nfsmw_native_cp, false, "GPU",
                     "Native renderer: take the draws from the command processor (off: from the game thread)");
 // Cached vertex data and textures trusted while the emulator reports no CPU
 // write to their pages (write_watch). Off: the SDK's iOS patches stop
@@ -7967,10 +7967,10 @@ void ArmNativeOnlyFromBoot() {
 }
 
 void CpDraw(const RexNativeDraw* in) {
-  ArmNativeOnlyFromBoot();
   if (!REXCVAR_GET(nfsmw_native_cp) || !recording || !in->vs_ucode || !in->ps_ucode) {
     return;
   }
+  ArmNativeOnlyFromBoot();
   static std::unordered_map<uint64_t, uint64_t> vs_keys, ps_keys;  // SDK hash -> key
   auto key = [](std::unordered_map<uint64_t, uint64_t>& keys, uint64_t hash, const uint32_t* ucode, uint32_t n,
                 bool vertex) {
