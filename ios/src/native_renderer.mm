@@ -208,7 +208,7 @@ REXCVAR_DEFINE_BOOL(nfsmw_native_pace, true, "GPU",
                     "Native renderer: the game waits for it rather than frames being dropped");
 // The draws from the emulated command processor (its own thread) instead of
 // the draw capture's decoding of D3D's command buffers on the game's thread.
-REXCVAR_DEFINE_BOOL(nfsmw_native_cp, false, "GPU",
+REXCVAR_DEFINE_BOOL(nfsmw_native_cp, true, "GPU",
                     "Native renderer: take the draws from the command processor (off: from the game thread)");
 // Cached vertex data and textures trusted while the emulator reports no CPU
 // write to their pages (write_watch). Off: the SDK's iOS patches stop

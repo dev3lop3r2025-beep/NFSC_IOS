@@ -35,13 +35,18 @@ class NfsCarbonApp : public rex::ReXApp {
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
 #if defined(__APPLE__)
-    // iOS Documents directory resolution
+    // iOS sandbox directory resolution
     const std::filesystem::path docs_dir = rex::filesystem::GetUserFolder();
-    if (!docs_dir.empty()) {
-      user_data_root_ = docs_dir;
-      paths.user_data_root = docs_dir;
-      paths.cache_root = docs_dir / "cache";
-      paths.config_path = docs_dir / "nfscarbon.toml";
+    if (paths.user_data_root.empty()) {
+      paths.user_data_root = !docs_dir.empty() ? (docs_dir / "data") : std::filesystem::path("/private/var/mobile/Documents/data");
+    }
+    user_data_root_ = paths.user_data_root;
+
+    if (paths.cache_root.empty()) {
+      paths.cache_root = !docs_dir.empty() ? (docs_dir / "cache") : std::filesystem::path("/private/var/mobile/Documents/cache");
+    }
+    if (paths.config_path.empty()) {
+      paths.config_path = !docs_dir.empty() ? (docs_dir / "config" / "nfscarbon.toml") : std::filesystem::path("/private/var/mobile/Documents/config/nfscarbon.toml");
     }
 
     if (paths.game_data_root.empty()) {

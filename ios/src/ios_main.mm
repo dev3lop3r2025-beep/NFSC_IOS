@@ -166,7 +166,25 @@ fs::path DocumentsFolder() {
   return fs::path(paths.firstObject.UTF8String);
 }
 
+fs::path CachesFolder() {
+  NSArray<NSString*>* paths =
+      NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+  return fs::path(paths.firstObject.UTF8String);
+}
+
+fs::path ApplicationSupportFolder() {
+  NSArray<NSString*>* paths =
+      NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES);
+  return fs::path(paths.firstObject.UTF8String);
+}
+
+fs::path TemporaryFolder() {
+  NSString* tmp = NSTemporaryDirectory();
+  return fs::path(tmp.UTF8String);
+}
+
 std::vector<std::string> GameArguments(const fs::path& docs, const fs::path& iso) {
+  const fs::path caches = CachesFolder();
   return {
       "--gpu_plugin=xenos",
       "--gpu_backend=vulkan",
@@ -186,6 +204,8 @@ std::vector<std::string> GameArguments(const fs::path& docs, const fs::path& iso
       std::string("--user_language=") + NFSCARBON_GAME_LANGUAGE,
       std::string("--user_country=") + NFSCARBON_GAME_COUNTRY,
       "--user_data_root=" + (docs / "data").string(),
+      "--cache_root=" + (caches / "rexglue").string(),
+      "--config=" + (docs / "config" / "nfscarbon.toml").string(),
       "--log_file=" + (docs / "logs" / "nfscarbon.log").string(),
       "--log_level=info",
       "--log_flush_interval=1",
@@ -381,7 +401,20 @@ int RunGame(int argc, char* argv[], const fs::path& docs) {
 #endif
 
 int RunProbe(int argc, char* argv[], const fs::path& docs) {
-  rex::cvar::Init(argc, argv);
+  const fs::path caches = CachesFolder();
+  std::vector<std::string> probe_args;
+  probe_args.push_back(argc > 0 ? argv[0] : "nfscarbon");
+  probe_args.push_back("--user_data_root=" + (docs / "data").string());
+  probe_args.push_back("--cache_root=" + (caches / "rexglue").string());
+  probe_args.push_back("--config=" + (docs / "config" / "nfscarbon.toml").string());
+  probe_args.push_back("--log_file=" + (docs / "logs" / "nfscarbon.log").string());
+  probe_args.push_back("--log_level=info");
+  for (int i = 1; i < argc; ++i) probe_args.push_back(argv[i]);
+  std::vector<char*> probe_argv;
+  for (auto& a : probe_args) probe_argv.push_back(a.data());
+  probe_argv.push_back(nullptr);
+
+  rex::cvar::Init(int(probe_args.size()), probe_argv.data());
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
   rex::InitLogging((docs / "logs" / "nfscarbon.log").c_str());
@@ -400,17 +433,45 @@ int main(int argc, char* argv[]) {
   std::signal(SIGILL, CrashSignalHandler);
   std::signal(SIGFPE, CrashSignalHandler);
 
-  setenv("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight", 1);
-  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+  // 1. Resolve iOS sandbox directories early via Foundation
   const fs::path docs = DocumentsFolder();
+  const fs::path caches = CachesFolder();
+  const fs::path app_support = ApplicationSupportFolder();
+  const fs::path tmp = TemporaryFolder();
+
+  // 2. Pre-create writable sandbox directories before any component can touch them
   std::error_code ec;
+  fs::create_directories(docs, ec);
   fs::create_directories(docs / "logs", ec);
   fs::create_directories(docs / "data", ec);
+  fs::create_directories(docs / "config", ec);
+  fs::create_directories(docs / "rex_data", ec);
+  fs::create_directories(caches, ec);
+  fs::create_directories(caches / "rexglue", ec);
+  fs::create_directories(caches / "rexglue" / "shaders", ec);
+  fs::create_directories(caches / "rexglue" / "shaders" / "shareable", ec);
+  fs::create_directories(app_support, ec);
+  fs::create_directories(tmp, ec);
+
+  // 3. Redirect XDG & Temp env vars so POSIX/XDG libraries never touch ~/.local, ~/.cache, ~/.config
+  setenv("XDG_DATA_HOME", (docs / "rex_data").c_str(), 1);
+  setenv("XDG_CACHE_HOME", (caches).c_str(), 1);
+  setenv("XDG_CONFIG_HOME", (docs / "config").c_str(), 1);
+  setenv("TMPDIR", tmp.c_str(), 1);
+  if (!docs.empty()) {
+    setenv("HOME", docs.parent_path().c_str(), 1);
+  }
+
+  setenv("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight", 1);
+  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 
   namespace boot = nfsmw::boot;
   boot::Open((docs / "logs" / "boot.txt").string());
   boot::Trace("---- start, build " __DATE__ " " __TIME__);
   boot::Trace("Documents: " + docs.string());
+  boot::Trace("Caches: " + caches.string());
+  boot::Trace("XDG_DATA_HOME: " + (docs / "rex_data").string());
+  boot::Trace("XDG_CACHE_HOME: " + caches.string());
 
 #if NFSMW_WITH_GAME
   boot::Trace("launcher: on screen");

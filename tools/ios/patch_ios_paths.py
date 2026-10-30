@@ -82,6 +82,21 @@ FOLDER_NEW = '''std::filesystem::path GetExecutableFolder() {
 #if REX_PLATFORM_ANDROID
 '''
 
+USER_FOLDER_ANCHOR = '''std::filesystem::path GetUserFolder() {
+#if defined(__SWITCH__)'''
+USER_FOLDER_NEW = '''std::filesystem::path GetUserFolder() {
+#if REX_PLATFORM_IOS
+  // LOCAL PATCH - iOS: never use ~/.local or ~/.cache; root of sandbox is strictly read-only.
+  if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
+    return std::filesystem::path(*xdg);
+  }
+  if (auto home = rex::platform::env::get("HOME")) {
+    return std::filesystem::path(*home) / "Documents" / "rex_data";
+  }
+  return "/private/var/mobile/Documents/rex_data";
+#endif
+#if defined(__SWITCH__)'''
+
 # ---------------------------------------------------------------------------
 #  src/ui/vulkan/vulkan_instance.cpp
 # ---------------------------------------------------------------------------
@@ -116,13 +131,148 @@ MVK_NEW = '''  std::vector<std::filesystem::path> loader_candidates = macos_runt
 #endif
 '''
 
+# ---------------------------------------------------------------------------
+#  src/graphics/vulkan/pipeline_cache.cpp
+# ---------------------------------------------------------------------------
+SHADER_STORAGE_ANCHOR = '''  auto shader_storage_root = cache_root / "shaders";
+  auto shader_storage_shareable_root = shader_storage_root / "shareable";
+  if (!std::filesystem::exists(shader_storage_shareable_root)) {
+    if (!std::filesystem::create_directories(shader_storage_shareable_root)) {
+      REXGPU_ERROR(
+          "Failed to create the shareable shader storage directory, persistent "
+          "shader storage will be disabled: {}",
+          rex::path_to_utf8(shader_storage_shareable_root));
+      return;
+    }
+  }'''
+SHADER_STORAGE_NEW = '''  auto shader_storage_root = cache_root / "shaders";
+  auto shader_storage_shareable_root = shader_storage_root / "shareable";
+  std::error_code storage_ec;
+  if (!std::filesystem::exists(shader_storage_shareable_root, storage_ec)) {
+    storage_ec.clear();
+    if (!std::filesystem::create_directories(shader_storage_shareable_root, storage_ec) && storage_ec) {
+      REXGPU_ERROR(
+          "Failed to create the shareable shader storage directory ({}), persistent "
+          "shader storage will be disabled: {}",
+          storage_ec.message(), rex::path_to_utf8(shader_storage_shareable_root));
+      return;
+    }
+  }'''
+
+# ---------------------------------------------------------------------------
+#  src/core/filesystem.cpp
+# ---------------------------------------------------------------------------
+PARENT_FOLDER_ANCHOR = '''bool CreateParentFolder(const std::filesystem::path& path) {
+  if (path.has_parent_path()) {
+    auto parent_path = path.parent_path();
+    if (!std::filesystem::exists(parent_path)) {
+      return std::filesystem::create_directories(parent_path);
+    }
+  }
+  return true;
+}'''
+PARENT_FOLDER_NEW = '''bool CreateParentFolder(const std::filesystem::path& path) {
+  if (path.has_parent_path()) {
+    auto parent_path = path.parent_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(parent_path, ec)) {
+      ec.clear();
+      return std::filesystem::create_directories(parent_path, ec);
+    }
+  }
+  return true;
+}'''
+
+# ---------------------------------------------------------------------------
+#  src/system/xam/content_manager.cpp
+# ---------------------------------------------------------------------------
+CONTENT_HEADER_ANCHOR = '''  auto parent_path = header_path.parent_path();
+
+  if (!std::filesystem::exists(parent_path)) {
+    if (!std::filesystem::create_directories(parent_path)) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }'''
+CONTENT_HEADER_NEW = '''  auto parent_path = header_path.parent_path();
+
+  std::error_code parent_ec;
+  if (!std::filesystem::exists(parent_path, parent_ec)) {
+    parent_ec.clear();
+    if (!std::filesystem::create_directories(parent_path, parent_ec) && parent_ec) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }'''
+
+CONTENT_PKG1_ANCHOR = '''  if (!std::filesystem::create_directories(package_path)) {'''
+CONTENT_PKG1_NEW = '''  std::error_code pkg_ec;
+  if (!std::filesystem::create_directories(package_path, pkg_ec) && pkg_ec) {'''
+
+CONTENT_PKG2_ANCHOR = '''  std::filesystem::create_directories(package_path);
+'''
+CONTENT_PKG2_NEW = '''  std::error_code pkg2_ec;
+  std::filesystem::create_directories(package_path, pkg2_ec);
+'''
+
+# ---------------------------------------------------------------------------
+#  src/system/xam/user_profile.cpp
+# ---------------------------------------------------------------------------
+USER_PROF_ANCHOR = '''    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    std::filesystem::create_directories(content_dir);'''
+USER_PROF_NEW = '''    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    std::error_code prof_ec;
+    std::filesystem::create_directories(content_dir, prof_ec);'''
+
+# ---------------------------------------------------------------------------
+#  src/filesystem/devices/host_path_entry.cpp
+# ---------------------------------------------------------------------------
+HOST_PATH_ANCHOR = '''  if (attributes & kFileAttributeDirectory) {
+    if (!std::filesystem::create_directories(full_path)) {
+      return nullptr;
+    }
+  }'''
+HOST_PATH_NEW = '''  if (attributes & kFileAttributeDirectory) {
+    std::error_code dir_ec;
+    if (!std::filesystem::create_directories(full_path, dir_ec) && dir_ec) {
+      return nullptr;
+    }
+  }'''
+
+# ---------------------------------------------------------------------------
+#  src/core/logging.cpp
+# ---------------------------------------------------------------------------
+LOG_PATH_ANCHOR = '''std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
+                                            std::string_view app_name) {
+  std::filesystem::create_directories(logs_dir);'''
+LOG_PATH_NEW = '''std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
+                                            std::string_view app_name) {
+  std::error_code log_ec;
+  std::filesystem::create_directories(logs_dir, log_ec);'''
+
 BLOCKS = [
     ("src/core/filesystem_posix.cpp", "include dlfcn.h", DLFCN_ANCHOR, DLFCN_NEW),
     ("src/core/filesystem_posix.cpp", "GetExecutableFolder() is Frameworks/", FOLDER_ANCHOR,
      FOLDER_NEW),
+    ("src/core/filesystem_posix.cpp", "GetUserFolder() uses Documents/rex_data on iOS",
+     USER_FOLDER_ANCHOR, USER_FOLDER_NEW),
     ("src/ui/vulkan/vulkan_instance.cpp", "include rex/filesystem.h", INCLUDE_ANCHOR,
      INCLUDE_NEW),
     ("src/ui/vulkan/vulkan_instance.cpp", "MoltenVK.framework first", MVK_ANCHOR, MVK_NEW),
+    ("src/graphics/vulkan/pipeline_cache.cpp", "exception-safe shader storage create_directories",
+     SHADER_STORAGE_ANCHOR, SHADER_STORAGE_NEW),
+    ("src/core/filesystem.cpp", "exception-safe CreateParentFolder create_directories",
+     PARENT_FOLDER_ANCHOR, PARENT_FOLDER_NEW),
+    ("src/system/xam/content_manager.cpp", "exception-safe content header create_directories",
+     CONTENT_HEADER_ANCHOR, CONTENT_HEADER_NEW),
+    ("src/system/xam/content_manager.cpp", "exception-safe content package create_directories 1",
+     CONTENT_PKG1_ANCHOR, CONTENT_PKG1_NEW),
+    ("src/system/xam/content_manager.cpp", "exception-safe content package create_directories 2",
+     CONTENT_PKG2_ANCHOR, CONTENT_PKG2_NEW),
+    ("src/system/xam/user_profile.cpp", "exception-safe user profile create_directories",
+     USER_PROF_ANCHOR, USER_PROF_NEW),
+    ("src/filesystem/devices/host_path_entry.cpp", "exception-safe host path entry create_directories",
+     HOST_PATH_ANCHOR, HOST_PATH_NEW),
+    ("src/core/logging.cpp", "exception-safe logging create_directories",
+     LOG_PATH_ANCHOR, LOG_PATH_NEW),
 ]
 
 if __name__ == "__main__":

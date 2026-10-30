@@ -783,7 +783,15 @@ std::vector<std::string> Arguments(NSDictionary<NSString*, NSString*>* s) {
   a.push_back("--ios_xma_starve_reset=" + b(On(s, @"audio_starve_reset")));
 
   // Backend selection: Only use native if explicitly requested AND no_vulkan is on
-  if (On(s, @"native_renderer") && On(s, @"no_vulkan")) {
+  const bool native_on = On(s, @"native_renderer");
+  if (native_on) {
+    a.push_back("--resolution_scale=1");
+    a.push_back("--nfsmw_native_resolution_scale=" + str(@"scale"));
+    a.push_back("--nfsmw_native_half_rate_reflections=" + b([Value(s, @"half_rate_reflections") isEqualToString:@"half"]));
+  }
+  a.push_back("--nfsmw_native_present=" + b(native_on));
+  a.push_back("--nfsmw_native_cp=" + b(native_on));
+  if (native_on && On(s, @"no_vulkan")) {
     a.push_back("--gpu_backend=native");
   } else {
     a.push_back("--gpu_backend=vulkan");
