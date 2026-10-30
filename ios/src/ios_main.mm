@@ -367,9 +367,7 @@ int RunGame(int argc, char* argv[], const fs::path& docs) {
   const int result = initialized ? context.RunMainMessageLoop() : EXIT_FAILURE;
 
   REXLOG_INFO("[ios] main message loop returned with exit code {}", result);
-  if (auto* kernel = rex::system::kernel_state()) {
-    REXLOG_INFO("[ios] kernel title terminated: {}", kernel->is_title_terminated());
-  }
+
   rex::FlushLogging();
   if (auto logger = spdlog::default_logger()) {
     logger->flush();
