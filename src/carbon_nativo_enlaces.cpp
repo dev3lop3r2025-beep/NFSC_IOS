@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 
+#include "carbon_nativo_ganchos.h"
+
 // Game frames, one per Swap; only for the "game ahead" measurement. Carbon's Swap is not hooked yet.
 std::atomic<uint64_t> g_nfsmw_fotogramas_juego{0};
 
@@ -38,4 +40,52 @@ uint32_t MuestrasOriginalesModoActual(const uint8_t*) { return 1; }
 namespace nfsmw::nativo {
 void ActivarConsumidorMarcadores(bool) {}
 void AnotarComprobacionMarcador(bool, uint32_t, uint32_t, uint32_t, uint32_t) {}
+void AnotarDibujo(FuncionDibujo, uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}
+void TerminarDibujo() {}
+
+namespace ganchos_detalle {
+struct EntradaShader {};
+const EntradaShader* IdentificarCreacion(uint8_t*, uint32_t, bool) { return nullptr; }
+void RecordarCreacion(uint32_t, const EntradaShader*, bool) {}
+}  // namespace ganchos_detalle
 }  // namespace nfsmw::nativo
+
+extern "C" {
+float nfsmw_mirror_scale_x = 1.0f;
+float nfsmw_mirror_scale_y = 1.0f;
+float nfsmw_mirror_shift_y = 0.0f;
+}
+
+struct PPCContext;
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define REX_WEAK_HOOK_FALLBACK(name) \
+  extern "C" void __imp__##name(PPCContext&, uint8_t*) {}
+#else
+#define REX_WEAK_HOOK_FALLBACK(name) \
+  __attribute__((weak)) extern "C" void __imp__##name(PPCContext&, uint8_t*) {}
+#endif
+
+REX_WEAK_HOOK_FALLBACK(sub_823C8290)
+REX_WEAK_HOOK_FALLBACK(sub_824FFBE0)
+REX_WEAK_HOOK_FALLBACK(sub_82500298)
+REX_WEAK_HOOK_FALLBACK(sub_82592340)
+REX_WEAK_HOOK_FALLBACK(sub_825930E0)
+REX_WEAK_HOOK_FALLBACK(sub_82593408)
+REX_WEAK_HOOK_FALLBACK(sub_82593818)
+REX_WEAK_HOOK_FALLBACK(sub_82593A58)
+REX_WEAK_HOOK_FALLBACK(sub_82597070)
+REX_WEAK_HOOK_FALLBACK(sub_825987E0)
+REX_WEAK_HOOK_FALLBACK(sub_8259A308)
+REX_WEAK_HOOK_FALLBACK(sub_826DCB30)
+REX_WEAK_HOOK_FALLBACK(sub_826DCD68)
+REX_WEAK_HOOK_FALLBACK(sub_826DD448)
+REX_WEAK_HOOK_FALLBACK(sub_826DD9D8)
+REX_WEAK_HOOK_FALLBACK(sub_826DDA78)
+REX_WEAK_HOOK_FALLBACK(sub_826DDE68)
+REX_WEAK_HOOK_FALLBACK(sub_826DE280)
+REX_WEAK_HOOK_FALLBACK(sub_826DE700)
+REX_WEAK_HOOK_FALLBACK(sub_826E0250)
+REX_WEAK_HOOK_FALLBACK(sub_826E4680)
+REX_WEAK_HOOK_FALLBACK(sub_826F6A88)
+REX_WEAK_HOOK_FALLBACK(sub_82706068)

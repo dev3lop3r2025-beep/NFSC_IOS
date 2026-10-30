@@ -227,7 +227,10 @@ set(NFSCARBON_APP_SOURCES
 )
 
 if(NFSCARBON_WITH_GAME)
-    list(APPEND NFSCARBON_APP_SOURCES src/game_app.cpp)
+    list(APPEND NFSCARBON_APP_SOURCES
+        src/game_app.cpp
+        "${NFSCARBON_SDK}/src/ui/rex_app.cpp"
+    )
 endif()
 
 add_executable(nfscarbon MACOSX_BUNDLE ${NFSCARBON_APP_SOURCES})
@@ -241,7 +244,9 @@ target_include_directories(nfscarbon PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${NFSCARBON_REPO}"
     "${NFSCARBON_REPO}/src"
+    "${NFSCARBON_SDK}"
     "${NFSCARBON_SDK}/include"
+    "${NFSCARBON_SDK}/src"
     "${NFSCARBON_GEN_DIR}"
 )
 
