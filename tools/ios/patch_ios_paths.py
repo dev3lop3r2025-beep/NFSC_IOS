@@ -83,7 +83,7 @@ FOLDER_NEW = '''std::filesystem::path GetExecutableFolder() {
 '''
 
 USER_FOLDER_ANCHOR = '''std::filesystem::path GetUserFolder() {
-#if defined(__SWITCH__)'''
+  // get preferred data home'''
 USER_FOLDER_NEW = '''std::filesystem::path GetUserFolder() {
 #if REX_PLATFORM_IOS
   // LOCAL PATCH - iOS: never use ~/.local or ~/.cache; root of sandbox is strictly read-only.
@@ -95,7 +95,7 @@ USER_FOLDER_NEW = '''std::filesystem::path GetUserFolder() {
   }
   return "/private/var/mobile/Documents/rex_data";
 #endif
-#if defined(__SWITCH__)'''
+  // get preferred data home'''
 
 # ---------------------------------------------------------------------------
 #  src/ui/vulkan/vulkan_instance.cpp

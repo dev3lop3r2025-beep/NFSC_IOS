@@ -763,6 +763,7 @@ std::vector<std::string> Arguments(NSDictionary<NSString*, NSString*>* s) {
   // Carbon scene and single-pass
   const bool single_pass = wide || (On(s, @"one_pass") && !msaa);
   a.push_back("--carbon_single_pass=" + b(single_pass));
+  a.push_back("--nfsmw_una_pasada=" + b(single_pass));
   if (wide) {
     a.push_back("--carbon_scene_resolution=1560x720");
   } else if ([aspect isEqualToString:@"4:3"]) {

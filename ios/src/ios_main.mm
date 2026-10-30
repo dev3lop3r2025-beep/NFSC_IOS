@@ -199,13 +199,13 @@ std::vector<std::string> GameArguments(const fs::path& docs, const fs::path& iso
       "--readback_resolve=fast",
       "--gpu_sin_msaa=true",
       "--carbon_single_pass=true",
+      "--nfsmw_una_pasada=true",
       "--audio_maxqframes=64",
       // The Xbox 360 language and country of the game's edition (USA).
       std::string("--user_language=") + NFSCARBON_GAME_LANGUAGE,
       std::string("--user_country=") + NFSCARBON_GAME_COUNTRY,
       "--user_data_root=" + (docs / "data").string(),
       "--cache_root=" + (caches / "rexglue").string(),
-      "--config=" + (docs / "config" / "nfscarbon.toml").string(),
       "--log_file=" + (docs / "logs" / "nfscarbon.log").string(),
       "--log_level=info",
       "--log_flush_interval=1",
@@ -406,7 +406,6 @@ int RunProbe(int argc, char* argv[], const fs::path& docs) {
   probe_args.push_back(argc > 0 ? argv[0] : "nfscarbon");
   probe_args.push_back("--user_data_root=" + (docs / "data").string());
   probe_args.push_back("--cache_root=" + (caches / "rexglue").string());
-  probe_args.push_back("--config=" + (docs / "config" / "nfscarbon.toml").string());
   probe_args.push_back("--log_file=" + (docs / "logs" / "nfscarbon.log").string());
   probe_args.push_back("--log_level=info");
   for (int i = 1; i < argc; ++i) probe_args.push_back(argv[i]);

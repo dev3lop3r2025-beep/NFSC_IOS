@@ -135,7 +135,7 @@ REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "GPU",
                       "Graphics API: d3d12 or vulkan. Takes effect on restart. If the one "
                       "you pick was not built into this copy, the game falls back to the "
                       "other one and says so in the log.")
-    .allowed({"d3d12", "vulkan"})
+    .allowed({"d3d12", "vulkan", "native"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 """
@@ -239,10 +239,14 @@ VIEJA_CARGA_V2 = '  if (!config_.graphics && !config_.gpu_plugin.empty()) {\n   
 VIEJA_CARGA_V3 = CARGA_NUEVO[:CARGA_NUEVO.index(
     "\n\n    // Y aqui se borra la lista") + 1]
 
+VIEJO_CVAR_V3 = 'REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",\n                      "GPU emulation plugin to load at startup (e.g. \'xenos\'); empty disables "\n                      "GPU emulation")\n    .lifecycle(rex::cvar::Lifecycle::kInitOnly);\n\n// PARCHE LOCAL - selector de API grafica\n//\n// El plugin ya sabia elegir entre D3D12 y Vulkan por nombre; lo que faltaba\n// era que alguien se lo dijera. Ver plugin_main.cpp:\n//\n//     if (backend == "any" || backend == "d3d12")  -> D3D12GraphicsSystem\n//     if (backend == "any" || backend == "vulkan") -> VulkanGraphicsSystem\n//\n// "any" coge el primero que este compilado, que es D3D12. Con esto se puede\n// forzar uno concreto y comparar.\n//\n// PIDE REINICIO, PERO NO ES DE SOLO LECTURA. La primera version lo puse como\n// kInitOnly, igual que gpu_plugin, y el menu de F4 lo pintaba en rojo y\n// deshabilitado: se veia pero no se podia tocar. Es que kInitOnly significa\n// "no se puede ni guardar el valor nuevo", y aqui si se puede: lo que no se\n// puede es aplicarlo sin reiniciar. Eso es kRequiresRestart, que ademas hace\n// que el SDK lo apunte en su lista de cambios pendientes -y el menu la\n// ensena, con un boton para reiniciar-.\n//\n// Y ya no hay "any". Con any no se sabia cual estaba puesta de verdad, que era\n// justo lo que habia que ensenar. Con dos opciones y ambas explicitas, el\n// ajuste ES la respuesta a "cual se esta usando".\n//\n// El texto va en ingles porque es lo que sale en esa ventana, que es del SDK\n// y esta entera en ingles.\nREXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "GPU",\n                      "Graphics API: d3d12 or vulkan. Takes effect on restart. If the one "\n                      "you pick was not built into this copy, the game falls back to the "\n                      "other one and says so in the log.")\n    .allowed({"d3d12", "vulkan"})\n    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);\n'
+
 # DE MAS NUEVO A MAS VIEJO. La v2 es la v1 con cosas anadidas, asi que mirar
 # la v1 primero se llevaria solo su parte y dejaria la cola de la v2 suelta.
 VIEJOS = [
     # (nombre, huella que SOLO aparece en esa version, bloque entero, anclaje)
+    ("cvar de la v3 (sin backend native)",
+     '.allowed({"d3d12", "vulkan"})', VIEJO_CVAR_V3, CVAR_ANCLA),
     ("carga de la v3 (sin limpiar los reinicios pendientes)",
      'const char* la_otra = (backend_elegido == "vulkan") ? "d3d12" : "vulkan";',
      VIEJA_CARGA_V3, CARGA_ANCLA),
@@ -262,7 +266,7 @@ def localizar_sdk():
     # NFSMW_SDK apunta a otro arbol del SDK (el de Android, por ejemplo). Si
     # esta puesta se usa SOLO esa ruta: caer en silencio en el SDK de Windows
     # parchearia el arbol equivocado.
-    otro = os.environ.get("NFSMW_SDK")
+    otro = os.environ.get("NFSCARBON_SDK") or os.environ.get("NFSC_SDK") or os.environ.get("NFSMW_SDK")
     candidatos = [pathlib.Path(otro)] if otro else [raiz.parent / "rexglue-sdk", raiz / "sdk"]
     for cand in candidatos:
         if (cand / "src" / "ui" / "rex_app.cpp").exists():
