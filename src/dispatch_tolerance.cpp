@@ -45,8 +45,8 @@ void NoopTrap(PPCContext& ctx, uint8_t* /*base*/) {
   ctx.r3.u64 = 0;
 }
 
-static ::PPCFunc original_terminate_title = nullptr;
-static ::PPCFunc original_dbg_print = nullptr;
+static ::PPCFunc* original_terminate_title = nullptr;
+static ::PPCFunc* original_dbg_print = nullptr;
 
 void Carbon_TerminateTitle_Hook(PPCContext& ctx, uint8_t* base) {
   REXLOG_ERROR("[carbon] XamLoaderTerminateTitle CALLED! caller lr=0x{:08X}, exit_code(r3)={:d} (0x{:08X}), r4=0x{:08X}",
