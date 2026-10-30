@@ -79,8 +79,8 @@
 
 // The SDK's command processor (tools/ios/patch_ios_native_only.py).
 extern std::atomic<bool> rex_native_draws_only;
-// Game-thread time in the draw capture (native_draw_census.cpp).
-extern std::atomic<uint64_t> nfsmw_capture_ns;
+// Game-thread time in the draw capture (native_draw_census.cpp not compiled for Carbon).
+std::atomic<uint64_t> nfsmw_capture_ns{0};
 // The command processor's hooks (the same in tools/ios/patch_ios_native_only.py).
 struct RexNativeDraw {
   const uint32_t* regs;
