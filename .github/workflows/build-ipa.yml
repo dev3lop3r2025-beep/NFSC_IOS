@@ -34,17 +34,19 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
 
       - name: Install Python Dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pillow tomli
+          python3 -m pip install -r requirements.txt
 
       - name: Cache Homebrew Dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/Library/Caches/Homebrew
+            /opt/homebrew
             /usr/local/Homebrew
           key: ${{ runner.os }}-brew-${{ hashFiles('**/CMakeLists.txt') }}
           restore-keys: |
@@ -52,14 +54,14 @@ jobs:
 
       - name: Install Build Tools
         run: |
-          brew install cmake ninja
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
 
       - name: Cache ReXGlue iOS SDK & MoltenVK
         uses: actions/cache@v4
         id: cache-sdk
         with:
           path: |
-            ../rexglue-sdk-ios
+            ${{ github.workspace }}/../rexglue-sdk-ios
             ~/.nfsc-ios
           key: ${{ runner.os }}-rexglue-sdk-v0.10.0-mvk-1.4.1
 
@@ -131,7 +133,11 @@ jobs:
       - name: Compile and Package IPA
         run: |
           cd ios
-          cmake --build --preset ios --target ipa -v
+          cmake --build --preset ios --target ipa -- -j 4 || {
+            echo "[CI] Build failed! Re-running failed file with single-job diagnostics..."
+            cmake --build --preset ios --target ipa -v -- -j 1
+            exit 1
+          }
 
       - name: Compute Checksums & Verify Artifacts
         run: |

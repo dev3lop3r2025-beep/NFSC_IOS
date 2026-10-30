@@ -63,7 +63,10 @@ def check_and_extract_cache():
             print(f"          Unpacking into {GENERATED_DIR}...")
             GENERATED_DIR.mkdir(parents=True, exist_ok=True)
             with tarfile.open(c, "r:gz") as tar:
-                tar.extractall(path=GENERATED_DIR)
+                if hasattr(tarfile, 'data_filter'):
+                    tar.extractall(path=GENERATED_DIR, filter='data')
+                else:
+                    tar.extractall(path=GENERATED_DIR)
             if (GENERATED_DIR / "sources.cmake").exists():
                 print(f"[Codegen] Successfully restored generated sources from {c.name}!")
                 return True

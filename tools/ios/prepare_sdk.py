@@ -186,7 +186,10 @@ def moltenvk(sdk):
         with urllib.request.urlopen(MOLTENVK_URL, timeout=300) as resp:
             tar.write_bytes(resp.read())
     with tarfile.open(tar) as t:
-        t.extractall(dest)
+        if hasattr(tarfile, 'data_filter'):
+            t.extractall(dest, filter='data')
+        else:
+            t.extractall(dest)
     xcf = list(dest.rglob("dynamic/MoltenVK.xcframework"))
     if not xcf:
         sys.exit(f"[ERROR] The MoltenVK tar has no dynamic/MoltenVK.xcframework ({dest})")
