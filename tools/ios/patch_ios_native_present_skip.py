@@ -19,6 +19,7 @@ paints 55/s"). With the flag set, the refresh is skipped as if it had failed
 (the last image stays, unshown); FMVs clear the flag and it resumes.
 """
 
+import os
 import pathlib
 import sys
 
@@ -36,10 +37,11 @@ NEW_DECL = '''#include <pthread.h>  // LOCAL PATCH - iOS: pthread_main_np (patch
 extern std::atomic<bool> rex_native_draws_only;
 '''
 
-ANCHOR = '''  bool is_active = writable_properties.IsActive();
+ORIGINAL_ANCHOR = '''  bool is_active = writable_properties.IsActive();
   ios_timing::g_frames.fetch_add(1, std::memory_order_relaxed);  // LOCAL PATCH - iOS
 '''
-NEW = '''  bool is_active = writable_properties.IsActive();
+
+OLD_UNGUARDED_NEW = '''  bool is_active = writable_properties.IsActive();
   ios_timing::g_frames.fetch_add(1, std::memory_order_relaxed);  // LOCAL PATCH - iOS
   // LOCAL PATCH - iOS: the native renderer shows the game: no gamma pass, no
   // paint, no present of this hidden output (patch_ios_native_present_skip.py).
@@ -48,10 +50,41 @@ NEW = '''  bool is_active = writable_properties.IsActive();
   }
 '''
 
-BLOCKS = [
-    (FILE, "declare the native flag", ANCHOR_DECL, NEW_DECL),
-    (FILE, "skip the refresh while native shows", ANCHOR, NEW),
-]
+NEW = '''  bool is_active = writable_properties.IsActive();
+  ios_timing::g_frames.fetch_add(1, std::memory_order_relaxed);  // LOCAL PATCH - iOS
+#if REX_PLATFORM_IOS
+  // LOCAL PATCH - iOS: the native renderer shows the game: no gamma pass, no
+  // paint, no present of this hidden output (patch_ios_native_present_skip.py).
+  if (rex_native_draws_only.load(std::memory_order_relaxed)) {
+    return false;
+  }
+#endif
+'''
+
+def make_blocks():
+    # If the cached SDK tree already had the old un-guarded block applied,
+    # use it as the anchor so patch_engine cleanly upgrades it to the #if REX_PLATFORM_IOS version.
+    sdk = pathlib.Path(__file__).resolve().parents[2].parent / "rexglue-sdk-ios"
+    other = (
+        os.environ.get("NFSCARBON_SDK")
+        or os.environ.get("NFSC_SDK")
+        or os.environ.get("NFSMW_SDK")
+    )
+    if other:
+        sdk = pathlib.Path(other)
+    presenter = sdk / FILE
+    anchor = ORIGINAL_ANCHOR
+    if presenter.exists():
+        txt = presenter.read_text(encoding="utf-8", errors="replace")
+        if OLD_UNGUARDED_NEW in txt and NEW not in txt:
+            anchor = OLD_UNGUARDED_NEW
+
+    return [
+        (FILE, "declare the native flag", ANCHOR_DECL, NEW_DECL),
+        (FILE, "skip the refresh while native shows", anchor, NEW),
+    ]
+
+BLOCKS = make_blocks()
 
 if __name__ == "__main__":
     sys.exit(run("ios_native_present_skip", BLOCKS))
