@@ -34,9 +34,17 @@ REXCVAR_DEFINE_BOOL(carbon_single_pass, false, "Carbon",
 REXCVAR_DEFINE_STRING(carbon_scene_resolution, "1280x720", "Carbon",
                       "Scene resolution for carbon_single_pass: 1024x576, 1280x720 or WxH");
 
-extern "C" void __imp__sub_824FFAB0(PPCContext& __restrict ctx, uint8_t* base);
-extern "C" void __imp__sub_8250B0D0(PPCContext& __restrict ctx, uint8_t* base);
-extern "C" void __imp__sub_82500168(PPCContext& __restrict ctx, uint8_t* base);
+#if defined(__GNUC__) || defined(__clang__)
+#define CARBON_WEAK_IMPORT [[gnu::weak]]
+#else
+#define CARBON_WEAK_IMPORT
+#endif
+
+extern "C" {
+CARBON_WEAK_IMPORT void __imp__sub_824FFAB0(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_8250B0D0(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_82500168(PPCContext& __restrict ctx, uint8_t* base);
+}
 
 namespace {
 
@@ -109,7 +117,9 @@ void WriteOutputSize(uint8_t* base) {
 // Renderer constructor helper: after the original fills the table, rewrite mode 2.
 extern "C" REX_FUNC(sub_824FFAB0) {
   const uint32_t renderer = ctx.r3.u32;
-  __imp__sub_824FFAB0(ctx, base);
+  if (&__imp__sub_824FFAB0) {
+    __imp__sub_824FFAB0(ctx, base);
+  }
   if (!Enabled(base)) {
     return;
   }
@@ -131,7 +141,9 @@ extern "C" REX_FUNC(sub_824FFAB0) {
 
 // Mode select: after the original picks a mode, force mode 2.
 extern "C" REX_FUNC(sub_8250B0D0) {
-  __imp__sub_8250B0D0(ctx, base);
+  if (&__imp__sub_8250B0D0) {
+    __imp__sub_8250B0D0(ctx, base);
+  }
   if (!Enabled(base)) {
     return;
   }
@@ -148,7 +160,9 @@ extern "C" REX_FUNC(sub_82500168) {
     ctx.r4.u64 = kMode;
     ctx.r5.u64 = 1;
   }
-  __imp__sub_82500168(ctx, base);
+  if (&__imp__sub_82500168) {
+    __imp__sub_82500168(ctx, base);
+  }
   if (Enabled(base)) {
     WriteOutputSize(base);
   }

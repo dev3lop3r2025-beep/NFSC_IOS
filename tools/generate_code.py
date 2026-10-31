@@ -111,11 +111,13 @@ def generate_code(xex_path, sdk_path=None, rexglue_bin=None, force_codegen=False
     xex_path = pathlib.Path(xex_path).resolve()
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not force_codegen and check_and_extract_cache():
-        return
-
     # Auto-stage the USA XEX from xex/ directory when the caller is using the default path.
     xex_path = stage_usa_xex(xex_path)
+
+    # Only fall back to pre-generated C++ archive if no XEX file exists and not forcing codegen.
+    if not force_codegen and not xex_path.is_file():
+        if check_and_extract_cache():
+            return
 
     if not xex_path.is_file():
         fail(

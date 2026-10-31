@@ -14,23 +14,33 @@
 #include "carbon_missing_entries.h"
 #include "../generated/default/nfsc_pch.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define CARBON_WEAK_IMPORT [[gnu::weak]]
+#else
+#define CARBON_WEAK_IMPORT
+#endif
+
 // Forward declarations of verified compiled guest routines
 extern "C" {
 // __imp__ variants delegate to the rexglue-compiled function body.
 // Direct (non-imp) variants are the REX_FUNC wrappers defined in this file.
 void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
 void sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
-void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
 void sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
-void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
 void sub_82944340(PPCContext& __restrict ctx, uint8_t* base);
-void __imp__sub_82944340(PPCContext& __restrict ctx, uint8_t* base);
-void sub_8294BF08(PPCContext& __restrict ctx, uint8_t* base);
-void __imp__sub_8294BF08(PPCContext& __restrict ctx, uint8_t* base);
-void sub_82949748(PPCContext& __restrict ctx, uint8_t* base);
-void __imp__sub_82949748(PPCContext& __restrict ctx, uint8_t* base);
-void sub_827A3300(PPCContext& __restrict ctx, uint8_t* base);
-void __imp__sub_827A3300(PPCContext& __restrict ctx, uint8_t* base);
+
+// Kernel import __imp__ symbols -- used for version-agnostic address discovery.
+// rexglue registers: SetFunction(<guest_addr>, __imp__KernelFunc) in nfsc_register.cpp.
+// We find the guest address at runtime by looking up the __imp__ pointer in the dispatcher.
+CARBON_WEAK_IMPORT void __imp__XamLoaderTerminateTitle(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__ExTerminateThread(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__XexUnloadImageAndExitThread(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__HalReturnToFirmware(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__KeBugCheck(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__KeBugCheckEx(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__DbgPrint(PPCContext& __restrict ctx, uint8_t* base);
 }
 
 namespace {
@@ -107,7 +117,9 @@ void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
 
   // Delegate to the genuine USA compiled entry point (rexglue sub_829446E0).
   // Do NOT redirect to xstart here -- in the USA XEX, 0x829446E0 calls xstart internally.
-  __imp__sub_829446E0(ctx, base);
+  if (&__imp__sub_829446E0) {
+    __imp__sub_829446E0(ctx, base);
+  }
 
   REXLOG_INFO("[carbon-boot] <<< sub_829446E0 (USA entry 0x829446E0) finished (r3={})", ctx.r3.s32);
   LogBootBreadcrumb("[carbon-boot] <<< sub_829446E0 (USA entry 0x829446E0) finished");
@@ -186,7 +198,7 @@ void Carbon_Main_Hook(PPCContext& ctx, uint8_t* base) {
 
   if (original_carbon_main) {
     original_carbon_main(ctx, base);
-  } else {
+  } else if (&__imp__sub_824E9780) {
     __imp__sub_824E9780(ctx, base);
   }
 
@@ -331,62 +343,91 @@ void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher, 
   // wrapper in dispatch_tolerance.cpp provides the log via the static override mechanism.
   REXLOG_INFO("[carbon] USA entry point 0x829446E0 is compiled genuine entry (no redirect needed)");
 
-  // 2. Instrument xstart (0x82944510)
-  if (auto* orig = dispatcher->GetFunction(0x82944510)) {
+  const uint32_t kImportScanStart = PPCImageConfig.code_base + PPCImageConfig.code_size - 0x100000;
+  const uint32_t kImportScanEnd   = PPCImageConfig.code_base + PPCImageConfig.code_size;
+  constexpr uint32_t kImportStep  = 4;
+
+  // 2. Instrument xstart (0x82944510): find its address or locate via __imp__xstart.
+  uint32_t xstart_addr = 0x82944510;
+  for (uint32_t addr = kImportScanStart; addr < kImportScanEnd; addr += kImportStep) {
+    if (dispatcher->GetFunction(addr) == reinterpret_cast<::PPCFunc*>(&__imp__xstart)) {
+      xstart_addr = addr;
+      break;
+    }
+  }
+  if (auto* orig = dispatcher->GetFunction(xstart_addr)) {
     original_xstart = orig;
   }
-  dispatcher->SetFunction(0x82944510, &Carbon_XStart_Hook);
-  REXLOG_INFO("[carbon] Hooked xstart (0x82944510) with breadcrumb logger");
+  dispatcher->SetFunction(xstart_addr, &Carbon_XStart_Hook);
+  REXLOG_INFO("[carbon] Hooked xstart at 0x{:08X} with breadcrumb logger", xstart_addr);
 
-  // 3. Override display/privilege check sub_82944340 to force success (r3 = 0)
+  // 3. Override display/privilege check sub_82944340 to force success (r3 = 0).
+  // This is a small function called inside xstart that checks display/privilege.
+  // Its address is version-specific; we use the known PAL address and let it fail
+  // gracefully if the USA address differs. TODO: update after USA codegen.
   dispatcher->SetFunction(0x82944340, &sub_82944340);
   REXLOG_INFO("[carbon] Overrode sub_82944340 with success handler (r3 = 0)");
 
-  // 4. Instrument Carbon's real main() (0x824E9780)
+  // 4. Instrument Carbon's real main().
+  // Address is version-specific; fails gracefully if USA codegen moves it.
+  // TODO: update 0x824E9780 to USA address after running codegen.
   if (auto* orig = dispatcher->GetFunction(0x824E9780)) {
     original_carbon_main = orig;
   }
   dispatcher->SetFunction(0x824E9780, &Carbon_Main_Hook);
   REXLOG_INFO("[carbon] Hooked Carbon main() (0x824E9780) with breadcrumb logger");
 
-  // 5. Instrument title/thread termination routines
-  if (auto* orig = dispatcher->GetFunction(0x82AACDF4)) {
-    original_terminate_title = orig;
-    dispatcher->SetFunction(0x82AACDF4, &Carbon_TerminateTitle_Hook);
-    REXLOG_INFO("[carbon] Hooked XamLoaderTerminateTitle (0x82AACDF4)");
-  }
-  if (auto* orig = dispatcher->GetFunction(0x82AAD5A4)) {
-    original_terminate_thread = orig;
-    dispatcher->SetFunction(0x82AAD5A4, &Carbon_ExTerminateThread_Hook);
-    REXLOG_INFO("[carbon] Hooked ExTerminateThread (0x82AAD5A4)");
-  }
-  if (auto* orig = dispatcher->GetFunction(0x82AAD714)) {
-    original_unload_and_exit = orig;
-    dispatcher->SetFunction(0x82AAD714, &Carbon_XexUnloadImageAndExitThread_Hook);
-    REXLOG_INFO("[carbon] Hooked XexUnloadImageAndExitThread (0x82AAD714)");
-  }
-  if (auto* orig = dispatcher->GetFunction(0x82AAD774)) {
-    original_return_to_firmware = orig;
-    dispatcher->SetFunction(0x82AAD774, &Carbon_HalReturnToFirmware_Hook);
-    REXLOG_INFO("[carbon] Hooked HalReturnToFirmware (0x82AAD774)");
-  }
-  if (auto* orig = dispatcher->GetFunction(0x82AAC344)) {
-    original_bug_check = orig;
-    dispatcher->SetFunction(0x82AAC344, &Carbon_KeBugCheck_Hook);
-    REXLOG_INFO("[carbon] Hooked KeBugCheck (0x82AAC344)");
-  }
-  if (auto* orig = dispatcher->GetFunction(0x82AAD494)) {
-    original_bug_check_ex = orig;
-    dispatcher->SetFunction(0x82AAD494, &Carbon_KeBugCheckEx_Hook);
-    REXLOG_INFO("[carbon] Hooked KeBugCheckEx (0x82AAD494)");
+  // 5. Instrument kernel import thunks.
+  // We use __imp__ function pointers directly: rexglue registers them as
+  // SetFunction(<guest_thunk_addr>, __imp__KernelFunc) in nfsc_register.cpp.
+  // By looking up the function pointer in the dispatcher we get the correct
+  // guest address regardless of which XEX (PAL or USA) was used for codegen.
+  struct KernelHook {
+    ::PPCFunc* imp_ptr;          // __imp__KernelFunc pointer
+    ::PPCFunc* hook;             // our diagnostic wrapper
+    ::PPCFunc** original_out;    // where to save the original (may be nullptr)
+    const char* name;            // for logging
+  };
+  const KernelHook kernel_hooks[] = {
+    { reinterpret_cast<::PPCFunc*>(&__imp__XamLoaderTerminateTitle),
+      &Carbon_TerminateTitle_Hook, &original_terminate_title,
+      "XamLoaderTerminateTitle" },
+    { reinterpret_cast<::PPCFunc*>(&__imp__ExTerminateThread),
+      &Carbon_ExTerminateThread_Hook, &original_terminate_thread,
+      "ExTerminateThread" },
+    { reinterpret_cast<::PPCFunc*>(&__imp__XexUnloadImageAndExitThread),
+      &Carbon_XexUnloadImageAndExitThread_Hook, &original_unload_and_exit,
+      "XexUnloadImageAndExitThread" },
+    { reinterpret_cast<::PPCFunc*>(&__imp__HalReturnToFirmware),
+      &Carbon_HalReturnToFirmware_Hook, &original_return_to_firmware,
+      "HalReturnToFirmware" },
+    { reinterpret_cast<::PPCFunc*>(&__imp__KeBugCheck),
+      &Carbon_KeBugCheck_Hook, &original_bug_check,
+      "KeBugCheck" },
+    { reinterpret_cast<::PPCFunc*>(&__imp__KeBugCheckEx),
+      &Carbon_KeBugCheckEx_Hook, &original_bug_check_ex,
+      "KeBugCheckEx" },
+    { reinterpret_cast<::PPCFunc*>(&__imp__DbgPrint),
+      &Carbon_DbgPrint_Hook, &original_dbg_print,
+      "DbgPrint" },
+  };
+  for (const auto& h : kernel_hooks) {
+    if (!h.imp_ptr) continue;
+    bool hooked = false;
+    for (uint32_t addr = kImportScanStart; addr < kImportScanEnd; addr += kImportStep) {
+      if (dispatcher->GetFunction(addr) == h.imp_ptr) {
+        if (h.original_out) *h.original_out = h.imp_ptr;
+        dispatcher->SetFunction(addr, h.hook);
+        REXLOG_INFO("[carbon] Hooked {} at 0x{:08X}", h.name, addr);
+        hooked = true;
+        break;
+      }
+    }
+    if (!hooked) {
+      REXLOG_WARN("[carbon] Could not find {} thunk in dispatcher (wrong XEX version?)", h.name);
+    }
   }
 
-  // 6. Instrument DbgPrint
-  if (auto* orig = dispatcher->GetFunction(0x82AACE24)) {
-    original_dbg_print = orig;
-    dispatcher->SetFunction(0x82AACE24, &Carbon_DbgPrint_Hook);
-    REXLOG_INFO("[carbon] Hooked DbgPrint (0x82AACE24)");
-  }
 
   if (auto logger = spdlog::default_logger()) {
     logger->flush();

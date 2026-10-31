@@ -57,15 +57,17 @@ workflows:
             echo "[Codemagic] Staged USA XEX: $(wc -c < game/default.xex) bytes"
           fi
 
-          # Unpack pre-generated C++ source archive (352 translation files)
-          python3 tools/generate_code.py --unpack-cache || true
+          # Unpack pre-generated C++ source archive only if XEX is unavailable
+          if [ ! -f "game/default.xex" ]; then
+            python3 tools/generate_code.py --unpack-cache || true
+          fi
 
       - name: Generate Code if XEX Available
         script: |
           set -e
           if [ -f "game/default.xex" ]; then
             echo "[Codemagic] Running USA XEX codegen..."
-            python3 tools/generate_code.py --xex game/default.xex
+            python3 tools/generate_code.py --xex game/default.xex --force-codegen
             echo "[Codemagic] Verifying USA codegen (fail-fast)..."
             python3 tools/verify_usa_codegen.py
           else

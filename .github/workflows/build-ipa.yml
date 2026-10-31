@@ -94,7 +94,9 @@ jobs:
           fi
 
           # Priority 3: Unpack pre-generated C++ cache (gen.tar.gz) if XEX is unavailable
-          python3 tools/generate_code.py --unpack-cache || true
+          if [ ! -f "game/default.xex" ]; then
+            python3 tools/generate_code.py --unpack-cache || true
+          fi
 
       - name: Prepare ReXGlue iOS SDK
         run: |
@@ -105,11 +107,10 @@ jobs:
           fi
 
       - name: Generate Code if XEX Available
-        if: ${{ inputs.force_codegen || !hashFiles('generated/default/sources.cmake') }}
         run: |
           if [ -f "game/default.xex" ]; then
             echo "[CI] Running USA XEX codegen..."
-            python3 tools/generate_code.py --xex game/default.xex
+            python3 tools/generate_code.py --xex game/default.xex --force-codegen
           else
             echo "[CI] Note: game/default.xex not found. Building host harness & probe only."
           fi
