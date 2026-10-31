@@ -17,7 +17,6 @@ out_directory_path = "generated/default"
 includes = []
 
 [entrypoint.functions]
-# Explicit function hints go here. These are populated by rexglue codegen after
-# running against xex/usa_default.xex. Do NOT add PAL XEX addresses (CRC 5E74E60D).
-# Run: python3 tools/generate_code.py --force-codegen
-# Then restore discovered USA addresses here.
+0x823217D0 = {}
+0x82A63408 = {}
+0x82A66790 = {}

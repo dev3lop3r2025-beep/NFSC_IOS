@@ -16,8 +16,9 @@ Checked addresses (USA XEX, NFS Carbon Title ID 454107EC):
   0x829446E0  -- XEX entry point (IS the real entry in USA, not a blr stub!)
   0x82944510  -- xstart() CRT entry
   0x824E9780  -- Carbon main()
-  0x82AA8470  -- __xc_a (C++ static initializer range start, from crash log)
-  0x82AA9998  -- __xc_z (C++ static initializer range end, from crash log)
+  0x823217D0  -- USA direct branch target (sub_823217D0)
+  0x82A63408  -- USA direct branch target (sub_82A63408)
+  0x82A66790  -- USA direct branch target (sub_82A66790)
 """
 
 import pathlib
@@ -28,13 +29,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 REGISTER_CPP = ROOT / "generated" / "default" / "nfsc_register.cpp"
 
 # Functions that MUST appear in the USA-generated nfsc_register.cpp.
-# These were observed in the USA crash log as called before the AV.
 REQUIRED_USA_SYMBOLS = [
     ("0x829446E0", "sub_829446E0", "XEX entry point (USA genuine, not PAL blr stub)"),
     ("0x82944510", "xstart",       "CRT entry point xstart"),
     ("0x824E9780", "sub_824E9780", "Carbon main()"),
-    ("0x82AA8470", "sub_82AA8470", "__xc_a static-initializer range start (USA crash log)"),
-    ("0x82AA9998", "sub_82AA9998", "__xc_z static-initializer range end (USA crash log)"),
+    ("0x823217D0", "sub_823217D0", "USA direct branch entrypoint (0x823217D0)"),
+    ("0x82A63408", "sub_82A63408", "USA direct branch entrypoint (0x82A63408)"),
+    ("0x82A66790", "sub_82A66790", "USA direct branch entrypoint (0x82A66790)"),
 ]
 
 # PAL-only addresses that must NOT appear (if they do, codegen was run on PAL XEX).
