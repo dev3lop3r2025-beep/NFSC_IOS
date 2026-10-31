@@ -134,32 +134,44 @@ void CarbonRegisterMissingEntries(rex::runtime::FunctionDispatcher* dispatcher,
   // Preserve existing generated functions; never replace a non-return opcode.
   size_t return_entries = 0;
   size_t member_adapters = 0;
+  size_t skipped_entries = 0;
   for (uint32_t entry = PPCImageConfig.code_base;
        entry < PPCImageConfig.code_base + PPCImageConfig.code_size; entry += 4) {
-    if (REX_LOAD_U32(entry) == 0x4E800020 && !dispatcher->GetFunction(entry)) {
-      if (!dispatcher->SetFunction(entry, &Carbon_Blr))
-        REX_FATAL("Could not register original Carbon return instruction");
-      ++return_entries;
+    if (REX_LOAD_U32(entry) == 0x4E800020) {
+      if (dispatcher->GetFunction(entry)) {
+        ++skipped_entries;
+      } else {
+        if (!dispatcher->SetFunction(entry, &Carbon_Blr))
+          REX_FATAL("Could not register original Carbon return instruction");
+        ++return_entries;
+      }
     }
     if (REX_LOAD_U32(entry) == kMemberAdapter[0] &&
-        entry + kMemberAdapter.size() * 4 <= PPCImageConfig.code_base + PPCImageConfig.code_size &&
-        !dispatcher->GetFunction(entry)) {
-      bool matches = true;
-      for (size_t index = 1; index < kMemberAdapter.size(); ++index) {
-        if (REX_LOAD_U32(entry + static_cast<uint32_t>(index * 4)) != kMemberAdapter[index]) {
-          matches = false;
-          break;
+        entry + kMemberAdapter.size() * 4 <= PPCImageConfig.code_base + PPCImageConfig.code_size) {
+      if (dispatcher->GetFunction(entry)) {
+        ++skipped_entries;
+      } else {
+        bool matches = true;
+        for (size_t index = 1; index < kMemberAdapter.size(); ++index) {
+          if (REX_LOAD_U32(entry + static_cast<uint32_t>(index * 4)) != kMemberAdapter[index]) {
+            matches = false;
+            break;
+          }
         }
-      }
-      if (matches) {
-        if (!dispatcher->SetFunction(entry, &Carbon_MemberAdapter))
-          REX_FATAL("Could not register original Carbon member adapter");
-        ++member_adapters;
+        if (matches) {
+          if (!dispatcher->SetFunction(entry, &Carbon_MemberAdapter))
+            REX_FATAL("Could not register original Carbon member adapter");
+          ++member_adapters;
+        }
       }
     }
   }
-  REXLOG_INFO("[carbon] Registered {} original blr entries", return_entries);
+  REXLOG_INFO("[carbon] Registered {} original blr entries ({} existing compiled functions skipped)",
+              return_entries, skipped_entries);
   REXLOG_INFO("[carbon] Registered {} verified member adapters", member_adapters);
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush();
+  }
   constexpr uint32_t state_entry = 0x82296468;
   if (!dispatcher->GetFunction(state_entry)) {
     bool ok = true;
