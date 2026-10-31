@@ -20,6 +20,8 @@ game/
 *.ISO
 *.xex
 *.XEX
+# Allow the staged USA XEX binary (private repo only — ~4.8 MB, no ISO content)
+!xex/usa_default.xex
 *.rar
 *.zip
 *.7z

@@ -16,7 +16,8 @@
 
 // Forward declarations of verified compiled guest routines
 extern "C" {
-void xstart(PPCContext& __restrict ctx, uint8_t* base);
+// __imp__ variants delegate to the rexglue-compiled function body.
+// Direct (non-imp) variants are the REX_FUNC wrappers defined in this file.
 void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
 void sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
 void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
@@ -88,14 +89,14 @@ static ::PPCFunc* original_xstart = nullptr;
 //  Startup Breadcrumb Hooks
 // =============================================================================
 
-// 1. Entry point 0x829446E0 redirection:
-// The USA default.xex header has entry_point = 0x829446E0, which is just an epilogue
-// blr stub (sub_829446E0). If executed directly, the guest thread terminates in 1 ms!
-// We intercept 0x829446E0 and redirect execution to the real CRT entry point xstart (0x82944510).
+// 1. Entry point 0x829446E0 breadcrumb:
+// In the USA default.xex, 0x829446E0 IS the genuine XEX entry point compiled by
+// rexglue into sub_829446E0. This is NOT a blr stub (that was the PAL XEX).
+// We log entry for boot diagnostics and then delegate to the compiled USA code.
 void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
-                "[carbon-boot] GUEST ENTRY 0x829446E0 -> redirecting to xstart (0x82944510)! (lr=0x%08X, sp=0x%08X, r13=0x%08X)",
+                "[carbon-boot] GUEST ENTRY 0x829446E0 (USA genuine entry point) called (lr=0x%08X, sp=0x%08X, r13=0x%08X)",
                 static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r13.u32);
   REXLOG_INFO("{}", buf);
   LogBootBreadcrumb(buf);
@@ -104,11 +105,12 @@ void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
     logger->flush();
   }
 
-  // Invoke the real CRT entry point
-  xstart(ctx, base);
+  // Delegate to the genuine USA compiled entry point (rexglue sub_829446E0).
+  // Do NOT redirect to xstart here -- in the USA XEX, 0x829446E0 calls xstart internally.
+  __imp__sub_829446E0(ctx, base);
 
-  REXLOG_INFO("[carbon-boot] <<< xstart (0x82944510) finished execution (return code r3={})", ctx.r3.s32);
-  LogBootBreadcrumb("[carbon-boot] <<< xstart (0x82944510) finished execution");
+  REXLOG_INFO("[carbon-boot] <<< sub_829446E0 (USA entry 0x829446E0) finished (r3={})", ctx.r3.s32);
+  LogBootBreadcrumb("[carbon-boot] <<< sub_829446E0 (USA entry 0x829446E0) finished");
   rex::FlushLogging();
   if (auto logger = spdlog::default_logger()) {
     logger->flush();
@@ -322,9 +324,12 @@ void Carbon_DbgPrint_Hook(PPCContext& ctx, uint8_t* base) {
 void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher, uint8_t* /*base*/) {
   if (!dispatcher) return;
 
-  // 1. Redirect dummy header entry point (0x829446E0) to xstart (0x82944510)
-  dispatcher->SetFunction(0x829446E0, &Carbon_EntryPoint_0x829446E0_Hook);
-  REXLOG_INFO("[carbon] Hooked header entry point 0x829446E0 -> redirects to xstart (0x82944510)");
+  // 1. Instrument entry point 0x829446E0 with a breadcrumb logger.
+  // NOTE: In the USA XEX, 0x829446E0 IS the genuine rexglue-compiled entry point.
+  // We do NOT override the dispatcher for this address -- rexglue already registered
+  // the compiled sub_829446E0 which calls xstart internally. The REX_FUNC(sub_829446E0)
+  // wrapper in dispatch_tolerance.cpp provides the log via the static override mechanism.
+  REXLOG_INFO("[carbon] USA entry point 0x829446E0 is compiled genuine entry (no redirect needed)");
 
   // 2. Instrument xstart (0x82944510)
   if (auto* orig = dispatcher->GetFunction(0x82944510)) {

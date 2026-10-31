@@ -73,20 +73,27 @@ jobs:
         env:
           CARBON_XEX_SECRET: ${{ secrets.CARBON_XEX_SECRET }}
         run: |
-          mkdir -p game generated/default
+          mkdir -p game generated/default xex
 
-          # Check if secret XEX was provided in private repository settings
+          # Priority 1: CARBON_XEX_SECRET (URL or base64-encoded USA XEX)
           if [ -n "${CARBON_XEX_SECRET}" ]; then
-            echo "[CI] Found CARBON_XEX_SECRET. Decoding default.xex..."
+            echo "[CI] Found CARBON_XEX_SECRET. Decoding usa_default.xex..."
             if [[ "${CARBON_XEX_SECRET}" =~ ^https?:// ]]; then
-              curl -L -s -o game/default.xex "${CARBON_XEX_SECRET}"
+              curl -L -s -o xex/usa_default.xex "${CARBON_XEX_SECRET}"
             else
-              echo "${CARBON_XEX_SECRET}" | base64 -d > game/default.xex
+              echo "${CARBON_XEX_SECRET}" | base64 -d > xex/usa_default.xex
             fi
-            echo "[CI] Successfully extracted default.xex from secret."
+            echo "[CI] Decoded usa_default.xex: $(wc -c < xex/usa_default.xex) bytes."
           fi
 
-          # Unpack pre-generated source archive if committed or cached
+          # Priority 2: xex/usa_default.xex committed to repo (private repo only)
+          if [ -f "xex/usa_default.xex" ]; then
+            echo "[CI] Staging xex/usa_default.xex -> game/default.xex"
+            cp -f xex/usa_default.xex game/default.xex
+            echo "[CI] Staged USA XEX: $(wc -c < game/default.xex) bytes"
+          fi
+
+          # Priority 3: Unpack pre-generated C++ cache (gen.tar.gz) if XEX is unavailable
           python3 tools/generate_code.py --unpack-cache || true
 
       - name: Prepare ReXGlue iOS SDK
@@ -101,10 +108,18 @@ jobs:
         if: ${{ inputs.force_codegen || !hashFiles('generated/default/sources.cmake') }}
         run: |
           if [ -f "game/default.xex" ]; then
+            echo "[CI] Running USA XEX codegen..."
             python3 tools/generate_code.py --xex game/default.xex
           else
-            echo "[CI] Note: game/default.xex not found. Building host harness & probe."
+            echo "[CI] Note: game/default.xex not found. Building host harness & probe only."
           fi
+
+      - name: Verify USA Codegen (Fail-Fast)
+        if: hashFiles('generated/default/nfsc_register.cpp')
+        run: |
+          echo "[CI] Verifying codegen was produced from USA XEX (not PAL)..."
+          python3 tools/verify_usa_codegen.py
+          echo "[CI] USA codegen verification PASSED."
 
       - name: Configure CMake for iOS (arm64 Native)
         run: |

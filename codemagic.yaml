@@ -47,10 +47,30 @@ workflows:
       - name: Restore or Prepare Game Codegen (PowerPC to C++)
         script: |
           set -e
-          echo "[Codemagic] Unpacking pre-generated C++ code cache..."
-          mkdir -p game generated/default
-          # Extract pre-generated C++ source archive (352 translation files)
+          echo "[Codemagic] Preparing USA XEX for codegen..."
+          mkdir -p game generated/default xex
+
+          # Stage xex/usa_default.xex (committed to private repo) into game/
+          if [ -f "xex/usa_default.xex" ]; then
+            echo "[Codemagic] Staging xex/usa_default.xex -> game/default.xex"
+            cp -f xex/usa_default.xex game/default.xex
+            echo "[Codemagic] Staged USA XEX: $(wc -c < game/default.xex) bytes"
+          fi
+
+          # Unpack pre-generated C++ source archive (352 translation files)
           python3 tools/generate_code.py --unpack-cache || true
+
+      - name: Generate Code if XEX Available
+        script: |
+          set -e
+          if [ -f "game/default.xex" ]; then
+            echo "[Codemagic] Running USA XEX codegen..."
+            python3 tools/generate_code.py --xex game/default.xex
+            echo "[Codemagic] Verifying USA codegen (fail-fast)..."
+            python3 tools/verify_usa_codegen.py
+          else
+            echo "[Codemagic] Note: game/default.xex not found. Skipping codegen."
+          fi
 
       - name: Prepare ReXGlue iOS SDK & MoltenVK
         script: |

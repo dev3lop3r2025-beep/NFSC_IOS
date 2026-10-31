@@ -2,6 +2,12 @@
 """
 tools/generate_code.py
 Ahead-Of-Time (AOT) PowerPC-to-C++ Code Generator for Need for Speed: Carbon (Xbox 360, Title ID: 454107EC).
+
+USA XEX staging:
+  The authoritative source binary is 'xex/usa_default.xex' (NFS Carbon USA).
+  This script auto-stages it to 'game/default.xex' before invoking rexglue so that
+  the manifest path remains stable. Never use the PAL XEX (CRC 5E74E60D) for codegen
+  -- the generated C++ addresses differ from what the USA ISO maps into guest RAM.
 """
 
 import argparse
@@ -14,10 +20,15 @@ import sys
 import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+USA_XEX = ROOT / "xex" / "usa_default.xex"
 DEFAULT_XEX = ROOT / "game" / "default.xex"
 GENERATED_DIR = ROOT / "generated" / "default"
 MANIFEST_FILE = ROOT / "nfscarbon_manifest.toml"
 OVERRIDE_FILE = ROOT / "overrides.toml"
+
+# Expected size of the USA default.xex (bytes). Used to reject obvious wrong-variant files.
+_USA_XEX_EXPECTED_BYTES = 4_861_952
+_XEX_SIZE_TOLERANCE = 32 * 1024  # +/- 32 KB
 
 
 def fail(msg):
@@ -73,6 +84,29 @@ def check_and_extract_cache():
     return False
 
 
+def stage_usa_xex(target_path: pathlib.Path) -> pathlib.Path:
+    """Auto-stage the USA XEX from xex/usa_default.xex into game/default.xex.
+
+    Returns the path to use for codegen (may be the same as target_path if no USA XEX found).
+    """
+    if USA_XEX.is_file():
+        size = USA_XEX.stat().st_size
+        if abs(size - _USA_XEX_EXPECTED_BYTES) > _XEX_SIZE_TOLERANCE:
+            print(
+                f"[Codegen] WARNING: {USA_XEX} size={size} bytes deviates from expected "
+                f"{_USA_XEX_EXPECTED_BYTES} bytes by more than {_XEX_SIZE_TOLERANCE} bytes. "
+                f"Verify you have the correct USA variant (not PAL/JPN/other)."
+            )
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not target_path.is_file() or target_path.stat().st_size != size:
+            print(f"[Codegen] Staging USA XEX: {USA_XEX} -> {target_path}")
+            shutil.copy2(str(USA_XEX), str(target_path))
+        else:
+            print(f"[Codegen] USA XEX already staged at {target_path} ({size} bytes). Skipping copy.")
+        return target_path
+    return target_path
+
+
 def generate_code(xex_path, sdk_path=None, rexglue_bin=None, force_codegen=False):
     xex_path = pathlib.Path(xex_path).resolve()
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
@@ -80,9 +114,18 @@ def generate_code(xex_path, sdk_path=None, rexglue_bin=None, force_codegen=False
     if not force_codegen and check_and_extract_cache():
         return
 
+    # Auto-stage the USA XEX from xex/ directory when the caller is using the default path.
+    xex_path = stage_usa_xex(xex_path)
+
     if not xex_path.is_file():
-        fail(f"Target executable does not exist: {xex_path}\n"
-             f"Place your retail Carbon default.xex in 'game/default.xex' or specify with --xex.")
+        fail(
+            f"Target executable does not exist: {xex_path}\n"
+            f"Place the NFS Carbon USA default.xex in 'xex/usa_default.xex' (preferred) or\n"
+            f"'game/default.xex', or specify with --xex.\n"
+            f"IMPORTANT: Use the USA XEX only. The PAL variant (CRC 5E74E60D) has different\n"
+            f"addresses and will produce broken codegen (addresses shifted ~0x1D0 bytes)."
+        )
+
 
     print(f"============================================================")
     print(f"  NFS Carbon Xbox 360 (454107EC) AOT Codegen Pipeline       ")
