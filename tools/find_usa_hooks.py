@@ -74,12 +74,25 @@ KERNEL_IMPORT_NAMES = [
 ]
 
 
+def find_register_file() -> pathlib.Path | None:
+    for name in ("nfscarbon_register.cpp", "nfsc_register.cpp"):
+        p = GENERATED_DIR / name
+        if p.is_file():
+            return p
+    if GENERATED_DIR.is_dir():
+        for f in GENERATED_DIR.glob("*register*.cpp"):
+            if f.is_file():
+                return f
+    return None
+
+
 def read_register_cpp() -> str:
-    if not REGISTER_CPP.is_file():
-        print(f"[find_usa_hooks] ERROR: {REGISTER_CPP} not found.")
+    p = find_register_file()
+    if not p:
+        print(f"[find_usa_hooks] ERROR: No register.cpp found under {GENERATED_DIR}.")
         print("  Run codegen first: python3 tools/generate_code.py --force-codegen")
         sys.exit(1)
-    return REGISTER_CPP.read_text(encoding="utf-8", errors="replace")
+    return p.read_text(encoding="utf-8", errors="replace")
 
 
 def find_all_registered_addresses(content: str) -> set[int]:

@@ -26,7 +26,21 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-REGISTER_CPP = ROOT / "generated" / "default" / "nfsc_register.cpp"
+GEN_DEFAULT_DIR = ROOT / "generated" / "default"
+
+def find_register_cpp() -> pathlib.Path | None:
+    candidates = [
+        GEN_DEFAULT_DIR / "nfscarbon_register.cpp",
+        GEN_DEFAULT_DIR / "nfsc_register.cpp",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    if GEN_DEFAULT_DIR.is_dir():
+        for f in GEN_DEFAULT_DIR.glob("*register*.cpp"):
+            if f.is_file():
+                return f
+    return None
 
 # Functions that MUST appear in the USA-generated nfsc_register.cpp.
 REQUIRED_USA_SYMBOLS = [
@@ -47,14 +61,16 @@ FORBIDDEN_PAL_ONLY_SYMBOLS: list[tuple[str, str]] = [
 
 
 def check_register_cpp() -> int:
-    if not REGISTER_CPP.is_file():
+    register_cpp = find_register_cpp()
+    if not register_cpp:
         print(
-            f"[verify_usa_codegen] FAIL: {REGISTER_CPP} not found!\n"
+            f"[verify_usa_codegen] FAIL: No register.cpp found in {GEN_DEFAULT_DIR}!\n"
             f"  Run codegen first: python3 tools/generate_code.py --force-codegen"
         )
         return 1
 
-    content = REGISTER_CPP.read_text(encoding="utf-8", errors="replace")
+    print(f"[verify_usa_codegen] Inspecting {register_cpp.name}...")
+    content = register_cpp.read_text(encoding="utf-8", errors="replace")
     failures: list[str] = []
 
     for addr, symbol, desc in REQUIRED_USA_SYMBOLS:

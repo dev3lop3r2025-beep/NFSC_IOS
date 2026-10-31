@@ -150,31 +150,41 @@ endif()
 #  Generated Game Code (PowerPC to ARM64 C++)
 # -----------------------------------------------------------------------------
 set(NFSCARBON_WITH_GAME OFF)
-if(EXISTS "${NFSCARBON_GEN_DIR}/sources.cmake" AND EXISTS "${NFSCARBON_GEN_DIR}/nfsc_recomp.0.cpp")
-    set(NFSCARBON_WITH_GAME ON)
+if(EXISTS "${NFSCARBON_GEN_DIR}/sources.cmake")
     include("${NFSCARBON_GEN_DIR}/sources.cmake")
+    if(GENERATED_SOURCES)
+        set(NFSCARBON_WITH_GAME ON)
 
-    add_library(nfscarbon_recomp STATIC ${GENERATED_SOURCES})
-    target_include_directories(nfscarbon_recomp PRIVATE
-        "${NFSCARBON_REPO}"
-        "${NFSCARBON_REPO}/src"
-        "${NFSCARBON_GEN_DIR}")
-    if(TARGET rex::runtime)
-        target_link_libraries(nfscarbon_recomp PUBLIC rex::runtime nfscarbon_headers)
-        rexglue_apply_target_settings(nfscarbon_recomp)
-    endif()
+        add_library(nfscarbon_recomp STATIC ${GENERATED_SOURCES})
+        target_include_directories(nfscarbon_recomp PRIVATE
+            "${NFSCARBON_REPO}"
+            "${NFSCARBON_REPO}/src"
+            "${NFSCARBON_GEN_DIR}")
+        if(TARGET rex::runtime)
+            target_link_libraries(nfscarbon_recomp PUBLIC rex::runtime nfscarbon_headers)
+            rexglue_apply_target_settings(nfscarbon_recomp)
+        endif()
 
-    if(EXISTS "${NFSCARBON_GEN_DIR}/nfscarbon_pch.h")
-        target_precompile_headers(nfscarbon_recomp PRIVATE "${NFSCARBON_GEN_DIR}/nfscarbon_pch.h")
+        if(EXISTS "${NFSCARBON_GEN_DIR}/nfscarbon_pch.h")
+            target_precompile_headers(nfscarbon_recomp PRIVATE "${NFSCARBON_GEN_DIR}/nfscarbon_pch.h")
+        elseif(EXISTS "${NFSCARBON_GEN_DIR}/nfsc_pch.h")
+            target_precompile_headers(nfscarbon_recomp PRIVATE "${NFSCARBON_GEN_DIR}/nfsc_pch.h")
+        endif()
+        target_compile_options(nfscarbon_recomp PRIVATE -gline-tables-only -Wno-unused-variable)
+        if(EXISTS "${NFSCARBON_GEN_DIR}/nfscarbon_register.cpp")
+            set_source_files_properties("${NFSCARBON_GEN_DIR}/nfscarbon_register.cpp"
+                PROPERTIES COMPILE_OPTIONS "-O1")
+        endif()
+        if(EXISTS "${NFSCARBON_GEN_DIR}/nfsc_register.cpp")
+            set_source_files_properties("${NFSCARBON_GEN_DIR}/nfsc_register.cpp"
+                PROPERTIES COMPILE_OPTIONS "-O1")
+        endif()
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS recomp=${NFSCARBON_JOBS_RECOMP})
+        set_target_properties(nfscarbon_recomp PROPERTIES JOB_POOL_COMPILE recomp)
+        message(STATUS "NFSCarbon: compiling with game code (${NFSCARBON_GEN_DIR})")
+    else()
+        message(STATUS "NFSCarbon: sources.cmake found but GENERATED_SOURCES is empty in ${NFSCARBON_GEN_DIR}.")
     endif()
-    target_compile_options(nfscarbon_recomp PRIVATE -gline-tables-only -Wno-unused-variable)
-    if(EXISTS "${NFSCARBON_GEN_DIR}/nfsc_register.cpp")
-        set_source_files_properties("${NFSCARBON_GEN_DIR}/nfsc_register.cpp"
-            PROPERTIES COMPILE_OPTIONS "-O1")
-    endif()
-    set_property(GLOBAL APPEND PROPERTY JOB_POOLS recomp=${NFSCARBON_JOBS_RECOMP})
-    set_target_properties(nfscarbon_recomp PROPERTIES JOB_POOL_COMPILE recomp)
-    message(STATUS "NFSCarbon: compiling with game code (${NFSCARBON_GEN_DIR})")
 else()
     message(STATUS "NFSCarbon: no generated code found in ${NFSCARBON_GEN_DIR}. "
                    "Run: python3 tools/generate_code.py")

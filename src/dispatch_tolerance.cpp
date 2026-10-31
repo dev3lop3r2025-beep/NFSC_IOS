@@ -12,7 +12,20 @@
 #include <spdlog/spdlog.h>
 
 #include "carbon_missing_entries.h"
+
+#if __has_include("../generated/default/nfscarbon_pch.h")
+#include "../generated/default/nfscarbon_pch.h"
+#elif __has_include("generated/default/nfscarbon_pch.h")
+#include "generated/default/nfscarbon_pch.h"
+#elif __has_include("nfscarbon_pch.h")
+#include "nfscarbon_pch.h"
+#elif __has_include("../generated/default/nfsc_pch.h")
 #include "../generated/default/nfsc_pch.h"
+#elif __has_include("generated/default/nfsc_pch.h")
+#include "generated/default/nfsc_pch.h"
+#elif __has_include("nfsc_pch.h")
+#include "nfsc_pch.h"
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CARBON_WEAK_IMPORT [[gnu::weak]]

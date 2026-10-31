@@ -162,6 +162,14 @@ def generate_code(xex_path, sdk_path=None, rexglue_bin=None, force_codegen=False
         fail(f"Codegen did not produce expected sources file: {sources_cmake}")
 
     print(f"\n[Codegen Complete] Recompiled C++ sources generated at: {GENERATED_DIR}")
+    if sources_cmake.is_file():
+        lines = [line.strip() for line in sources_cmake.read_text(encoding="utf-8").splitlines() if line.strip() and not line.strip().startswith("#")]
+        print(f"[Codegen] {sources_cmake.name} configured with {len(lines)} source entries. First few:")
+        for line in lines[:8]:
+            print(f"  {line}")
+    if GENERATED_DIR.is_dir():
+        key_files = sorted(f.name for f in GENERATED_DIR.iterdir() if f.is_file() and (f.suffix in ('.h', '.cmake') or 'register' in f.name or 'init' in f.name))
+        print(f"[Codegen] Key headers and registration files: {', '.join(key_files)}")
 
 
 def main():

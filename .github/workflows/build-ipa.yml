@@ -118,7 +118,7 @@ jobs:
           fi
 
       - name: Verify USA Codegen (Fail-Fast)
-        if: hashFiles('generated/default/nfsc_register.cpp')
+        if: hashFiles('generated/default/sources.cmake') != '' || hashFiles('generated/default/*register*.cpp') != ''
         run: |
           echo "[CI] Verifying codegen was produced from USA XEX (not PAL)..."
           python3 tools/verify_usa_codegen.py

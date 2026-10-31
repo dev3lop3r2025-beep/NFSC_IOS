@@ -82,10 +82,14 @@ extern "C" REX_FUNC(sub_826E0088) {
                                         : uint64_t(std::clamp(500.0 / cap, 1.0, 50.0) * 1e6);
 
 #if defined(__APPLE__)
-        os_sync_wait_on_address_with_timeout(
-            sequence, before, sizeof(uint32_t),
-            OS_SYNC_WAIT_ON_ADDRESS_NONE,
-            OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns);
+        if (__builtin_available(iOS 17.4, macOS 14.4, *)) {
+          os_sync_wait_on_address_with_timeout(
+              sequence, before, sizeof(uint32_t),
+              OS_SYNC_WAIT_ON_ADDRESS_NONE,
+              OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns);
+        } else {
+          std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(timeout_ns, 1000000)));
+        }
 #else
         std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(timeout_ns, 1000000)));
 #endif
