@@ -43,8 +43,8 @@ extern "C" {
 void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
 void sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
 CARBON_WEAK_IMPORT void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
-void sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
-CARBON_WEAK_IMPORT void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
+// NOTE: sub_829446E0 / __imp__sub_829446E0 are defined in the recomp library.
+// Do NOT redeclare or redefine them here; hooked via dispatcher->SetFunction() at runtime.
 void sub_82944340(PPCContext& __restrict ctx, uint8_t* base);
 
 // Kernel import __imp__ symbols -- used for version-agnostic address discovery.
@@ -119,6 +119,12 @@ static ::PPCFunc* original_xstart = nullptr;
 // In the USA default.xex, 0x829446E0 IS the genuine XEX entry point compiled by
 // rexglue into sub_829446E0. This is NOT a blr stub (that was the PAL XEX).
 // We log entry for boot diagnostics and then delegate to the compiled USA code.
+//
+// __imp__sub_829446E0 is defined in libnfscarbon_recomp.a (nfsc_recomp.113.cpp via
+// DEFINE_REX_FUNC). We must NOT define REX_FUNC(sub_829446E0) here as it would
+// conflict with that definition and prevent __imp__ from being linked.
+extern "C" void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
+
 void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
@@ -145,9 +151,9 @@ void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
   }
 }
 
-extern "C" REX_FUNC(sub_829446E0) {
-  Carbon_EntryPoint_0x829446E0_Hook(ctx, base);
-}
+// NOTE: sub_829446E0 is NOT redefined here as REX_FUNC -- doing so conflicts with
+// DEFINE_REX_FUNC(sub_829446E0) in the recomp library (nfsc_recomp.113.cpp).
+// The hook is installed at runtime via CarbonInstallDiagnosticHooks()->dispatcher->SetFunction().
 
 // 2. xstart (0x82944510) breadcrumb:
 void Carbon_XStart_Hook(PPCContext& ctx, uint8_t* base) {
@@ -353,11 +359,16 @@ void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher, 
   if (!dispatcher) return;
 
   // 1. Instrument entry point 0x829446E0 with a breadcrumb logger.
-  // NOTE: In the USA XEX, 0x829446E0 IS the genuine rexglue-compiled entry point.
-  // We do NOT override the dispatcher for this address -- rexglue already registered
-  // the compiled sub_829446E0 which calls xstart internally. The REX_FUNC(sub_829446E0)
-  // wrapper in dispatch_tolerance.cpp provides the log via the static override mechanism.
-  REXLOG_INFO("[carbon] USA entry point 0x829446E0 is compiled genuine entry (no redirect needed)");
+  // The recomp-generated sub_829446E0 is now used unmodified (we removed the conflicting
+  // REX_FUNC static override). Install the breadcrumb hook dynamically via the dispatcher.
+  if (auto* orig = dispatcher->GetFunction(0x829446E0)) {
+    // Save original so the hook can delegate to it.
+    // Carbon_EntryPoint_0x829446E0_Hook uses __imp__sub_829446E0 directly, so we just
+    // set the dispatcher entry to our hook -- the hook calls __imp__ internally.
+    (void)orig;  // original saved implicitly via __imp__sub_829446E0 in the hook
+  }
+  dispatcher->SetFunction(0x829446E0, &Carbon_EntryPoint_0x829446E0_Hook);
+  REXLOG_INFO("[carbon] Hooked USA entry point 0x829446E0 with breadcrumb logger (dispatcher)");
 
   const uint32_t kImportScanStart = PPCImageConfig.code_base + PPCImageConfig.code_size - 0x100000;
   const uint32_t kImportScanEnd   = PPCImageConfig.code_base + PPCImageConfig.code_size;
