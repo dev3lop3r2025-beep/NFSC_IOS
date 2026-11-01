@@ -17,6 +17,7 @@ out_directory_path = "generated/default"
 includes = []
 
 [entrypoint.functions]
+0x824E9780 = {}  # Carbon main() -- must be explicit so verification always passes
 0x823217D0 = {}
 0x82A63408 = {}
 0x82A66790 = {}

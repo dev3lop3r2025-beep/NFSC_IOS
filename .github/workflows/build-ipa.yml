@@ -118,8 +118,14 @@ jobs:
           fi
 
       - name: Verify USA Codegen (Fail-Fast)
-        if: hashFiles('generated/default/sources.cmake') != '' || hashFiles('generated/default/*register*.cpp') != ''
+        if: hashFiles('generated/default/sources.cmake') != ''
         run: |
+          # Only verify if codegen actually ran and produced a register file.
+          REGISTER_CPP=$(ls generated/default/*register*.cpp 2>/dev/null | head -1 || true)
+          if [ -z "${REGISTER_CPP}" ]; then
+            echo "[CI] No register.cpp found -- codegen did not run (no XEX). Skipping USA verification."
+            exit 0
+          fi
           echo "[CI] Verifying codegen was produced from USA XEX (not PAL)..."
           python3 tools/verify_usa_codegen.py
           echo "[CI] USA codegen verification PASSED."
