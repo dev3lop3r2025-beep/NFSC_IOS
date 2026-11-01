@@ -40,11 +40,10 @@
 extern "C" {
 // __imp__ variants delegate to the rexglue-compiled function body.
 // Direct (non-imp) variants are the REX_FUNC wrappers defined in this file.
-void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
 void sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
 CARBON_WEAK_IMPORT void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
-// NOTE: sub_829446E0 / __imp__sub_829446E0 are defined in the recomp library.
-// Do NOT redeclare or redefine them here; hooked via dispatcher->SetFunction() at runtime.
+CARBON_WEAK_IMPORT void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
 void sub_82944340(PPCContext& __restrict ctx, uint8_t* base);
 
 // Kernel import __imp__ symbols -- used for version-agnostic address discovery.
@@ -110,6 +109,7 @@ static ::PPCFunc* original_bug_check_ex = nullptr;
 static ::PPCFunc* original_dbg_print = nullptr;
 static ::PPCFunc* original_carbon_main = nullptr;
 static ::PPCFunc* original_xstart = nullptr;
+static ::PPCFunc* original_entry_point = nullptr;
 
 // =============================================================================
 //  Startup Breadcrumb Hooks
@@ -120,11 +120,8 @@ static ::PPCFunc* original_xstart = nullptr;
 // rexglue into sub_829446E0. This is NOT a blr stub (that was the PAL XEX).
 // We log entry for boot diagnostics and then delegate to the compiled USA code.
 //
-// __imp__sub_829446E0 is defined in libnfscarbon_recomp.a (nfsc_recomp.113.cpp via
-// DEFINE_REX_FUNC). We must NOT define REX_FUNC(sub_829446E0) here as it would
-// conflict with that definition and prevent __imp__ from being linked.
-extern "C" void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
-
+// The hook delegates primarily to original_entry_point captured from the
+// dispatcher at initialization time, with __imp__sub_829446E0 as a weak fallback.
 void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
@@ -137,9 +134,12 @@ void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
     logger->flush();
   }
 
-  // Delegate to the genuine USA compiled entry point (rexglue sub_829446E0).
-  // Do NOT redirect to xstart here -- in the USA XEX, 0x829446E0 calls xstart internally.
-  if (&__imp__sub_829446E0) {
+  // Delegate to the genuine USA compiled entry point.
+  // 1. If original entry function was registered in dispatcher, call it.
+  // 2. Otherwise fall back to __imp__sub_829446E0 if available.
+  if (original_entry_point) {
+    original_entry_point(ctx, base);
+  } else if (&__imp__sub_829446E0) {
     __imp__sub_829446E0(ctx, base);
   }
 
@@ -170,7 +170,7 @@ void Carbon_XStart_Hook(PPCContext& ctx, uint8_t* base) {
 
   if (original_xstart) {
     original_xstart(ctx, base);
-  } else {
+  } else if (&__imp__xstart) {
     __imp__xstart(ctx, base);
   }
 
@@ -359,13 +359,10 @@ void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher, 
   if (!dispatcher) return;
 
   // 1. Instrument entry point 0x829446E0 with a breadcrumb logger.
-  // The recomp-generated sub_829446E0 is now used unmodified (we removed the conflicting
-  // REX_FUNC static override). Install the breadcrumb hook dynamically via the dispatcher.
+  // The recomp-generated sub_829446E0 is registered in the dispatcher.
+  // Save the original function pointer so the hook delegates to it.
   if (auto* orig = dispatcher->GetFunction(0x829446E0)) {
-    // Save original so the hook can delegate to it.
-    // Carbon_EntryPoint_0x829446E0_Hook uses __imp__sub_829446E0 directly, so we just
-    // set the dispatcher entry to our hook -- the hook calls __imp__ internally.
-    (void)orig;  // original saved implicitly via __imp__sub_829446E0 in the hook
+    original_entry_point = orig;
   }
   dispatcher->SetFunction(0x829446E0, &Carbon_EntryPoint_0x829446E0_Hook);
   REXLOG_INFO("[carbon] Hooked USA entry point 0x829446E0 with breadcrumb logger (dispatcher)");
@@ -376,10 +373,12 @@ void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher, 
 
   // 2. Instrument xstart (0x82944510): find its address or locate via __imp__xstart.
   uint32_t xstart_addr = 0x82944510;
-  for (uint32_t addr = kImportScanStart; addr < kImportScanEnd; addr += kImportStep) {
-    if (dispatcher->GetFunction(addr) == reinterpret_cast<::PPCFunc*>(&__imp__xstart)) {
-      xstart_addr = addr;
-      break;
+  if (&__imp__xstart) {
+    for (uint32_t addr = kImportScanStart; addr < kImportScanEnd; addr += kImportStep) {
+      if (dispatcher->GetFunction(addr) == reinterpret_cast<::PPCFunc*>(&__imp__xstart)) {
+        xstart_addr = addr;
+        break;
+      }
     }
   }
   if (auto* orig = dispatcher->GetFunction(xstart_addr)) {
