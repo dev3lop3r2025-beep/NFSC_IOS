@@ -44,9 +44,9 @@ REXCVAR_DEFINE_STRING(carbon_scene_resolution, "1280x720", "Carbon",
 #endif
 
 extern "C" {
-CARBON_WEAK_IMPORT void __imp__sub_824FFAB0(PPCContext& __restrict ctx, uint8_t* base);
-CARBON_WEAK_IMPORT void __imp__sub_8250B0D0(PPCContext& __restrict ctx, uint8_t* base);
-CARBON_WEAK_IMPORT void __imp__sub_82500168(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_824FFBE0(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_8250B200(PPCContext& __restrict ctx, uint8_t* base);
+CARBON_WEAK_IMPORT void __imp__sub_82500298(PPCContext& __restrict ctx, uint8_t* base);
 }
 
 namespace {
@@ -97,8 +97,8 @@ bool Enabled(uint8_t* base) {
     if (!REXCVAR_GET(carbon_single_pass)) {
       return false;
     }
-    if (!Matches(base, 0x824FFAB0, kCtorWords) || !Matches(base, 0x8250B0D0, kSelectWords) ||
-        !Matches(base, 0x82500168, kSizeWords)) {
+    if (!Matches(base, 0x824FFBE0, kCtorWords) || !Matches(base, 0x8250B200, kSelectWords) ||
+        !Matches(base, 0x82500298, kSizeWords)) {
       REXLOG_WARN("[render_mode] fingerprint mismatch, single-pass disabled");
       return false;
     }
@@ -118,10 +118,10 @@ void WriteOutputSize(uint8_t* base) {
 }  // namespace
 
 // Renderer constructor helper: after the original fills the table, rewrite mode 2.
-extern "C" REX_FUNC(sub_824FFAB0) {
+extern "C" REX_FUNC(sub_824FFBE0) {
   const uint32_t renderer = ctx.r3.u32;
-  if (&__imp__sub_824FFAB0) {
-    __imp__sub_824FFAB0(ctx, base);
+  if (&__imp__sub_824FFBE0) {
+    __imp__sub_824FFBE0(ctx, base);
   }
   if (!Enabled(base)) {
     return;
@@ -143,9 +143,9 @@ extern "C" REX_FUNC(sub_824FFAB0) {
 }
 
 // Mode select: after the original picks a mode, force mode 2.
-extern "C" REX_FUNC(sub_8250B0D0) {
-  if (&__imp__sub_8250B0D0) {
-    __imp__sub_8250B0D0(ctx, base);
+extern "C" REX_FUNC(sub_8250B200) {
+  if (&__imp__sub_8250B200) {
+    __imp__sub_8250B200(ctx, base);
   }
   if (!Enabled(base)) {
     return;
@@ -158,13 +158,13 @@ extern "C" REX_FUNC(sub_8250B0D0) {
 }
 
 // Output size: ask for mode 2 (r4 = 2, r5 = 1, as the retail caller does for it).
-extern "C" REX_FUNC(sub_82500168) {
+extern "C" REX_FUNC(sub_82500298) {
   if (Enabled(base)) {
     ctx.r4.u64 = kMode;
     ctx.r5.u64 = 1;
   }
-  if (&__imp__sub_82500168) {
-    __imp__sub_82500168(ctx, base);
+  if (&__imp__sub_82500298) {
+    __imp__sub_82500298(ctx, base);
   }
   if (Enabled(base)) {
     WriteOutputSize(base);

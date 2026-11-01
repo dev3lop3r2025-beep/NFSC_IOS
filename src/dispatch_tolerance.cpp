@@ -38,13 +38,6 @@
 
 // Forward declarations of verified compiled guest routines
 extern "C" {
-// __imp__ variants delegate to the rexglue-compiled function body.
-// Direct (non-imp) variants are the REX_FUNC wrappers defined in this file.
-CARBON_WEAK_IMPORT void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
-void sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
-CARBON_WEAK_IMPORT void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
-void sub_82944340(PPCContext& __restrict ctx, uint8_t* base);
-
 // Kernel import __imp__ symbols -- used for version-agnostic address discovery.
 // rexglue registers: SetFunction(<guest_addr>, __imp__KernelFunc) in nfsc_register.cpp.
 // We find the guest address at runtime by looking up the __imp__ pointer in the dispatcher.
@@ -107,7 +100,6 @@ static ::PPCFunc* original_bug_check = nullptr;
 static ::PPCFunc* original_bug_check_ex = nullptr;
 static ::PPCFunc* original_dbg_print = nullptr;
 static ::PPCFunc* original_carbon_main = nullptr;
-static ::PPCFunc* original_xstart = nullptr;
 static ::PPCFunc* original_entry_point = nullptr;
 
 // =============================================================================
@@ -150,44 +142,18 @@ void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
 // DEFINE_REX_FUNC(sub_829446E0) in the recomp library (nfsc_recomp.113.cpp).
 // The hook is installed at runtime via CarbonInstallDiagnosticHooks()->dispatcher->SetFunction().
 
-// 2. xstart (0x82944510) breadcrumb:
-void Carbon_XStart_Hook(PPCContext& ctx, uint8_t* base) {
-  char buf[256];
-  std::snprintf(buf, sizeof(buf),
-                "[carbon-boot] >>> ENTERING xstart (0x82944510) - CRT startup sequence beginning (lr=0x%08X, sp=0x%08X)",
-                static_cast<uint32_t>(ctx.lr), ctx.r1.u32);
-  REXLOG_INFO("{}", buf);
-  LogBootBreadcrumb(buf);
-  rex::FlushLogging();
-  if (auto logger = spdlog::default_logger()) {
-    logger->flush();
-  }
-
-  if (original_xstart) {
-    original_xstart(ctx, base);
-  } else if (&__imp__xstart) {
-    __imp__xstart(ctx, base);
-  }
-
-  REXLOG_INFO("[carbon-boot] <<< EXITED xstart (0x82944510) with r3={}", ctx.r3.s32);
-  rex::FlushLogging();
-  if (auto logger = spdlog::default_logger()) {
-    logger->flush();
-  }
-}
-
-// 3. sub_82944340: Security/Display/Privilege check
-// In xstart:
-//   sub_82944340(ctx, base);
-//   cmpwi r3, 0; beq loc_82944560;
-//   __imp__XamLoaderTerminateTitle(ctx, base);
-// If r3 == 0, xstart branches to loc_82944560 and proceeds to Carbon's main().
+// 2. USA display/privilege check (0x82944510) hook:
+// In USA xstart (0x829446E0):
+//   0x8294471C: bl 0x82944510
+//   0x82944720: cmpwi r3, 0; beq 0x82944730
+//   0x82944728: bl 0x82AACFC4 (XamLoaderTerminateTitle)
+// If r3 == 0, xstart branches to 0x82944730, runs CRT init, and proceeds to main().
 // If r3 != 0, xstart terminates the title immediately!
-// We override this function to always return r3 = 0.
-extern "C" REX_FUNC(sub_82944340) {
+// We override this function to force success (r3 = 0).
+void Carbon_DisplayCheck_0x82944510_Hook(PPCContext& ctx, uint8_t* /*base*/) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
-                "[carbon-boot] sub_82944340 (display/privilege check) called from lr=0x%08X -> forcing r3=0 (proceed to loc_82944560)",
+                "[carbon-boot] sub_82944510 (USA display/privilege check) called from lr=0x%08X -> forcing r3=0 (proceed to CRT init)",
                 static_cast<uint32_t>(ctx.lr));
   REXLOG_INFO("{}", buf);
   LogBootBreadcrumb(buf);
@@ -198,12 +164,13 @@ extern "C" REX_FUNC(sub_82944340) {
   ctx.r3.s64 = 0;
 }
 
-// 4. Carbon main() (0x824E9780) hook:
+// 3. Carbon genuine USA main() (0x824E98B0) hook:
+// Called by USA xstart (0x829446E0) at 0x82944874 after CRT initialization.
 void Carbon_Main_Hook(PPCContext& ctx, uint8_t* base) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
                 "[carbon-boot] ========================================================\n"
-                "[carbon-boot] >>> CARBON main() REACHED at 0x824E9780! argc=%d, argv=0x%08X\n"
+                "[carbon-boot] >>> CARBON USA main() REACHED at 0x824E98B0! argc=%d, argv=0x%08X\n"
                 "[carbon-boot] ========================================================",
                 ctx.r3.s32, ctx.r4.u32);
   REXLOG_INFO("{}", buf);
@@ -215,11 +182,9 @@ void Carbon_Main_Hook(PPCContext& ctx, uint8_t* base) {
 
   if (original_carbon_main) {
     original_carbon_main(ctx, base);
-  } else if (&__imp__sub_824E9780) {
-    __imp__sub_824E9780(ctx, base);
   }
 
-  REXLOG_INFO("[carbon-boot] <<< CARBON main() returned with code={:d} (0x{:08X})",
+  REXLOG_INFO("[carbon-boot] <<< CARBON USA main() returned with code={:d} (0x{:08X})",
               ctx.r3.s32, ctx.r3.u32);
   rex::FlushLogging();
   if (auto logger = spdlog::default_logger()) {
@@ -366,37 +331,18 @@ void CarbonInstallDiagnosticHooks(rex::runtime::FunctionDispatcher* dispatcher, 
   const uint32_t kImportScanEnd   = PPCImageConfig.code_base + PPCImageConfig.code_size;
   constexpr uint32_t kImportStep  = 4;
 
-  // 2. Instrument xstart (0x82944510): find its address or locate via __imp__xstart.
-  uint32_t xstart_addr = 0x82944510;
-  if (&__imp__xstart) {
-    for (uint32_t addr = kImportScanStart; addr < kImportScanEnd; addr += kImportStep) {
-      if (dispatcher->GetFunction(addr) == reinterpret_cast<::PPCFunc*>(&__imp__xstart)) {
-        xstart_addr = addr;
-        break;
-      }
-    }
-  }
-  if (auto* orig = dispatcher->GetFunction(xstart_addr)) {
-    original_xstart = orig;
-  }
-  dispatcher->SetFunction(xstart_addr, &Carbon_XStart_Hook);
-  REXLOG_INFO("[carbon] Hooked xstart at 0x{:08X} with breadcrumb logger", xstart_addr);
+  // 2. Override USA display/privilege check sub_82944510 to force success (r3 = 0).
+  // In USA xstart (0x829446E0), this function is called at 0x8294471C.
+  dispatcher->SetFunction(0x82944510, &Carbon_DisplayCheck_0x82944510_Hook);
+  REXLOG_INFO("[carbon] Overrode USA display/privilege check sub_82944510 with success handler (r3 = 0)");
 
-  // 3. Override display/privilege check sub_82944340 to force success (r3 = 0).
-  // This is a small function called inside xstart that checks display/privilege.
-  // Its address is version-specific; we use the known PAL address and let it fail
-  // gracefully if the USA address differs. TODO: update after USA codegen.
-  dispatcher->SetFunction(0x82944340, &sub_82944340);
-  REXLOG_INFO("[carbon] Overrode sub_82944340 with success handler (r3 = 0)");
-
-  // 4. Instrument Carbon's real main().
-  // Address is version-specific; fails gracefully if USA codegen moves it.
-  // TODO: update 0x824E9780 to USA address after running codegen.
-  if (auto* orig = dispatcher->GetFunction(0x824E9780)) {
+  // 3. Instrument Carbon's genuine USA main() (0x824E98B0).
+  // Called by USA xstart at 0x82944874 after CRT initialization.
+  if (auto* orig = dispatcher->GetFunction(0x824E98B0)) {
     original_carbon_main = orig;
   }
-  dispatcher->SetFunction(0x824E9780, &Carbon_Main_Hook);
-  REXLOG_INFO("[carbon] Hooked Carbon main() (0x824E9780) with breadcrumb logger");
+  dispatcher->SetFunction(0x824E98B0, &Carbon_Main_Hook);
+  REXLOG_INFO("[carbon] Hooked Carbon USA main() (0x824E98B0) with breadcrumb logger");
 
   // 5. Instrument kernel import thunks.
   // We use __imp__ function pointers directly: rexglue registers them as

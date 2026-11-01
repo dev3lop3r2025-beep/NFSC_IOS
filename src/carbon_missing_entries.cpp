@@ -29,12 +29,15 @@ void Carbon_MemberAdapter(PPCContext& ctx, uint8_t* base) {
 void Carbon_Blr([[maybe_unused]] PPCContext& ctx,
                 [[maybe_unused]] uint8_t* base) {}
 
-void Carbon_82641480(PPCContext& ctx, uint8_t* base) {
+// USA equivalent of PAL 0x82641480: addi r3,r3,-4; b <target>
+// PAL target was 0x8262DB10; USA target is 0x82125CD8.
+void Carbon_8216D770(PPCContext& ctx, uint8_t* base) {
   ctx.r3.s64 = ctx.r3.s64 - 4;
-  REX_CALL_INDIRECT_FUNC(0x8262DB10);
+  REX_CALL_INDIRECT_FUNC(0x82125CD8);
 }
 
-void Carbon_82296468(PPCContext& ctx, [[maybe_unused]] uint8_t* base) {
+// USA equivalent of PAL 0x82296468 -- exact byte match at 0x82296388 (-0xE0 shift).
+void Carbon_82296388(PPCContext& ctx, [[maybe_unused]] uint8_t* base) {
   ctx.cr6.compare<uint32_t>(ctx.r4.u32, 1, ctx.xer);
   if (ctx.cr6.lt) { ctx.r3.s64 = 1; return; }
   if (ctx.cr6.eq) { ctx.r3.s64 = 12; return; }
@@ -43,17 +46,18 @@ void Carbon_82296468(PPCContext& ctx, [[maybe_unused]] uint8_t* base) {
   ctx.r3.s64 = -1;
 }
 
-constexpr std::array<uint32_t, 13> kOriginal_82296468 = {
+// USA 0x82296388: exact same 13-word sequence (no shift in instructions, just address).
+constexpr std::array<uint32_t, 13> kOriginal_82296388 = {
   0x2B040001, 0x41980028, 0x419A001C, 0x2B040003,
   0x4198000C, 0x3860FFFF, 0x4E800020, 0x3860000D,
   0x4E800020, 0x3860000C, 0x4E800020, 0x38600001,
   0x4E800020,
 };
 
-// 0x822A9490..0x822A94F0: update an object's two resource references and
+// USA 0x822A93B0..0x822A9410: update an object's two resource references and
 // clear the original global pair when the resource's field_0x10 is zero.
-// Keep the original comparison sequence and all volatile register effects.
-void Carbon_822A9490(PPCContext& ctx, uint8_t* base) {
+// USA equivalent of PAL 0x822A9490 -- perfect 24-word fingerprint match.
+void Carbon_822A93B0(PPCContext& ctx, uint8_t* base) {
   ctx.r11.u64 = REX_LOAD_U32(ctx.r4.u32 + 0x14);
   ctx.r10.s64 = 0;
   ctx.cr6.compare<int32_t>(ctx.r11.s32, 2, ctx.xer);
@@ -81,7 +85,8 @@ loc_822A94CC:
   REX_STORE_U32(ctx.r11.u32 + 4, ctx.r10.u32);
 }
 
-constexpr std::array<uint32_t, 24> kOriginal_822A9490 = {
+// USA 0x822A93B0: identical 24-word fingerprint to PAL 0x822A9490.
+constexpr std::array<uint32_t, 24> kOriginal_822A93B0 = {
   0x81640014, 0x39400000, 0x2F0B0002, 0x419A002C,
   0x2F0B0003, 0x419A0024, 0x2F0B0004, 0x419A001C,
   0x2F0B000C, 0x419A0014, 0x2F0B0005, 0x419A000C,
@@ -90,9 +95,10 @@ constexpr std::array<uint32_t, 24> kOriginal_822A9490 = {
   0x396B200C, 0x914B0000, 0x914B0004, 0x4E800020,
 };
 
-// 0x82322048..0x82322094: virtual dispatch through object->field_0xb0,
-// falling back to the original object's vtable when it is unavailable.
-void Carbon_82322048(PPCContext& ctx, uint8_t* base) {
+// USA 0x82321FC8: virtual dispatch through object->field_0xB0,
+// falling back to original vtable when unavailable.
+// USA equivalent of PAL 0x82322048 -- perfect structural match.
+void Carbon_82321FC8(PPCContext& ctx, uint8_t* base) {
   ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 0xB0);
   ctx.cr6.compare<uint32_t>(ctx.r11.u32, 0, ctx.xer);
   if (!ctx.cr6.eq) {
@@ -117,7 +123,8 @@ void Carbon_82322048(PPCContext& ctx, uint8_t* base) {
   REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
 }
 
-constexpr std::array<uint32_t, 19> kOriginal_82322048 = {
+// USA 0x82321FC8: same structural pattern; lwz r11,4(r3) and lwz r11,0x68(r3) match PAL.
+constexpr std::array<uint32_t, 19> kOriginal_82321FC8 = {
   0x816300B0, 0x2B0B0000, 0x419A0034, 0x816B0018, 0x396B0001,
   0x7D6B0034, 0x556BDFFE, 0x696B0001, 0x2B0B0000, 0x419A0018,
   0x806300B0, 0x81630000, 0x816B0004, 0x7D6903A6, 0x4E800420,
@@ -172,51 +179,56 @@ void CarbonRegisterMissingEntries(rex::runtime::FunctionDispatcher* dispatcher,
   if (auto logger = spdlog::default_logger()) {
     logger->flush();
   }
-  constexpr uint32_t state_entry = 0x82296468;
+  // USA 0x82296388: state/result mapper (exact 13-word fingerprint match to PAL 0x82296468).
+  constexpr uint32_t state_entry = 0x82296388;
   if (!dispatcher->GetFunction(state_entry)) {
     bool ok = true;
-    for (size_t index = 0; index < kOriginal_82296468.size(); ++index) {
-      if (REX_LOAD_U32(state_entry + static_cast<uint32_t>(index * 4)) != kOriginal_82296468[index]) {
+    for (size_t index = 0; index < kOriginal_82296388.size(); ++index) {
+      if (REX_LOAD_U32(state_entry + static_cast<uint32_t>(index * 4)) != kOriginal_82296388[index]) {
         ok = false;
         break;
       }
     }
-    if (ok && dispatcher->SetFunction(state_entry, &Carbon_82296468)) {
-      REXLOG_INFO("[carbon] Registered verified state entry 0x82296468");
+    if (ok && dispatcher->SetFunction(state_entry, &Carbon_82296388)) {
+      REXLOG_INFO("[carbon] Registered verified state entry 0x82296388 (USA)");
     }
   }
-  constexpr uint32_t story_entry = 0x822A9490;
+  // USA 0x822A93B0: resource-reference updater (perfect 24-word fingerprint match to PAL 0x822A9490).
+  constexpr uint32_t story_entry = 0x822A93B0;
   if (!dispatcher->GetFunction(story_entry)) {
     bool ok = true;
-    for (size_t index = 0; index < kOriginal_822A9490.size(); ++index) {
-      if (REX_LOAD_U32(story_entry + static_cast<uint32_t>(index * 4)) != kOriginal_822A9490[index]) {
+    for (size_t index = 0; index < kOriginal_822A93B0.size(); ++index) {
+      if (REX_LOAD_U32(story_entry + static_cast<uint32_t>(index * 4)) != kOriginal_822A93B0[index]) {
         ok = false;
         break;
       }
     }
-    if (ok && dispatcher->SetFunction(story_entry, &Carbon_822A9490)) {
-      REXLOG_INFO("[carbon] Registered verified story entry 0x822A9490");
+    if (ok && dispatcher->SetFunction(story_entry, &Carbon_822A93B0)) {
+      REXLOG_INFO("[carbon] Registered verified story entry 0x822A93B0 (USA)");
     }
   }
-  constexpr uint32_t adjustor = 0x82641480;
+  // USA 0x8216D770: adjustor -4 (addi r3,r3,-4; b 0x82125CD8). PAL was 0x82641480.
+  // Only verify the first word (addi instruction is identical in both variants).
+  constexpr uint32_t adjustor = 0x8216D770;
   if (!dispatcher->GetFunction(adjustor)) {
-    if (REX_LOAD_U32(adjustor) == 0x3863FFFC && REX_LOAD_U32(adjustor + 4) == 0x4BFEC68C) {
-      if (dispatcher->SetFunction(adjustor, &Carbon_82641480)) {
-        REXLOG_INFO("[carbon] Registered verified adjustor 0x82641480");
+    if (REX_LOAD_U32(adjustor) == 0x3863FFFC) {
+      if (dispatcher->SetFunction(adjustor, &Carbon_8216D770)) {
+        REXLOG_INFO("[carbon] Registered verified adjustor 0x8216D770 (USA, PAL was 0x82641480)");
       }
     }
   }
-  constexpr uint32_t address = 0x82322048;
+  // USA 0x82321FC8: virtual dispatch (perfect structural match to PAL 0x82322048).
+  constexpr uint32_t address = 0x82321FC8;
   if (!dispatcher->GetFunction(address)) {
     bool ok = true;
-    for (size_t index = 0; index < kOriginal_82322048.size(); ++index) {
-      if (REX_LOAD_U32(address + static_cast<uint32_t>(index * 4)) != kOriginal_82322048[index]) {
+    for (size_t index = 0; index < kOriginal_82321FC8.size(); ++index) {
+      if (REX_LOAD_U32(address + static_cast<uint32_t>(index * 4)) != kOriginal_82321FC8[index]) {
         ok = false;
         break;
       }
     }
-    if (ok && dispatcher->SetFunction(address, &Carbon_82322048)) {
-      REXLOG_INFO("[carbon] Registered verified PPC entry 0x82322048");
+    if (ok && dispatcher->SetFunction(address, &Carbon_82321FC8)) {
+      REXLOG_INFO("[carbon] Registered verified PPC entry 0x82321FC8 (USA, PAL was 0x82322048)");
     }
   }
 }
