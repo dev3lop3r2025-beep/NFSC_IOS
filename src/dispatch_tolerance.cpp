@@ -27,8 +27,11 @@
 #include "nfsc_pch.h"
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define CARBON_WEAK_IMPORT [[gnu::weak]]
+#if defined(__APPLE__)
+// On Mach-O, weak_import is required for undefined weak symbols (not [[gnu::weak]]).
+#define CARBON_WEAK_IMPORT __attribute__((weak_import))
+#elif defined(__GNUC__) || defined(__clang__)
+#define CARBON_WEAK_IMPORT __attribute__((weak))
 #else
 #define CARBON_WEAK_IMPORT
 #endif

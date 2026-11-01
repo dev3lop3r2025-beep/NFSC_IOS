@@ -34,7 +34,15 @@
 REXCVAR_DEFINE_INT32(ios_carbon_ring_wait_ms, 0, "GPU",
                      "Fixed cap (ms) for ring-space waits (0: automatic based on FPS cap)");
 
-extern "C" void __imp__sub_826E0088(PPCContext& __restrict ctx, uint8_t* base);
+#if defined(__APPLE__)
+#define CARBON_RING_WEAK __attribute__((weak_import))
+#elif defined(__GNUC__) || defined(__clang__)
+#define CARBON_RING_WEAK __attribute__((weak))
+#else
+#define CARBON_RING_WEAK
+#endif
+
+extern "C" CARBON_RING_WEAK void __imp__sub_826E0088(PPCContext& __restrict ctx, uint8_t* base);
 
 namespace {
 
@@ -96,6 +104,8 @@ extern "C" REX_FUNC(sub_826E0088) {
       }
     }
   }
-  __imp__sub_826E0088(ctx, base);
+  if (&__imp__sub_826E0088) {
+    __imp__sub_826E0088(ctx, base);
+  }
 }
 

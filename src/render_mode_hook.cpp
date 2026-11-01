@@ -34,8 +34,11 @@ REXCVAR_DEFINE_BOOL(carbon_single_pass, false, "Carbon",
 REXCVAR_DEFINE_STRING(carbon_scene_resolution, "1280x720", "Carbon",
                       "Scene resolution for carbon_single_pass: 1024x576, 1280x720 or WxH");
 
-#if defined(__GNUC__) || defined(__clang__)
-#define CARBON_WEAK_IMPORT [[gnu::weak]]
+#if defined(__APPLE__)
+// On Mach-O, weak_import is required for undefined weak symbols (not [[gnu::weak]]).
+#define CARBON_WEAK_IMPORT __attribute__((weak_import))
+#elif defined(__GNUC__) || defined(__clang__)
+#define CARBON_WEAK_IMPORT __attribute__((weak))
 #else
 #define CARBON_WEAK_IMPORT
 #endif

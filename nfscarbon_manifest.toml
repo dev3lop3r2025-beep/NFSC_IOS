@@ -18,6 +18,11 @@ includes = []
 
 [entrypoint.functions]
 0x824E9780 = {}  # Carbon main() -- must be explicit so verification always passes
+0x824FFAB0 = {}  # render_mode_hook: renderer constructor helper
+0x82500168 = {}  # render_mode_hook: output size hook
+0x8250B0D0 = {}  # render_mode_hook: mode select hook
+0x826E0088 = {}  # ring_wait_hook: D3D ring wait watchdog
+0x829446E0 = {}  # XEX genuine entry point (USA)
 0x823217D0 = {}
 0x82A63408 = {}
 0x82A66790 = {}
