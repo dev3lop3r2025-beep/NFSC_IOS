@@ -43,7 +43,6 @@ extern "C" {
 CARBON_WEAK_IMPORT void __imp__xstart(PPCContext& __restrict ctx, uint8_t* base);
 void sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
 CARBON_WEAK_IMPORT void __imp__sub_824E9780(PPCContext& __restrict ctx, uint8_t* base);
-CARBON_WEAK_IMPORT void __imp__sub_829446E0(PPCContext& __restrict ctx, uint8_t* base);
 void sub_82944340(PPCContext& __restrict ctx, uint8_t* base);
 
 // Kernel import __imp__ symbols -- used for version-agnostic address discovery.
@@ -120,8 +119,8 @@ static ::PPCFunc* original_entry_point = nullptr;
 // rexglue into sub_829446E0. This is NOT a blr stub (that was the PAL XEX).
 // We log entry for boot diagnostics and then delegate to the compiled USA code.
 //
-// The hook delegates primarily to original_entry_point captured from the
-// dispatcher at initialization time, with __imp__sub_829446E0 as a weak fallback.
+// The hook delegates dynamically to original_entry_point captured from the
+// dispatcher at initialization time.
 void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
@@ -134,13 +133,9 @@ void Carbon_EntryPoint_0x829446E0_Hook(PPCContext& ctx, uint8_t* base) {
     logger->flush();
   }
 
-  // Delegate to the genuine USA compiled entry point.
-  // 1. If original entry function was registered in dispatcher, call it.
-  // 2. Otherwise fall back to __imp__sub_829446E0 if available.
+  // Delegate to genuine USA compiled entry point via the saved dispatcher pointer.
   if (original_entry_point) {
     original_entry_point(ctx, base);
-  } else if (&__imp__sub_829446E0) {
-    __imp__sub_829446E0(ctx, base);
   }
 
   REXLOG_INFO("[carbon-boot] <<< sub_829446E0 (USA entry 0x829446E0) finished (r3={})", ctx.r3.s32);
